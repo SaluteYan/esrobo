@@ -1,0 +1,17 @@
+# left 命名空间下的 MoveIt2 控制器配置
+controller_names:
+  - scaled_joint_trajectory_controller  # 与驱动的控制器名一致
+
+scaled_joint_trajectory_controller:
+  type: FollowJointTrajectory
+  action_ns: follow_joint_trajectory
+  default: true
+  joints:
+    - shoulder_pan_joint
+    - shoulder_lift_joint
+    - elbow_joint
+    - wrist_1_joint
+    - wrist_2_joint
+    - wrist_3_joint
+  # 关键：指定控制器的命名空间路径
+  action_server_namespace: /left/scaled_joint_trajectory_controller

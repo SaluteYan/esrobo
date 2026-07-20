@@ -1,0 +1,30 @@
+
+controller_manager:
+  ros__parameters:
+    update_rate: 100 # Hz
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    joint_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+zero_diff_system:
+  ros__parameters:
+    joints:
+      - joint_1
+      - joint_2
+      
+    command_interfaces:
+      - position
+      
+    state_interfaces:
+      - position
+      - velocity
+      
+    canopen_config_file: "$(find-pkg-share zero_diff_canopen_driver)/config/canopen_config.yaml"
+    
+    # 映射 ROS2 Control 关节名到 CANopen 节点名
+    joint_map:
+      joint_1: "joint_1"
+      joint_2: "joint_2"

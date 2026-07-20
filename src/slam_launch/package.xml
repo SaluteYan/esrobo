@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypes="http://www.w3.org/2001/XMLSchema" type="application/xml"?>
+<package format="3">
+  <name>slam_launch</name>
+  <version>0.0.0</version>
+  <description>
+    Launch files for SLAM and static TF transform
+  </description>
+  <maintainer email="user@todo.todo">user</maintainer>
+  <license>Apache-2.0</license>
+
+  <!-- 依赖项：静态TF、ROS2核心、启动相关 -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>tf2_ros</depend>
+  <depend>rclcpp</depend>
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
+

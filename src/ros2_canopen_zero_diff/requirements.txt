@@ -1,0 +1,15 @@
+
+# 本项目为 ROS2 C++/Python 混合项目，主要依赖通过 apt 安装
+# 请确保已安装 ROS2 Humble/Iron/Jazzy 基础环境
+# 
+# 核心依赖包 (通过 rosdep 或 apt 安装):
+# ros-${ROS_DISTRO}-canopen-core
+# ros-${ROS_DISTRO}-canopen-402-driver
+# ros-${ROS_DISTRO}-canopen-ros2-control
+# ros-${ROS_DISTRO}-ros2-control
+# ros-${ROS_DISTRO}-joint-state-broadcaster
+# ros-${ROS_DISTRO}-joint-trajectory-controller
+#
+# Python 依赖 (仅用于启动脚本，通常 ROS2 内置):
+# launch
+# launch_ros

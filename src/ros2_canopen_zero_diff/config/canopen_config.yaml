@@ -1,0 +1,65 @@
+
+# CANopen 总线配置
+# 定义 CAN 接口和主站参数
+canopen:
+  master:
+    node_id: 1
+    bus_device: "can0" # 物理CAN接口，如can0, vcan0
+    bus_config: ""     # 可选，用于设置波特率等，通常由系统层处理
+    
+  nodes:
+    # 关节模组 1 (Node ID 2)
+    joint_1:
+      node_id: 2
+      driver: "canopen_402_driver::CIA402Driver" # 使用标准CiA402驱动
+      period_ms: 10 # 通信周期 10ms (100Hz)
+      
+      # PDO 映射配置 (根据零差手册调整索引和子索引)
+      # 以下为标准CiA402常用对象字典映射示例
+      rpdo_mapping:
+        - index: 0x6040 # Control Word
+          subindex: 0
+          offset: 0
+          length: 16
+        - index: 0x607A # Target Position
+          subindex: 0
+          offset: 16
+          length: 32
+          
+      tpdo_mapping:
+        - index: 0x6041 # Status Word
+          subindex: 0
+          offset: 0
+          length: 16
+        - index: 0x6064 # Position Actual Value
+          subindex: 0
+          offset: 16
+          length: 32
+        - index: 0x606C # Velocity Actual Value
+          subindex: 0
+          offset: 48
+          length: 32
+
+    # 关节模组 2 (Node ID 3)
+    joint_2:
+      node_id: 3
+      driver: "canopen_402_driver::CIA402Driver"
+      period_ms: 10
+      rpdo_mapping:
+        - index: 0x6040
+          subindex: 0
+          offset: 0
+          length: 16
+        - index: 0x607A
+          subindex: 0
+          offset: 16
+          length: 32
+      tpdo_mapping:
+        - index: 0x6041
+          subindex: 0
+          offset: 0
+          length: 16
+        - index: 0x6064
+          subindex: 0
+          offset: 16
+          length: 32
