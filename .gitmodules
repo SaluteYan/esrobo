@@ -1,0 +1,6 @@
+[submodule "src/ranger_ros2"]
+	path = src/ranger_ros2
+	url = https://github.com/agilexrobotics/ranger_ros2.git
+[submodule "src/realsense-ros"]
+	path = src/realsense-ros
+	url = https://github.com/realsenseai/realsense-ros.git
