@@ -11,7 +11,7 @@
 | 移动底盘 | 松灵 Ranger Mini 3 | `ranger_bringup`, `ranger_base`, `ugv_sdk` |
 | 左/右机械臂 | 松灵 NERO 七轴机械臂 | `agx_arm_ctrl`, `pyAgxArm-master` |
 | 腰部关节 | 零差 3 关节，CANopen 风格驱动 | `erob_canopen` |
-| 灵巧手 | 灵心巧手 L10，双手 CAN | `linker_hand_ros2_sdk` |
+| 灵巧手 | 灵心巧手，双手 CAN；当前整机 URDF 使用 L20Lite 左/右手模型 | `linker_hand_ros2_sdk` |
 | 头部相机 | Orbbec Gemini 435Le | `orbbec_camera` |
 | 腕部相机 | RealSense D435，左右各一台 | `realsense2_camera` |
 | 头部舵机 | 飞特 SM40，RS485 | `servo_driver` |
@@ -35,10 +35,65 @@ src/OrbbecSDK_ROS2           Orbbec 头部相机驱动
 src/realsense-ros            RealSense 腕部相机驱动
 src/rslidar_sdk-main         RoboSense 激光雷达驱动
 src/esrobo_system            系统集成相关代码，目前不建议作为首轮调试入口
+model/urdf/esrobo_waist_with_head
+                              当前整机 URDF 描述包，含底盘、腰部、头部、双 NERO 机械臂和 L20Lite 双手模型
 debug_cmd.txt                原始现场调试命令备忘
 start_can.sh                 当前真机 CAN 命名和波特率初始化脚本
 99-fixed-can.rules           当前真机 USB/CAN/串口 udev 规则参考
 ```
+
+本地模型整理时还使用了以下源文件目录：
+
+```text
+../agx_arm_urdf/nero         NERO 机械臂原始 URDF/Xacro 和 meshes
+../linkerhand-urdf/l20lite   LinkerHand L20Lite 左/右手原始 URDF 和 meshes
+```
+
+## 整机 URDF 模型
+
+当前整机模型主文件：
+
+```text
+model/urdf/esrobo_waist_with_head/urdf/esrobo_waist_with_head.urdf
+```
+
+该文件以原始 ESROBO 腰部/头部/底盘 URDF 为主体，补充了左右 NERO 七轴机械臂、NERO 末端法兰、左右力传感器安装件和 LinkerHand L20Lite 双手。模型资源已经复制到当前描述包内部，主要 mesh 目录为：
+
+```text
+model/urdf/esrobo_waist_with_head/meshes/nero
+model/urdf/esrobo_waist_with_head/meshes/nero/dae
+model/urdf/esrobo_waist_with_head/meshes/linkerhand_l20lite/left
+model/urdf/esrobo_waist_with_head/meshes/linkerhand_l20lite/right
+```
+
+命名约定：
+
+```text
+腰部和头部：保留原始 joint/link 命名，例如 waist_joint1、head_joint1
+左臂：NERO link/joint 使用 left_nero_ 前缀
+右臂：NERO link/joint 使用 right_nero_ 前缀
+机械臂第 1 轴：沿用原总 URDF 的 leftArm_joint、rightArm_joint 名称
+灵巧手：左右手 link/joint 分别使用 left_、right_ 前缀
+```
+
+当前左右 NERO 机械臂的关键零位约定如下：
+
+| 关节 | origin rpy | limit |
+| --- | --- | --- |
+| `leftArm_joint` | `1.5708 0 0` | `[-2.70526, 2.70526]` |
+| `rightArm_joint` | `1.5708 0 0` | `[-2.70526, 2.70526]` |
+| `left_nero_joint2` | `1.5707963 1.5707963 0` | `[-3.3107963, 0.1692037]` |
+| `right_nero_joint2` | `1.5707963 1.5707963 0` | `[-3.3107963, 0.1692037]` |
+
+其中 `left_nero_joint2` 和 `right_nero_joint2` 的初始姿态相对 NERO 原始 `joint2` 绕关节轴线正向偏移了 90 度；为了保持物理运动范围不变，limit 已整体减去 `1.5707963 rad`，换算回原始 NERO 关节坐标仍为 `[-1.74, 1.74]`。
+
+校验 URDF 语法：
+
+```bash
+xmllint --noout model/urdf/esrobo_waist_with_head/urdf/esrobo_waist_with_head.urdf
+```
+
+当前模型结构检查结果为 72 个 link、71 个 joint、单一 root link `base_link`，无重复 link/joint，parent/child 引用完整。
 
 ## 基础环境
 
