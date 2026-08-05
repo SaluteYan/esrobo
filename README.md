@@ -37,6 +37,7 @@ src/rslidar_sdk-main         RoboSense 激光雷达驱动
 src/esrobo_system            系统集成相关代码，目前不建议作为首轮调试入口
 model/urdf/esrobo_waist_with_head
                               当前整机 URDF 描述包，含底盘、腰部、头部、双 NERO 机械臂和 L20Lite 双手模型
+document                     随仓库整理的设备和整机操作手册 PDF
 debug_cmd.txt                原始现场调试命令备忘
 start_can.sh                 当前真机 CAN 命名和波特率初始化脚本
 99-fixed-can.rules           当前真机 USB/CAN/串口 udev 规则参考
@@ -48,6 +49,16 @@ start_can.sh                 当前真机 CAN 命名和波特率初始化脚本
 ../agx_arm_urdf/nero         NERO 机械臂原始 URDF/Xacro 和 meshes
 ../linkerhand-urdf/l20lite   LinkerHand L20Lite 左/右手原始 URDF 和 meshes
 ```
+
+## 参考文档
+
+`document/` 目录集中存放当前真机调试和日常操作会用到的 PDF 手册：
+
+| 文件 | 内容 |
+| --- | --- |
+| `document/移动仿人形双臂机器人平台操作手册.pdf` | ESROBO 移动仿人形双臂机器人平台整机操作说明，适合作为上电、基础操作和安全注意事项的总入口。 |
+| `document/RANGER MINI 3.0_用户手册.pdf` | 松灵 Ranger Mini 3 底盘用户手册，包含底盘规格、接口、通信和使用注意事项。 |
+| `document/NERO_用户手册.pdf` | 松灵 NERO 七轴机械臂用户手册，包含机械臂安装、上电、控制方式和常规使用说明。 |
 
 ## 整机 URDF 模型
 
