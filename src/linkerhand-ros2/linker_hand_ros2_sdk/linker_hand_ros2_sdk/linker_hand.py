@@ -26,7 +26,8 @@ class LinkerHand(Node):
         self.declare_parameter('hand_joint', 'L6')
         self.declare_parameter('is_touch', False)
         self.declare_parameter('can', 'can0')
-        self.declare_parameter('modbus', "None")        
+        self.declare_parameter('modbus', "None")
+        self.declare_parameter('move_on_start', False)
 
         # ros时间获取
         self.stamp_clock = Clock()
@@ -36,6 +37,7 @@ class LinkerHand(Node):
         self.is_touch = self.get_parameter('is_touch').value
         self.can = self.get_parameter('can').value
         self.modbus = self.get_parameter('modbus').value
+        self.move_on_start = self.get_parameter('move_on_start').value
         self.sdk_v = 2
         self.sleep_time = 0.005
         self.cmd_lock = False
@@ -118,7 +120,26 @@ class LinkerHand(Node):
                 ColorMsg(msg=f"{self.hand_type} {self.hand_joint} Not equipped with any pressure sensors", color="red")
                 self.is_touch = False
             
-        self.embedded_version = self.api.get_embedded_version()
+        self.embedded_version = None
+        for attempt in range(1, 4):
+            version = self.api.get_embedded_version()
+            if isinstance(version, (list, tuple)) and len(version) > 0:
+                self.embedded_version = list(version)
+                break
+            ColorMsg(
+                msg=(
+                    f"No embedded-version response from {self.hand_type} {self.hand_joint} "
+                    f"on {self.can} (attempt {attempt}/3)"
+                ),
+                color='yellow',
+            )
+            time.sleep(0.2)
+        if self.embedded_version is None:
+            raise RuntimeError(
+                f"No CAN response from {self.hand_type} {self.hand_joint} on {self.can}. "
+                "Startup commands were not sent. Check hand power, CAN cable/termination, "
+                "and interface-to-hand mapping."
+            )
         pose = None
         torque = [200, 200, 200, 200, 200]
         speed = [200, 250, 250, 250, 250]
@@ -133,7 +154,10 @@ class LinkerHand(Node):
             torque = [250, 250, 250, 250, 250, 250, 250]
             speed = [120, 250, 250, 250, 250, 250, 250]
         elif self.hand_joint == "L10":
-            torque = [255] * 10
+            # Initialize a conservative usable torque limit without commanding
+            # a pose.  Leaving this at the firmware's power-on value can make
+            # one or more joints accept position commands but remain stationary.
+            torque = [180] * 10
             pose = [255, 200, 255, 255, 255, 255, 180, 180, 180, 41]
             speed = [200, 250, 250, 250, 250, 250, 250, 250, 250, 250]
         elif self.hand_joint == "L20":
@@ -143,13 +167,22 @@ class LinkerHand(Node):
         elif self.hand_joint == "L25":
             pose = [75, 255, 255, 255, 255, 176, 97, 81, 114, 147, 202, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
         if pose is not None:
-            for i in range(1): 
-                self.api.set_speed(speed=speed)
-                time.sleep(0.1)
-                self.api.set_torque(torque=torque)
-                time.sleep(0.1)
+            # Speed and torque-limit configuration do not move the hand. Keep
+            # both independent from the optional startup pose so teleoperation
+            # never inherits unusable firmware power-on values.
+            self.api.set_speed(speed=speed)
+            time.sleep(0.1)
+            self.api.set_torque(torque=torque)
+            time.sleep(0.1)
+        if pose is not None and self.move_on_start:
+            for i in range(1):
                 self.api.finger_move(pose=pose)
                 time.sleep(0.1)
+        elif pose is not None:
+            ColorMsg(
+                msg=f"{self.hand_type} {self.hand_joint} startup motion disabled; waiting for commands",
+                color='green',
+            )
 
     def list_check(self,pose):
         if isinstance(pose, list) == False:
@@ -412,8 +445,12 @@ def main(args=None):
         rclpy.spin(node)         # 主循环，监听 ROS 回调
     except KeyboardInterrupt:
         print("收到 Ctrl+C，准备退出...")
+    except RuntimeError as exc:
+        ColorMsg(msg=f"LinkerHand startup failed: {exc}", color="red")
+        return 1
     finally:
         # node.close_can()         # 关闭 CAN 或其他硬件资源
         # node.destroy_node()      # 销毁 ROS 节点
         # rclpy.shutdown()         # 关闭 ROS
         print("程序已退出。")
+    return 0

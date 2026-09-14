@@ -1,0 +1,16 @@
+name: teleop_esrobo
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - scipy
+  - pyyaml
+  - python-can
+  - pinocchio
+  - pip:
+      - pink
+      - qpsolvers
+      - proxsuite
+      - proxqp

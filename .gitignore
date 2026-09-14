@@ -42,3 +42,8 @@ __pycache__/
 
 # Local debug notes
 debug_cmd.txt
+
+# Teleoperation machine-local dependencies and device state
+teleoperation/external/
+teleoperation/config/senseglove_esrobo_calibration*.json
+teleoperation/mono_crash*

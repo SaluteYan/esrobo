@@ -1,0 +1,169 @@
+# ESROBO real-machine teleoperation configuration.
+# Every key is optional; defaults live in src/esrobo_teleop/config.py.
+
+robot:
+  left_can_channel: can_piper1
+  right_can_channel: can_piper2
+  nero_firmware: V112                  # left/default arm protocol
+  right_nero_firmware: DEFAULT         # right arm currently publishes legacy 0x501..0x507 feedback
+  can_interface: socketcan
+  can_bitrate: 1000000
+  command_mode: j           # j is smoothed; js is SDK high-risk passthrough
+  allow_unsafe_js: false    # must be explicit before SDK passthrough can run
+  speed_percent: 25
+  # Initial full-arm J1..J7 commissioning limits. Velocity is rad/s,
+  # acceleration is rad/s^2, and step is rad per accepted feedback update.
+  max_joint_step: [0.038397, 0.038397, 0.038397, 0.043633, 0.043633, 0.043633, 0.043633]
+  max_joint_velocity: [0.314159, 0.314159, 0.314159, 0.349066, 0.349066, 0.349066, 0.349066]
+  max_joint_acceleration: [0.785398, 0.785398, 0.872665, 1.047198, 1.047198, 1.047198, 1.047198]
+  # Second-stage commissioning limits used by the single-arm PICO paths.
+  left_max_joint_step: [0.038397, 0.038397, 0.038397, 0.043633, 0.043633, 0.043633, 0.043633]
+  left_max_joint_velocity: [0.314159, 0.314159, 0.314159, 0.349066, 0.349066, 0.349066, 0.349066]
+  left_max_joint_acceleration: [0.785398, 0.785398, 0.872665, 1.047198, 1.047198, 1.047198, 1.047198]
+  right_max_joint_step: [0.038397, 0.038397, 0.038397, 0.043633, 0.043633, 0.043633, 0.043633]
+  right_max_joint_velocity: [0.314159, 0.314159, 0.314159, 0.349066, 0.349066, 0.349066, 0.349066]
+  right_max_joint_acceleration: [0.785398, 0.785398, 0.872665, 1.047198, 1.047198, 1.047198, 1.047198]
+  synchronize_joint_motion: false
+  joint_sync_error_deadband_deg: 0.05
+  # Initial full-arm commissioning envelope in URDF coordinates (J1..J7).
+  # deg lower=[-60,-75,-60,-8,-60,-30,-55]
+  # deg upper=[ 60,  7, 60,85, 60, 35, 55]
+  joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -1.047198, -0.139626, -1.047198, -0.523599, -0.959931]
+  joint_soft_upper_limits_urdf: [1.047198, 0.122173, 1.047198, 1.483530, 1.047198, 0.610865, 0.959931]
+  max_joint_deviation_from_start: 0.0  # legacy uniform limit; disabled in favor of per-joint limits
+  # SenseGlove pilot: only terminal physical joints 5/6/7 control hand orientation.
+  right_wrist_joint_indices: [4, 5, 6]    # zero-based SDK joint indices
+  # Calibrated glove IMU zero maps to these SDK physical joint positions.
+  wrist_neutral_joint_positions: [0.0, 0.0, 0.0]
+  right_wrist_max_angle_deg: 40.0             # total 3-axis offset; still bounded by joint hard limits
+  wrist_return_timeout_s: 10.0                # q: bounded time to return J5/J6/J7 to zero
+  wrist_return_tolerance_deg: 1.0             # q: feedback tolerance before disabling
+  return_feedback_grace_s: 1.0                # tolerate short CAN gaps during controlled return
+  return_verify_samples: 3                    # consecutive in-tolerance feedback frames required
+  return_phase_attempts: 2                    # retry before entering manual-intervention hold
+  disable_on_unconfirmed_return: false        # keep enabled for an operator s/d/x decision
+  right_wrist_max_step: 0.004              # rad/command, about 0.23 deg
+  right_wrist_max_velocity: 0.1396263      # rad/s, 8 deg/s
+  right_wrist_max_acceleration: 0.2792527  # rad/s^2, 16 deg/s^2
+  left_arm_disable_on_connect: true
+  right_arm_disable_on_connect: true       # match left arm: no mode/position command at startup
+  # Left V1.12 may publish no CAN frames while power-on disabled. In PICO
+  # single-left-arm mode, defer the bounded feedback wake/zero verification to e.
+  left_arm_allow_silent_disabled_startup: true
+  # PICO single-arm pilot: URDF zero is the natural-down pose. The corresponding
+  # SDK feedback is [0, pi/2, 0, 0, 0, 0, 0] because J2 has a +pi/2 offset.
+  full_arm_startup_zero_tolerance_deg: 8.0
+  full_arm_return_timeout_s: 30.0
+  full_arm_return_tolerance_deg: 1.5
+  joint_limit_margin: 0.05
+  left_joint_directions: [1, 1, 1, 1, 1, 1, 1]
+  right_joint_directions: [1, 1, 1, 1, 1, 1, 1]
+  # physical = direction * URDF + offset. Both arms use the SDK-positive
+  # direction for J1..J7; J3 must not be inverted on the installed right arm.
+  left_joint_offsets: [0, 1.5707963267948966, 0, 0, 0, 0, 0]
+  right_joint_offsets: [0, 1.5707963267948966, 0, 0, 0, 0, 0]
+
+retarget:
+  host: 0.0.0.0
+  port: 15050
+  retargeting_mode: arm_vector
+  # Align only the natural-down upper-arm direction with a minimum rotation.
+  # H1/H2 transverse axes remain fixed by source_to_robot_rotation.
+  arm_vector_position_mode: segment_direction_relative
+  position_delta_signs: [1.0, 1.0, 1.0]
+  swap_left_right_targets: false
+  enable_elbow_ik_targets: true
+  auto_start_reference: true
+  auto_start_reference_prepare_s: 5.0       # complete-pose detection -> preparation countdown
+  auto_start_reference_delay_s: 4.0         # stabilization + sample phase duration
+  auto_start_reference_sample_start_s: 1.0  # first second of this phase is not sampled
+  auto_start_reference_max_position_std_m: 0.05
+  arm_vector_max_reach: 0.72
+  max_endpoint_translation_velocity_m_s: 0.18
+  use_hand_imu_orientation: true
+  # Pure PICO left-arm tests may run without a glove. In that case J5-J7 hold
+  # their current feedback values and only J1-J4 follow shoulder/elbow/wrist.
+  require_hand_imu_for_active_arm: false
+  # A missing glove must never make PICO wrist orientation drive J5-J7.
+  allow_pico_wrist_orientation_fallback: false
+  # Calibration removes only the IMU zero offset. Motion stays in the glove's
+  # anatomical X/Y/Z axes. The measured per-side J7 direction is configured
+  # below; the left side now maps to J5/J6/+J7.
+  hand_imu_input_frame: senseglove_zeroed_anatomical_axes
+  # Shared fallback, retained for compatibility with existing configurations.
+  hand_imu_local_rotvec_to_robot_hand: [0, 1, 0, 0, 0, -1, 1, 0, 0]
+  # Left Nova 2 reports anatomical X/Y/Z as twist/side-sway/flexion. The latest
+  # isolated-arm check verified that left flexion needs the positive J7 sign.
+  left_hand_imu_local_rotvec_to_robot_hand: [0, 1, 0, 0, 0, 1, 1, 0, 0]
+  # Right-hand measured X/Y/Z drive longitudinal twist/side-sway/flexion.
+  # The physical right J7 flexion direction is positive (verified 2026-09-09).
+  right_hand_imu_local_rotvec_to_robot_hand: [0, 1, 0, 0, 0, 1, 1, 0, 0]
+  # Integrate accepted body-local X/Y/Z increments independently on both hands.
+  # Left/right still use their own fixed final direction matrices above.
+  left_hand_imu_xyz_decomposition: true
+  right_hand_imu_xyz_decomposition: true
+  # Compatibility path for older world-frame IMU UDP packets.
+  hand_imu_source_to_robot_rotation: [0, -1, 0, 0, 0, -1, 1, 0, 0]
+  hand_imu_max_angle_deg: 45.0
+  hand_imu_max_step_deg: 2.0
+
+ik:
+  urdf_path: urdf/esrobo_waist_with_head.urdf
+  base_link_name: waist_link3
+  enable_elbow_tasks: true
+  # Keep the anatomical chain explicit: J1-J4 follow PICO arm segments while
+  # J5-J7 follow the SenseGlove IMU in the URDF terminal-joint frame.
+  partition_terminal_wrist_ik: true
+  # Compute J4 directly from the target upper-arm/forearm angle, then let IK
+  # use J1-J3 for shoulder direction and elbow bend-plane placement.
+  partition_elbow_flexion_from_segments: true
+  dt: 0.02
+  iterations_per_cycle: 1
+  position_cost: 32.0
+  orientation_cost: 0.05
+  elbow_position_cost: 80.0
+  max_command_lead: 0.50
+  max_joint_position_delta: 0.50
+  clamp_to_limits: true
+
+hand:
+  mode: udp                 # udp | ros2
+  udp_host: 127.0.0.1
+  udp_port: 15051
+  feedback_udp_port: 15052
+  left_topic: /cb_left_hand_control_cmd
+  right_topic: /cb_right_hand_control_cmd
+  publish_hz: 50.0
+  max_stale_time_s: 0.5
+  require_feedback_on_enable: true
+  # The installed L20Lite hand uses the SDK's L10 interface (10 active actuators).
+  # Its full URDF expands the remaining passive joints with mimic relations.
+  model: L10
+  # Safety limits (0..255 servo units).  Hands require 'h' (or --enable) to move.
+  enable_on_start: false
+  out_min: 0
+  out_max: 255
+  max_step: 18
+  max_velocity: 400
+  home: [255, 128, 255, 255, 255, 255, 128, 128, 128, 128]
+  return_open_on_quit: true
+  return_open_duration_s: 1.5
+  # After glove calibration, align and verify every physical hand joint against
+  # the side-specific natural-open zero before accepting h/e.
+  startup_open_tolerance: 12       # 0..255 servo feedback units
+  startup_open_verify_timeout_s: 2.0
+  # L10 physical indices: 0 thumb flex, 1 thumb spread, 2..5 finger flex,
+  # 6/7/8 finger spread, 9 thumb roll. Keep unverified spread/roll axes held.
+  enabled_physical_joints: [0, 1, 2, 3, 4, 5, 9]
+  left_open:   [255, 255, 255, 255, 255, 255, 128, 128, 128, 128]
+  left_closed: [0,   0,   0,   0,   0,   0,   128, 128, 128, 128]
+  right_open:   [255, 210, 255, 255, 255, 255, 110, 110, 120, 33]
+  # Measured right-hand feedback at the physical natural-open pose.  Keep this
+  # separate from the command endpoint because command/feedback may differ by
+  # one count; repeated current hardware feedback places joint 0 near 254.
+  right_open_feedback: [254, 210, 254, 254, 254, 254, 109, 109, 119, 33]
+  right_closed: [73,  75,  0,   0,   0,   0,   110, 110, 120, 78]
+  # Right-thumb teleoperation endpoints (indices 0/1/9). These stay inside
+  # ranges exercised by the vendor L10 examples. Per-frame limits still apply.
+  # Startup/q continue to use right_open; this only expands active tracking.
+  right_teleop_closed: [40, 40, 0, 0, 0, 0, 110, 110, 120, 100]

@@ -436,7 +436,13 @@ class LinkerHandL10Can:
 
     def get_torque(self):
         '''Get current motor torque'''
-        if self.version != None and self.version[4]< 36:
+        # Older L10 firmware may return only the three-byte version tuple
+        # [dof, hardware, revision].  Torque feedback is unavailable there;
+        # do not index a non-existent protocol-version byte and kill the ROS
+        # driver when /cb_*_hand_info gains a subscriber.
+        if self.version is not None and (
+            len(self.version) <= 4 or self.version[4] < 36
+        ):
             return [-1] * 5
         else:
             self.send_frame(0x02, [])

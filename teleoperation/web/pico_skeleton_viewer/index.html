@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PICO 双臂骨架诊断</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="workspace">
+    <header class="topbar">
+      <div class="title-block">
+        <h1>PICO 双臂骨架诊断</h1>
+        <span id="sequence">序列 --</span>
+      </div>
+      <div class="status-cluster">
+        <span id="status-dot" class="status-dot waiting"></span>
+        <strong id="status-text">等待骨架数据</strong>
+        <span id="freshness">-- ms</span>
+        <span id="rate">-- Hz</span>
+      </div>
+      <div class="toolbar">
+        <select id="view-mode" aria-label="骨架数据层">
+          <option value="raw">PICO 原始</option>
+          <option value="robot">固定映射</option>
+          <option value="retarget">重定向目标</option>
+          <option value="ik">IK 结果</option>
+          <option value="command">限速命令</option>
+          <option value="feedback">实际反馈</option>
+        </select>
+        <button id="pause" class="command" type="button">暂停</button>
+        <button id="reset-camera" class="command" type="button">重置视角</button>
+      </div>
+    </header>
+
+    <section class="viewport" aria-label="三维骨架视图">
+      <div id="scene"></div>
+      <div class="side-label left">左臂</div>
+      <div class="side-label right">右臂</div>
+      <div class="axis-legend">
+        <span><i class="axis x"></i>+X</span>
+        <span><i class="axis y"></i>+Y</span>
+        <span><i class="axis z"></i>+Z</span>
+      </div>
+    </section>
+
+    <aside class="diagnostics">
+      <section>
+        <h2>追踪质量</h2>
+        <dl class="metrics">
+          <div><dt>有效节点</dt><dd id="valid-count">0 / 0</dd></div>
+          <div><dt>左大臂</dt><dd id="left-upper">-- m</dd></div>
+          <div><dt>左前臂</dt><dd id="left-fore">-- m</dd></div>
+          <div><dt>右大臂</dt><dd id="right-upper">-- m</dd></div>
+          <div><dt>右前臂</dt><dd id="right-fore">-- m</dd></div>
+        </dl>
+      </section>
+
+      <section class="coordinates">
+        <div class="section-heading">
+          <h2>关键点坐标</h2>
+          <span id="coordinate-frame">PICO</span>
+        </div>
+        <table>
+          <thead><tr><th>节点</th><th>X</th><th>Y</th><th>Z</th></tr></thead>
+          <tbody id="coordinate-rows"></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>坐标变换</h2>
+        <pre id="transform-matrix">--</pre>
+      </section>
+
+      <section>
+        <div class="section-heading"><h2>左臂关节角</h2><span>deg</span></div>
+        <table>
+          <thead><tr><th>关节</th><th>IK</th><th>命令</th><th>反馈</th></tr></thead>
+          <tbody id="joint-rows"></tbody>
+        </table>
+      </section>
+    </aside>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

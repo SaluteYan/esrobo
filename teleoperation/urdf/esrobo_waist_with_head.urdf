@@ -1,0 +1,1989 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com)
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot name="esrobo_waist_with_head">
+  <link name="base_link">
+    <inertial>
+      <origin xyz="-0.000129441397167085 -6.22722892037464E-05 -0.00402714196093296" rpy="0 0 0"/>
+      <mass value="21.7638613943256"/>
+      <inertia ixx="0.454081742173464" ixy="1.28167222825801E-11" ixz="-7.47987584093224E-08" iyy="0.895403122553941" iyz="1.11445825179406E-10" izz="1.34925284828622"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/base_link.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/base_link.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="lidar_link">
+    <inertial>
+      <origin xyz="-0.00109627025871695 0.000183356751178587 0.0366912045066785" rpy="0 0 0"/>
+      <mass value="0.107757812286884"/>
+      <inertia ixx="0.000114594535776428" ixy="-4.4688676954733E-07" ixz="3.06220276390766E-07" iyy="0.000116461362113387" iyz="8.53460714901472E-09" izz="0.000212642925491531"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/lidar_link.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/lidar_link.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="lidar_joint" type="fixed">
+    <origin xyz="0.29914 -0.0080486 0" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="lidar_link"/>
+    <axis xyz="0 0 0"/>
+  </joint>
+  <link name="waist_base">
+    <inertial>
+      <origin xyz="5.74354333826577E-06 0.0415941681094107 0.00888296360321766" rpy="0 0 0"/>
+      <mass value="1.2946424823513"/>
+      <inertia ixx="0.00988326066505988" ixy="-7.55814216293633E-08" ixz="5.42274064763639E-07" iyy="0.0124431832125879" iyz="-0.00102062149082877" izz="0.00658734084893035"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/waist_base.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/waist_base.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="waist_baseJoint" type="fixed">
+    <origin xyz="-0.15642 0 0" rpy="1.5708 0 0"/>
+    <parent link="base_link"/>
+    <child link="waist_base"/>
+    <axis xyz="0 0 0"/>
+  </joint>
+  <link name="waist_link1">
+    <inertial>
+      <origin xyz="0.000516545014009218 0.123998452250287 0.0255445430136935" rpy="0 0 0"/>
+      <mass value="2.61616445921771"/>
+      <inertia ixx="0.0531693840366685" ixy="-0.000149293069703163" ixz="-1.73824660122067E-05" iyy="0.0171217520499665" iyz="-0.00417798469628159" izz="0.041343390763757"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/waist_link1.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/waist_link1.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="waist_joint1" type="revolute">
+    <origin xyz="0 0.085004 -0.038804" rpy="0 0 0"/>
+    <parent link="waist_base"/>
+    <child link="waist_link1"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="0" upper="1.57" effort="0" velocity="0"/>
+  </joint>
+  <link name="waist_link2">
+    <inertial>
+      <origin xyz="0.00027645368158602 0.115617426784295 0.00641703247261105" rpy="0 0 0"/>
+      <mass value="2.01092959225819"/>
+      <inertia ixx="0.038745673958895" ixy="-7.93834409693227E-05" ixz="-6.03351978096313E-06" iyy="0.00601594119878968" iyz="-0.00249807245898995" izz="0.0365983543759957"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/waist_link2.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/waist_link2.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="waist_joint2" type="revolute">
+    <origin xyz="0.0014113 0.33999 0.028215" rpy="0 0 0"/>
+    <parent link="waist_link1"/>
+    <child link="waist_link2"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="0" upper="1.57" effort="0" velocity="0"/>
+  </joint>
+  <link name="waist_link3">
+    <inertial>
+      <origin xyz="-0.00230171535637425 0.284729690037248 0.0133442227879417" rpy="0 0 0"/>
+      <mass value="7.46035263489037"/>
+      <inertia ixx="0.091563419537643" ixy="0.00279979142983045" ixz="0.00324538431984483" iyy="0.0540817966652999" iyz="-0.00173986009603368" izz="0.0681486470068731"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/waist_link3.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/waist_link3.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="waist_joint3" type="revolute">
+    <origin xyz="0.00082778 0.34 0" rpy="0 0 0"/>
+    <parent link="waist_link2"/>
+    <child link="waist_link3"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="0" upper="1.57" effort="0" velocity="0"/>
+  </joint>
+  <link name="leftArm_link"/>
+  <link name="left_nero_base_link">
+    <inertial>
+      <origin xyz="-0.00319465997 -0.0432175844 -0.0000548348271" rpy="1.5708 0 0"/>
+      <mass value="1.06458435"/>
+      <inertia ixx="0.00102659855152" ixy="0.00000186219753" ixz="-0.00000295298037" iyy="0.00114399299508" iyz="-0.00000078763492" izz="0.00090872933022"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/base_link.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/base_link.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="leftArm_base_joint" type="fixed">
+    <origin xyz="0.0075362 0.42752 -0.096999" rpy="0 0 0"/>
+    <parent link="waist_link3"/>
+    <child link="leftArm_link"/>
+  </joint>
+  <joint name="left_nero_base_mount_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="1.5708 0 1.5708"/>
+    <parent link="leftArm_link"/>
+    <child link="left_nero_base_link"/>
+  </joint>
+  <link name="left_nero_link1">
+    <inertial>
+      <origin xyz="-0.00076810578 -0.00005718031 -0.00686372765" rpy="0 0 0"/>
+      <mass value="0.76710504"/>
+      <inertia ixx="0.00066689512233" ixy="0.00000273938306" ixz="0.00001463284987" iyy="0.00054501235592" iyz="0.00000183168344" izz="0.00051509465737"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link1.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link1.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="leftArm_joint" type="revolute">
+    <origin xyz="0 -0.138 -0.000000506902" rpy="1.5708 0 0"/>
+    <parent link="left_nero_base_link"/>
+    <child link="left_nero_link1"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.70526" upper="2.70526" effort="100" velocity="5"/>
+  </joint>
+  <link name="left_nero_link2">
+    <inertial>
+      <origin xyz="0.00079686657 -0.07890325930 0.00111849422" rpy="0 0 0"/>
+      <mass value="0.69381908"/>
+      <inertia ixx="0.00201093857656" ixy="-0.00002399426785" ixz="-0.00000072824714" iyy="0.00063544232555" iyz="0.00005831284343" izz="0.00181943989593"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link2.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link2.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_nero_joint2" type="revolute">
+    <origin xyz="0 0 0" rpy="1.5707963 1.5707963 0"/>
+    <parent link="left_nero_link1"/>
+    <child link="left_nero_link2"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.3107963" upper="0.1692037" effort="100" velocity="5"/>
+  </joint>
+  <link name="left_nero_link3">
+    <inertial>
+      <origin xyz="0.00014513363 -0.00121378766 -0.04861136795" rpy="0 0 0"/>
+      <mass value="0.67246544"/>
+      <inertia ixx="0.00343229961910" ixy="-0.00000026976739" ixz="0.00000305078107" iyy="0.00338662526897" iyz="-0.00003550220027" izz="0.00028853579710"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link3.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link3.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_nero_joint3" type="revolute">
+    <origin xyz="0 -0.31 0" rpy="-1.5707963  0 3.1415926926"/>
+    <parent link="left_nero_link2"/>
+    <child link="left_nero_link3"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.75" upper="2.75" effort="100" velocity="5"/>
+  </joint>
+  <link name="left_nero_link4">
+    <inertial>
+      <origin xyz="-0.00031334623 -0.05675192422 0.00076056133" rpy="0 0 0"/>
+      <mass value="0.48451414"/>
+      <inertia ixx="0.00050386693505" ixy="-0.00000529675237" ixz="0.00000006134740" iyy="0.00023502068202" iyz="0.00001815932566" izz="0.00040149523118"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link4.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link4.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_nero_joint4" type="revolute">
+    <origin xyz="0 0 0" rpy="-1.5707963  0 3.1415926926"/>
+    <parent link="left_nero_link3"/>
+    <child link="left_nero_link4"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.01" upper="2.14" effort="100" velocity="5"/>
+  </joint>
+  <link name="left_nero_link5">
+    <inertial>
+      <origin xyz="0.00265591357 0.00201195753 -0.11620855434" rpy="0 0 0"/>
+      <mass value="0.58368405"/>
+      <inertia ixx="0.00089537686723" ixy="0.00000648218232" ixz="-0.00001463346849" iyy="0.00085866122972" iyz="-0.00004035185637" izz="0.00021774946532"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link5.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link5.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_nero_joint5" type="revolute">
+    <origin xyz="0 -0.27001 0" rpy="1.5707963  -1.5707963  0"/>
+    <parent link="left_nero_link4"/>
+    <child link="left_nero_link5"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.75" upper="2.75" effort="100" velocity="5"/>
+  </joint>
+  <link name="left_nero_link6">
+    <inertial>
+      <origin xyz="0.00009501505 0.00107831174 -0.00019110990" rpy="0 0 0"/>
+      <mass value="0.3140406"/>
+      <inertia ixx="0.00006027211661" ixy="-0.00000024650903" ixz="0.00000015701294" iyy="0.00004699514792" iyz="0.00000004170875" izz="0.00005756771792"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link6.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link6.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_nero_joint6" type="revolute">
+    <origin xyz="0 0 0" rpy="1.5707963  -1.5707963  0"/>
+    <parent link="left_nero_link5"/>
+    <child link="left_nero_link6"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.73" upper="0.95" effort="100" velocity="5"/>
+  </joint>
+  <link name="left_nero_link7">
+    <inertial>
+      <origin xyz="-0.00014000 -0.00010000 -0.00275000" rpy="0 0 0"/>
+      <mass value="0.000001"/>
+      <inertia ixx="1.1000000000000001e-07" ixy="0" ixz="0" iyy="1.1000000000000001e-07" iyz="0" izz="1.9999999999999999e-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link7.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link7.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_nero_joint7" type="revolute">
+    <origin xyz="0 -0.0235 0" rpy="1.5707963 0 0"/>
+    <parent link="left_nero_link6"/>
+    <child link="left_nero_link7"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.5707963" upper="1.5707963" effort="100" velocity="5"/>
+  </joint>
+  <link name="left_nero_gripper_flange">
+    <inertial>
+      <origin xyz="0.000253201 -0.000322696 -0.010082901" rpy="0 0 0"/>
+      <mass value="0.04771096"/>
+      <inertia ixx="36.14107e-06" ixy="0" ixz="0" iyy="17.824164e-06" iyz="0" izz="26.95944e-06"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/gripper_flange.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/gripper_flange.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_nero_gripper_flange_joint" type="fixed">
+    <origin xyz="0.031 0 -0.0235" rpy="-1.5708 0 -1.5708"/>
+    <parent link="left_nero_link7"/>
+    <child link="left_nero_gripper_flange"/>
+  </joint>
+  <link name="leftSensor_link">
+    <inertial>
+      <origin xyz="0.029089727563582 -0.0391723252917056 0.000257031991900303" rpy="0 0 0"/>
+      <mass value="0.254777372478428"/>
+      <inertia ixx="0.00011272201620718" ixy="2.28684953755629E-07" ixz="-1.25670676105189E-07" iyy="0.000234682185717791" iyz="-3.1326530601045E-07" izz="0.000152969661912388"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/leftSensor_link.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/leftSensor_link.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="leftSensor_joint" type="fixed">
+    <origin xyz="0 0 0.012" rpy="-1.5708 0 0"/>
+    <parent link="left_nero_gripper_flange"/>
+    <child link="leftSensor_link"/>
+  </joint>
+  <link name="leftHand_link">
+    <inertial>
+      <origin xyz="-0.00378861347432373 0.000820204450131895 0.0805686615689543" rpy="0 0 0"/>
+      <mass value="0.103652479414672"/>
+      <inertia ixx="0.000193076183440551" ixy="1.28622350247875E-06" ixz="-2.06064564153793E-07" iyy="0.000129262885172737" iyz="-2.33887125894354E-06" izz="7.7154522927273E-05"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/hand_base_link.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/hand_base_link.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="leftHand_joint" type="fixed">
+    <origin xyz="-0.00021023 -0.0865 0" rpy="1.5708 3.1416 0"/>
+    <parent link="leftSensor_link"/>
+    <child link="leftHand_link"/>表示x、y、z偏移量，单位米表示x、y、z偏移量，单位米
+  </joint>
+  <link name="left_thumb_metacarpals_base1">
+    <inertial>
+      <origin xyz="0.0284841419451473 0.0032328053117659 1.27102541975441E-05" rpy="0 0 0"/>
+      <mass value="0.00840514828448049"/>
+      <inertia ixx="1.40225690783513E-06" ixy="1.196162690714E-07" ixz="7.34629714950971E-09" iyy="9.92532738625187E-07" iyz="-4.63982709938509E-08" izz="7.25924523731736E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/thumb_metacarpals_base1.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/thumb_metacarpals_base1.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_thumb_cmc_roll" type="revolute">
+    <origin xyz="-0.013419 -0.012551 0.060602" rpy="0 0 0"/>
+    <parent link="leftHand_link"/>
+    <child link="left_thumb_metacarpals_base1"/>
+    <axis xyz="-0.99996 0 -0.0087265"/>
+    <limit lower="0" upper="1.03" effort="4.8" velocity="1"/>
+  </joint>
+  <link name="left_thumb_metacarpals_base2">
+    <inertial>
+      <origin xyz="0.00149333647480262 -0.00615813217507052 -0.000273768129351912" rpy="0 0 0"/>
+      <mass value="0.00244725656099355"/>
+      <inertia ixx="1.15757169903916E-07" ixy="-4.50060051446398E-09" ixz="-9.19744539328016E-10" iyy="9.88121769947347E-08" iyz="3.81969206030993E-09" izz="6.88506418885536E-08"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/thumb_metacarpals_base2.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/thumb_metacarpals_base2.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_thumb_cmc_yaw" type="revolute">
+    <origin xyz="0.035797 0.00065879 0.00045944" rpy="0.13232 -0.0087266 0"/>
+    <parent link="left_thumb_metacarpals_base1"/>
+    <child link="left_thumb_metacarpals_base2"/>
+    <axis xyz="0 0.087156 0.99619"/>
+    <limit lower="0" upper="1.40" effort="4.8" velocity="1"/>
+  </joint>
+  <link name="left_thumb_metacarpals">
+    <inertial>
+      <origin xyz="0.00183663729904029 3.46162460989133E-06 0.026990412201572" rpy="0 0 0"/>
+      <mass value="0.0152011788694593"/>
+      <inertia ixx="2.95369587925714E-06" ixy="4.74536745194236E-11" ixz="-1.58087239939667E-07" iyy="3.84770419198789E-06" iyz="4.13672896569864E-10" izz="1.32008560539723E-06"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/thumb_metacarpals.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/thumb_metacarpals.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_thumb_cmc_pitch" type="revolute">
+    <origin xyz="0.0036974 -0.015398 -0.0019891" rpy="0 -0.9163 1.8064"/>
+    <parent link="left_thumb_metacarpals_base2"/>
+    <child link="left_thumb_metacarpals"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.52" effort="4.8" velocity="1"/>
+  </joint>
+  <link name="left_thumb_proximal">
+    <inertial>
+      <origin xyz="0.00159260267405223 4.28988976902342E-06 0.0151572309111939" rpy="0 0 0"/>
+      <mass value="0.00662225085289633"/>
+      <inertia ixx="1.01526328949763E-06" ixy="-7.87460584199835E-12" ixz="-4.4224308859969E-08" iyy="9.10425089721739E-07" iyz="2.81833762972893E-11" izz="4.47462917464685E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/thumb_proximal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/thumb_proximal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_thumb_mcp" type="revolute">
+    <origin xyz="0.0061722 0 0.047968" rpy="0 0 0"/>
+    <parent link="left_thumb_metacarpals"/>
+    <child link="left_thumb_proximal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.72" effort="3.7" velocity="1"/>
+    <mimic joint="left_thumb_cmc_pitch" multiplier="1.38" offset="0"/>
+  </joint>
+  <link name="left_thumb_distal">
+    <inertial>
+      <origin xyz="-0.00138833978915306 -1.92768110708619E-06 0.0115764513296314" rpy="0 0 0"/>
+      <mass value="0.00512798334000111"/>
+      <inertia ixx="3.30808161248092E-07" ixy="-3.43833611720834E-10" ixz="-1.04696624534012E-07" iyy="3.2363078244428E-07" iyz="-1.18697138701936E-10" izz="2.48875198442135E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/thumb_distal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/thumb_distal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_thumb_ip" type="revolute">
+    <origin xyz="-0.00017064 0 0.038665" rpy="0 0 0"/>
+    <parent link="left_thumb_proximal"/>
+    <child link="left_thumb_distal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.78" effort="3.36" velocity="1"/>
+    <mimic joint="left_thumb_cmc_pitch" multiplier="1.49" offset="0"/>
+  </joint>
+  <link name="left_index_metacarpals">
+    <inertial>
+      <origin xyz="-0.00143091454702933 2.56878017135254E-07 0.0107040528609869" rpy="0 0 0"/>
+      <mass value="0.0038877126435198"/>
+      <inertia ixx="1.87149599832498E-07" ixy="3.67335498441413E-11" ixz="1.3415127653338E-08" iyy="2.75278147668716E-07" iyz="2.44762951204078E-11" izz="2.06866317113344E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/index_metacarpals.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/index_metacarpals.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_index_mcp_roll" type="revolute">
+    <origin xyz="-0.0021643 -0.026654 0.13253" rpy="0.027927 -0.0087198 -0.00024358"/>
+    <parent link="leftHand_link"/>
+    <child link="left_index_metacarpals"/>
+    <axis xyz="1 0.00024367 0"/>
+    <limit lower="0" upper="0.19" effort="4.29" velocity="1"/>
+  </joint>
+  <link name="left_index_proximal">
+    <inertial>
+      <origin xyz="-0.00122347616770057 -2.04121170566118E-06 0.0182409893195748" rpy="0 0 0"/>
+      <mass value="0.00316246584579941"/>
+      <inertia ixx="3.57135128024094E-07" ixy="1.42036124901073E-11" ixz="-4.14209968733606E-08" iyy="3.51905870436209E-07" iyz="-1.08557233942923E-10" izz="1.40872561400322E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/index_proximal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/index_proximal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_index_mcp_pitch" type="revolute">
+    <origin xyz="0.0022097 0 0.015275" rpy="0 0 0.00024367"/>
+    <parent link="left_index_metacarpals"/>
+    <child link="left_index_proximal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.36" effort="4.8" velocity="1"/>
+  </joint>
+  <link name="left_index_middle">
+    <inertial>
+      <origin xyz="-0.00250309203564306 2.18945385091485E-06 0.0110397390913486" rpy="0 0 0"/>
+      <mass value="0.00283043921422803"/>
+      <inertia ixx="2.61037133593912E-07" ixy="5.76197451786318E-11" ixz="-4.0011060525121E-08" iyy="2.33077518995487E-07" iyz="-2.86979503467821E-11" izz="1.26543797445814E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/index_middle.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/index_middle.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_index_pip" type="revolute">
+    <origin xyz="-0.0010697 0 0.035634" rpy="0 0 0"/>
+    <parent link="left_index_proximal"/>
+    <child link="left_index_middle"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.78" effort="3.7" velocity="1"/>
+    <mimic joint="left_index_mcp_pitch" multiplier="1.3" offset="0"/>
+  </joint>
+  <link name="left_index_distal">
+    <inertial>
+      <origin xyz="-0.000604509916724614 -4.77400032578013E-06 0.0121511111849248" rpy="0 0 0"/>
+      <mass value="0.0031445375098231"/>
+      <inertia ixx="1.64070673729839E-07" ixy="1.88963511473794E-11" ixz="-4.27776869144244E-08" iyy="1.48362830813358E-07" iyz="-1.9734013143508E-10" izz="9.7804088657243E-08"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/index_distal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/index_distal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_index_dip" type="revolute">
+    <origin xyz="-0.0052444 0 0.025711" rpy="0 0 0"/>
+    <parent link="left_index_middle"/>
+    <child link="left_index_distal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.62" effort="10.43" velocity="1"/>
+    <mimic joint="left_index_mcp_pitch" multiplier="0.46" offset="0"/>
+  </joint>
+  <link name="left_middle_proximal">
+    <inertial>
+      <origin xyz="-0.00123185150819907 -2.04476498746886E-06 0.0182404193627525" rpy="0 0 0"/>
+      <mass value="0.00316246719662224"/>
+      <inertia ixx="3.57097075648345E-07" ixy="1.43002807788619E-11" ixz="-4.15201646947523E-08" iyy="3.51905920397223E-07" iyz="-1.08488557665733E-10" izz="1.4091067749978E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/middle_proximal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/middle_proximal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_middle_mcp_pitch" type="revolute">
+    <origin xyz="-0.0021316 -0.0076542 0.15281" rpy="0 -0.0087266 0"/>
+    <parent link="leftHand_link"/>
+    <child link="left_middle_proximal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.36" effort="4.8" velocity="1"/>
+  </joint>
+  <link name="left_middle_middle">
+    <inertial>
+      <origin xyz="-0.00252079729924576 2.18964489481777E-06 0.0110357094277332" rpy="0 0 0"/>
+      <mass value="0.00283043921858529"/>
+      <inertia ixx="2.60908423355366E-07" ixy="5.76720293661014E-11" ixz="-4.02265908644236E-08" iyy="2.33077520740401E-07" iyz="-2.86057758459882E-11" izz="1.26672514044425E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/middle_middle.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/middle_middle.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_middle_pip" type="revolute">
+    <origin xyz="-0.0010861 0 0.035634" rpy="0 0 0"/>
+    <parent link="left_middle_proximal"/>
+    <child link="left_middle_middle"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.78" effort="3.7" velocity="1"/>
+    <mimic joint="left_middle_mcp_pitch" multiplier="1.3" offset="0"/>
+  </joint>
+  <link name="left_middle_distal">
+    <inertial>
+      <origin xyz="-0.000622397825955366 -4.75569749899818E-06 0.012150171418504" rpy="0 0 0"/>
+      <mass value="0.00314452092964384"/>
+      <inertia ixx="1.63942838563309E-07" ixy="1.9526841627913E-11" ixz="-4.28753645610842E-08" iyy="1.48361296215111E-07" iyz="-1.96949597957508E-10" izz="9.7929884595885E-08"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/middle_distal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/middle_distal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_middle_dip" type="revolute">
+    <origin xyz="-0.0052857 0 0.025703" rpy="0 0 0"/>
+    <parent link="left_middle_middle"/>
+    <child link="left_middle_distal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.62" effort="10.43" velocity="1"/>
+    <mimic joint="left_middle_mcp_pitch" multiplier="0.46" offset="0"/>
+  </joint>
+  <link name="left_ring_metacarpals">
+    <inertial>
+      <origin xyz="-0.00143091448892014 6.05495226457808E-07 0.0107040523320813" rpy="0 0 0"/>
+      <mass value="0.00388771255966599"/>
+      <inertia ixx="1.87149578481638E-07" ixy="1.52642675041227E-11" ixz="1.34151349601248E-08" iyy="2.75278155094349E-07" iyz="2.12062463357117E-11" izz="2.06866318930306E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/ring_metacarpals.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/ring_metacarpals.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_ring_mcp_roll" type="revolute">
+    <origin xyz="-0.0021643 0.011346 0.13253" rpy="-0.024435 -0.0087266 0"/>
+    <parent link="leftHand_link"/>
+    <child link="left_ring_metacarpals"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="0" upper="0.2" effort="4.29" velocity="1"/>
+  </joint>
+  <link name="left_ring_proximal">
+    <inertial>
+      <origin xyz="-0.00122347652312429 -2.0423407393888E-06 0.0182409875332818" rpy="0 0 0"/>
+      <mass value="0.00316246660225829"/>
+      <inertia ixx="3.5713512847731E-07" ixy="1.42130904393983E-11" ixz="-4.14209983311065E-08" iyy="3.51905881089114E-07" iyz="-1.08576103054512E-10" izz="1.40872582931496E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/ring_proximal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/ring_proximal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_ring_mcp_pitch" type="revolute">
+    <origin xyz="0.0022097 0 0.015275" rpy="0 0 0"/>
+    <parent link="left_ring_metacarpals"/>
+    <child link="left_ring_proximal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.36" effort="4.8" velocity="1"/>
+  </joint>
+  <link name="left_ring_middle">
+    <inertial>
+      <origin xyz="-0.00250309189885196 2.18959036171751E-06 0.0110397385966097" rpy="0 0 0"/>
+      <mass value="0.00283043920090097"/>
+      <inertia ixx="2.61037130501287E-07" ixy="5.76216047828233E-11" ixz="-4.00110582573436E-08" iyy="2.33077521207674E-07" iyz="-2.86985395311388E-11" izz="1.26543807918808E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/ring_middle.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/ring_middle.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_ring_pip" type="revolute">
+    <origin xyz="-0.0010697 0 0.035634" rpy="0 0 0"/>
+    <parent link="left_ring_proximal"/>
+    <child link="left_ring_middle"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.78" effort="3.7" velocity="1"/>
+    <mimic joint="left_ring_mcp_pitch" multiplier="1.3" offset="0"/>
+  </joint>
+  <link name="left_ring_distal">
+    <inertial>
+      <origin xyz="-0.000604497650389674 -4.73100652065295E-06 0.012151126431567" rpy="0 0 0"/>
+      <mass value="0.00314454943731604"/>
+      <inertia ixx="1.64071049652571E-07" ixy="1.94791513771428E-11" ixz="-4.27777374237679E-08" iyy="1.48363091013624E-07" iyz="-1.96468435398403E-10" izz="9.78042601257212E-08"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/ring_distal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/ring_distal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_ring_dip" type="revolute">
+    <origin xyz="-0.0052444 0 0.025711" rpy="0 0 0"/>
+    <parent link="left_ring_middle"/>
+    <child link="left_ring_distal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.62" effort="10.43" velocity="1"/>
+    <mimic joint="left_ring_mcp_pitch" multiplier="0.46" offset="0"/>
+  </joint>
+  <link name="left_pinky_metacarpals">
+    <inertial>
+      <origin xyz="-0.00143091630673887 6.05311374107798E-07 0.010704049929046" rpy="0 0 0"/>
+      <mass value="0.00388771229554929"/>
+      <inertia ixx="1.87149536268889E-07" ixy="1.52679681737727E-11" ixz="1.34151204706615E-08" iyy="2.75278106047772E-07" iyz="2.11967245454867E-11" izz="2.06866328803883E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/pinky_metacarpals.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/pinky_metacarpals.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_pinky_mcp_roll" type="revolute">
+    <origin xyz="-0.00012074 0.030346 0.12755" rpy="-0.057596 -0.0087266 0"/>
+    <parent link="leftHand_link"/>
+    <child link="left_pinky_metacarpals"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="0" upper="0.3" effort="4.29" velocity="1"/>
+  </joint>
+  <link name="left_pinky_proximal">
+    <inertial>
+      <origin xyz="-0.00122347805395697 -2.04329569369888E-06 0.0182409919418033" rpy="0 0 0"/>
+      <mass value="0.00316246781629033"/>
+      <inertia ixx="3.57135263144139E-07" ixy="1.42286998987323E-11" ixz="-4.14209901998364E-08" iyy="3.5190602349514E-07" iyz="-1.08636442666922E-10" izz="1.40872647811026E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/pinky_proximal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/pinky_proximal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_pinky_mcp_pitch" type="revolute">
+    <origin xyz="0.0022097 0 0.015275" rpy="0 0 0"/>
+    <parent link="left_pinky_metacarpals"/>
+    <child link="left_pinky_proximal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.36" effort="4.8" velocity="1"/>
+  </joint>
+  <link name="left_pinky_middle">
+    <inertial>
+      <origin xyz="-0.00250309214140259 2.1894783039933E-06 0.0110397383273556" rpy="0 0 0"/>
+      <mass value="0.00283043906989622"/>
+      <inertia ixx="2.61037124783617E-07" ixy="5.7617222079153E-11" ixz="-4.00110565109454E-08" iyy="2.33077513229909E-07" iyz="-2.86988443315275E-11" izz="1.2654380297458E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/pinky_middle.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/pinky_middle.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_pinky_pip" type="revolute">
+    <origin xyz="-0.0010697 0 0.035634" rpy="0 0 0"/>
+    <parent link="left_pinky_proximal"/>
+    <child link="left_pinky_middle"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.78" effort="3.7" velocity="1"/>
+    <mimic joint="left_pinky_mcp_pitch" multiplier="1.3" offset="0"/>
+  </joint>
+  <link name="left_pinky_distal">
+    <inertial>
+      <origin xyz="-0.000604492895887754 -4.75263680191351E-06 0.0121511379180032" rpy="0 0 0"/>
+      <mass value="0.00314455887032079"/>
+      <inertia ixx="1.64071496633017E-07" ixy="1.95563986835622E-11" ixz="-4.27779200959899E-08" iyy="1.48363675410427E-07" iyz="-1.9679860568024E-10" izz="9.78043717695209E-08"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/pinky_distal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/left/pinky_distal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_pinky_dip" type="revolute">
+    <origin xyz="-0.0052444 0 0.025711" rpy="0 0 0"/>
+    <parent link="left_pinky_middle"/>
+    <child link="left_pinky_distal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.62" effort="10.43" velocity="1"/>
+    <mimic joint="left_pinky_mcp_pitch" multiplier="0.46" offset="0"/>
+  </joint>
+  <link name="rightArm_link"/>
+  <link name="right_nero_base_link">
+    <inertial>
+      <origin xyz="-0.00319465997 -0.0432175844 -0.0000548348271" rpy="1.5708 0 0"/>
+      <mass value="1.06458435"/>
+      <inertia ixx="0.00102659855152" ixy="0.00000186219753" ixz="-0.00000295298037" iyy="0.00114399299508" iyz="-0.00000078763492" izz="0.00090872933022"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/base_link.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/base_link.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="rightArm_base_joint" type="fixed">
+    <origin xyz="0.0073775 0.42752 0.1076" rpy="0 0 0"/>
+    <parent link="waist_link3"/>
+    <child link="rightArm_link"/>
+  </joint>
+  <joint name="right_nero_base_mount_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="-1.5708 0 1.5708"/>
+    <parent link="rightArm_link"/>
+    <child link="right_nero_base_link"/>
+  </joint>
+  <link name="right_nero_link1">
+    <inertial>
+      <origin xyz="-0.00076810578 -0.00005718031 -0.00686372765" rpy="0 0 0"/>
+      <mass value="0.76710504"/>
+      <inertia ixx="0.00066689512233" ixy="0.00000273938306" ixz="0.00001463284987" iyy="0.00054501235592" iyz="0.00000183168344" izz="0.00051509465737"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link1.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link1.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="rightArm_joint" type="revolute">
+    <origin xyz="0 -0.138 -0.000000506902" rpy="1.5708 0 0"/>
+    <parent link="right_nero_base_link"/>
+    <child link="right_nero_link1"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.70526" upper="2.70526" effort="100" velocity="5"/>
+  </joint>
+  <link name="right_nero_link2">
+    <inertial>
+      <origin xyz="0.00079686657 -0.07890325930 0.00111849422" rpy="0 0 0"/>
+      <mass value="0.69381908"/>
+      <inertia ixx="0.00201093857656" ixy="-0.00002399426785" ixz="-0.00000072824714" iyy="0.00063544232555" iyz="0.00005831284343" izz="0.00181943989593"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link2.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link2.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_nero_joint2" type="revolute">
+    <origin xyz="0 0 0" rpy="1.5707963 1.5707963 0"/>
+    <parent link="right_nero_link1"/>
+    <child link="right_nero_link2"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.3107963" upper="0.1692037" effort="100" velocity="5"/>
+  </joint>
+  <link name="right_nero_link3">
+    <inertial>
+      <origin xyz="0.00014513363 -0.00121378766 -0.04861136795" rpy="0 0 0"/>
+      <mass value="0.67246544"/>
+      <inertia ixx="0.00343229961910" ixy="-0.00000026976739" ixz="0.00000305078107" iyy="0.00338662526897" iyz="-0.00003550220027" izz="0.00028853579710"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link3.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link3.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_nero_joint3" type="revolute">
+    <origin xyz="0 -0.31 0" rpy="-1.5707963  0 3.1415926926"/>
+    <parent link="right_nero_link2"/>
+    <child link="right_nero_link3"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.75" upper="2.75" effort="100" velocity="5"/>
+  </joint>
+  <link name="right_nero_link4">
+    <inertial>
+      <origin xyz="-0.00031334623 -0.05675192422 0.00076056133" rpy="0 0 0"/>
+      <mass value="0.48451414"/>
+      <inertia ixx="0.00050386693505" ixy="-0.00000529675237" ixz="0.00000006134740" iyy="0.00023502068202" iyz="0.00001815932566" izz="0.00040149523118"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link4.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link4.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_nero_joint4" type="revolute">
+    <origin xyz="0 0 0" rpy="-1.5707963  0 3.1415926926"/>
+    <parent link="right_nero_link3"/>
+    <child link="right_nero_link4"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.01" upper="2.14" effort="100" velocity="5"/>
+  </joint>
+  <link name="right_nero_link5">
+    <inertial>
+      <origin xyz="0.00265591357 0.00201195753 -0.11620855434" rpy="0 0 0"/>
+      <mass value="0.58368405"/>
+      <inertia ixx="0.00089537686723" ixy="0.00000648218232" ixz="-0.00001463346849" iyy="0.00085866122972" iyz="-0.00004035185637" izz="0.00021774946532"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link5.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link5.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_nero_joint5" type="revolute">
+    <origin xyz="0 -0.27001 0" rpy="1.5707963  -1.5707963  0"/>
+    <parent link="right_nero_link4"/>
+    <child link="right_nero_link5"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.75" upper="2.75" effort="100" velocity="5"/>
+  </joint>
+  <link name="right_nero_link6">
+    <inertial>
+      <origin xyz="0.00009501505 0.00107831174 -0.00019110990" rpy="0 0 0"/>
+      <mass value="0.3140406"/>
+      <inertia ixx="0.00006027211661" ixy="-0.00000024650903" ixz="0.00000015701294" iyy="0.00004699514792" iyz="0.00000004170875" izz="0.00005756771792"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link6.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link6.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_nero_joint6" type="revolute">
+    <origin xyz="0 0 0" rpy="1.5707963  -1.5707963  0"/>
+    <parent link="right_nero_link5"/>
+    <child link="right_nero_link6"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.73" upper="0.95" effort="100" velocity="5"/>
+  </joint>
+  <link name="right_nero_link7">
+    <inertial>
+      <origin xyz="-0.00014000 -0.00010000 -0.00275000" rpy="0 0 0"/>
+      <mass value="0.000001"/>
+      <inertia ixx="1.1000000000000001e-07" ixy="0" ixz="0" iyy="1.1000000000000001e-07" iyz="0" izz="1.9999999999999999e-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/link7.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/link7.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_nero_joint7" type="revolute">
+    <origin xyz="0 -0.0235 0" rpy="1.5707963 0 0"/>
+    <parent link="right_nero_link6"/>
+    <child link="right_nero_link7"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.5707963" upper="1.5707963" effort="100" velocity="5"/>
+  </joint>
+  <link name="right_nero_gripper_flange">
+    <inertial>
+      <origin xyz="0.000253201 -0.000322696 -0.010082901" rpy="0 0 0"/>
+      <mass value="0.04771096"/>
+      <inertia ixx="36.14107e-06" ixy="0" ixz="0" iyy="17.824164e-06" iyz="0" izz="26.95944e-06"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/dae/gripper_flange.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/nero/gripper_flange.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_nero_gripper_flange_joint" type="fixed">
+    <origin xyz="0.031 0 -0.0235" rpy="-1.5708 0 -1.5708"/>
+    <parent link="right_nero_link7"/>
+    <child link="right_nero_gripper_flange"/>
+  </joint>
+  <link name="rightSensor_link">
+    <inertial>
+      <origin xyz="0.0310964836861436 -0.0407631172972749 0.000274739563998844" rpy="0 0 0"/>
+      <mass value="0.238356407740794"/>
+      <inertia ixx="0.000109358451523035" ixy="2.20927734350437E-07" ixz="-1.25670676106554E-07" iyy="0.000228126842592843" iyz="-3.13265306009417E-07" izz="0.000149606116081088"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/rightSensor_link.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/rightSensor_link.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="rightSensor_joint" type="fixed">
+    <origin xyz="0 0 0.012" rpy="-1.5708 0 0"/>
+    <parent link="right_nero_gripper_flange"/>
+    <child link="rightSensor_link"/>
+  </joint>
+  <link name="rightHand_link">
+    <inertial>
+      <origin xyz="-0.00378572993475002 -0.00041583904893102 0.083639288361369" rpy="0 0 0"/>
+      <mass value="0.108844276105116"/>
+      <inertia ixx="0.000193454839560416" ixy="-1.28842682703635E-06" ixz="-1.97005632027442E-07" iyy="0.000129793182936331" iyz="2.34961034039848E-06" izz="7.75126657491833E-05"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/hand_base_link.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/hand_base_link.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="rightHand_joint" type="fixed">
+    <origin xyz="-0.00021023 -0.0865 0" rpy="1.5708 3.1416 0"/>
+    <parent link="rightSensor_link"/>
+    <child link="rightHand_link"/>
+  </joint>
+  <link name="right_thumb_metacarpals_base1">
+    <inertial>
+      <origin xyz="0.0284798868788809 -0.00318431295224701 1.02719477181115E-05" rpy="0 0 0"/>
+      <mass value="0.0084581547726202"/>
+      <inertia ixx="1.40243836130246E-06" ixy="-1.19619722062239E-07" ixz="7.34394052250468E-09" iyy="9.92829395244375E-07" iyz="4.64162077403213E-08" izz="7.26110349167423E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/thumb_metacarpals_base1.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/thumb_metacarpals_base1.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_thumb_cmc_roll" type="revolute">
+    <origin xyz="-0.013419 0.012551 0.060602" rpy="0 0 0"/>
+    <parent link="rightHand_link"/>
+    <child link="right_thumb_metacarpals_base1"/>
+    <axis xyz="0.99996 0 -0.0087265"/>
+    <limit lower="0" upper="1.03" effort="4.8" velocity="1"/>
+  </joint>
+  <link name="right_thumb_metacarpals_base2">
+    <inertial>
+      <origin xyz="0.00174090957798892 0.00721482590041489 -0.000263313052030728" rpy="0 0 0"/>
+      <mass value="0.00582711245702963"/>
+      <inertia ixx="3.17303010997568E-07" ixy="1.12913904502057E-08" ixz="-2.63903919763792E-09" iyy="2.73232268452871E-07" iyz="-1.09223121289568E-08" izz="1.76908306988949E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/thumb_metacarpals_base2.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/thumb_metacarpals_base2.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_thumb_cmc_yaw" type="revolute">
+    <origin xyz="0.035798 -0.0006691 0.00040146" rpy="-0.13233 -0.0085747 0.0011413"/>
+    <parent link="right_thumb_metacarpals_base1"/>
+    <child link="right_thumb_metacarpals_base2"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="0" upper="1.40" effort="4.8" velocity="1"/>
+  </joint>
+  <link name="right_thumb_metacarpals">
+    <inertial>
+      <origin xyz="0.00183662400665177 -2.80439600631663E-06 0.0269904280709441" rpy="0 0 0"/>
+      <mass value="0.0152012256765109"/>
+      <inertia ixx="2.95371260447027E-06" ixy="-6.21178551021653E-11" ixz="-1.58082424321764E-07" iyy="3.8477229500142E-06" iyz="-4.14758708520733E-10" izz="1.32007940012866E-06"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/thumb_metacarpals.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/thumb_metacarpals.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_thumb_cmc_pitch" type="revolute">
+    <origin xyz="0.0037151 0.015396 -0.0019302" rpy="0 -0.9163 -1.8076"/>
+    <parent link="right_thumb_metacarpals_base2"/>
+    <child link="right_thumb_metacarpals"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.52" effort="4.8" velocity="1"/>
+  </joint>
+  <link name="right_thumb_proximal">
+    <inertial>
+      <origin xyz="0.00159268252983606 -4.43643671124011E-06 0.015157363827759" rpy="0 0 0"/>
+      <mass value="0.00662231923284161"/>
+      <inertia ixx="1.01527279135723E-06" ixy="3.86298144933713E-12" ixz="-4.42245334725163E-08" iyy="9.10434608488902E-07" iyz="-2.76864906314695E-11" izz="4.47464440479559E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/thumb_proximal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/thumb_proximal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_thumb_mcp" type="revolute">
+    <origin xyz="0.0061722 0 0.047968" rpy="0 0 0"/>
+    <parent link="right_thumb_metacarpals"/>
+    <child link="right_thumb_proximal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.72" effort="3.7" velocity="1"/>
+    <mimic joint="right_thumb_cmc_pitch" multiplier="1.38" offset="0"/>
+  </joint>
+  <link name="right_thumb_distal">
+    <inertial>
+      <origin xyz="-0.00138929852568181 1.78258724357894E-06 0.0115789166085123" rpy="0 0 0"/>
+      <mass value="0.00512919991432349"/>
+      <inertia ixx="3.30966764284813E-07" ixy="3.4874903065333E-10" ixz="-1.0473713688836E-07" iyy="3.23803379547457E-07" iyz="8.38797000457644E-11" izz="2.48897458436709E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/thumb_distal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/thumb_distal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_thumb_ip" type="revolute">
+    <origin xyz="-0.00017064 0 0.038665" rpy="0 0 0"/>
+    <parent link="right_thumb_proximal"/>
+    <child link="right_thumb_distal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.78" effort="3.36" velocity="1"/>
+    <mimic joint="right_thumb_cmc_pitch" multiplier="1.49" offset="0"/>
+  </joint>
+  <link name="right_index_metacarpals">
+    <inertial>
+      <origin xyz="-0.000394044300581899 -6.96524768268453E-07 0.00909446180986484" rpy="0 0 0"/>
+      <mass value="0.00903700329493157"/>
+      <inertia ixx="4.89554250283515E-07" ixy="-3.94697795521512E-11" ixz="2.73097237930781E-08" iyy="7.37380385682221E-07" iyz="-6.33508384593073E-11" izz="5.52862732336676E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/index_metacarpals.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/index_metacarpals.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_index_mcp_roll" type="revolute">
+    <origin xyz="-0.0021643 0.026654 0.13253" rpy="-0.027925 -0.0087266 0"/>
+    <parent link="rightHand_link"/>
+    <child link="right_index_metacarpals"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="0" upper="0.19" effort="100" velocity="1"/>
+  </joint>
+  <link name="right_index_proximal">
+    <inertial>
+      <origin xyz="-0.000129944380960653 1.17196171642124E-06 0.0104816955547003" rpy="0 0 0"/>
+      <mass value="0.00654982235507964"/>
+      <inertia ixx="4.43901400960209E-07" ixy="3.44400810155697E-12" ixz="-2.4814971446792E-08" iyy="4.58697731369085E-07" iyz="8.51406115918214E-11" izz="1.74205815221237E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/index_proximal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/index_proximal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_index_mcp_pitch" type="revolute">
+    <origin xyz="0.00220968332188026 0 0.0152749792820048" rpy="0 0 0"/>
+    <parent link="right_index_metacarpals"/>
+    <child link="right_index_proximal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.36" effort="4.8" velocity="1"/>
+  </joint>
+  <link name="right_index_middle">
+    <inertial>
+      <origin xyz="-0.00250308175256513 -2.09528008505294E-06 0.0110397399346051" rpy="0 0 0"/>
+      <mass value="0.00283043630937165"/>
+      <inertia ixx="2.61037002532157E-07" ixy="-5.76553826316728E-11" ixz="-4.00111847827091E-08" iyy="2.33077671005604E-07" iyz="2.97012055424732E-11" izz="1.2654386429984E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/index_middle.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/index_middle.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_index_pip" type="revolute">
+    <origin xyz="-0.0010697 0 0.035634" rpy="0 0 0"/>
+    <parent link="right_index_proximal"/>
+    <child link="right_index_middle"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.78" effort="3.7" velocity="1"/>
+    <mimic joint="right_index_mcp_pitch" multiplier="1.3" offset="0"/>
+  </joint>
+  <link name="right_index_distal">
+    <inertial>
+      <origin xyz="-0.000604588906740394 5.26099433146611E-06 0.0121514585299274" rpy="0 0 0"/>
+      <mass value="0.0031446130611452"/>
+      <inertia ixx="1.64075846532352E-07" ixy="-1.75219464852339E-11" ixz="-4.27797730478817E-08" iyy="1.48367877966466E-07" iyz="2.03355501606508E-10" izz="9.78063887942514E-08"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/index_distal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/index_distal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_index_dip" type="revolute">
+    <origin xyz="-0.0052444 0 0.025711" rpy="0 0 0"/>
+    <parent link="right_index_middle"/>
+    <child link="right_index_distal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.62" effort="10.43" velocity="1"/>
+    <mimic joint="right_index_mcp_pitch" multiplier="0.46" offset="0"/>
+  </joint>
+  <link name="right_middle_proximal">
+    <inertial>
+      <origin xyz="-0.000226219980586554 1.17216483217029E-06 0.0104800581470382" rpy="0 0 0"/>
+      <mass value="0.00654982478226949"/>
+      <inertia ixx="4.43422823045882E-07" ixy="2.65801609334198E-12" ixz="-2.72879331079685E-08" iyy="4.58697754707373E-07" iyz="8.52654749038393E-11" izz="1.746844667607E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/middle_proximal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/middle_proximal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_middle_mcp_pitch" type="revolute">
+    <origin xyz="-0.00213155528434806 0.00765417737818821 0.152810108410232" rpy="0 0 0"/>
+    <parent link="rightHand_link"/>
+    <child link="right_middle_proximal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.36" effort="100" velocity="1"/>
+  </joint>
+  <link name="right_middle_middle">
+    <inertial>
+      <origin xyz="-0.00261699473119731 -2.09526685194996E-06 0.0110132928110042" rpy="0 0 0"/>
+      <mass value="0.00283043635504842"/>
+      <inertia ixx="2.60196021834948E-07" ixy="-5.79547865424222E-11" ixz="-4.13919583593881E-08" iyy="2.33077669434872E-07" iyz="2.9104841260857E-11" izz="1.27384845266404E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/middle_middle.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/middle_middle.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_middle_pip" type="revolute">
+    <origin xyz="-0.00139702428111229 0 0.0356230829860553" rpy="0 0 0"/>
+    <parent link="right_middle_proximal"/>
+    <child link="right_middle_middle"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.78" effort="3.7" velocity="1"/>
+    <mimic joint="right_middle_mcp_pitch" multiplier="1.3" offset="0"/>
+  </joint>
+  <link name="right_middle_distal">
+    <inertial>
+      <origin xyz="-0.000728492686371173 5.23463092580619E-06 0.0121446078355885" rpy="0 0 0"/>
+      <mass value="0.00314458659113992"/>
+      <inertia ixx="1.63194300204967E-07" ixy="-1.99064062210326E-11" ixz="-4.34469141576056E-08" iyy="1.48366133401819E-07" iyz="2.02741720954809E-10" izz="9.8685363448972E-08"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/middle_distal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/middle_distal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_middle_dip" type="revolute">
+    <origin xyz="-0.0055098 0 0.025656" rpy="0 0 0"/>
+    <parent link="right_middle_middle"/>
+    <child link="right_middle_distal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.62" effort="10.43" velocity="1"/>
+    <mimic joint="right_middle_mcp_pitch" multiplier="0.46" offset="0"/>
+  </joint>
+  <link name="right_ring_metacarpals">
+    <inertial>
+      <origin xyz="-0.000394044453752051 -6.96464269499264E-07 0.00909446164305169" rpy="0 0 0"/>
+      <mass value="0.00903700335356623"/>
+      <inertia ixx="4.89554245950771E-07" ixy="-3.94741777907138E-11" ixz="2.73097253166787E-08" iyy="7.37380377611045E-07" iyz="-6.33493307330511E-11" izz="5.52862742016819E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/ring_metacarpals.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/ring_metacarpals.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_ring_mcp_roll" type="revolute">
+    <origin xyz="-0.00216430029569533 -0.0113458226218121 0.132534071328313" rpy="0.0244346095279086 -0.00872664625996829 0"/>
+    <parent link="rightHand_link"/>
+    <child link="right_ring_metacarpals"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="0.2" effort="4.29" velocity="1"/>
+  </joint>
+  <link name="right_ring_proximal">
+    <inertial>
+      <origin xyz="-0.000129951741702268 1.17052693794986E-06 0.0104816759358435" rpy="0 0 0"/>
+      <mass value="0.00654983629670871"/>
+      <inertia ixx="4.43901586303392E-07" ixy="3.50295306689535E-12" ixz="-2.48148215954452E-08" iyy="4.58698142287549E-07" iyz="8.52333703161162E-11" izz="1.74206152792307E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/ring_proximal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/ring_proximal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_ring_mcp_pitch" type="revolute">
+    <origin xyz="0.0022097 0 0.015275" rpy="0 0 0"/>
+    <parent link="right_ring_metacarpals"/>
+    <child link="right_ring_proximal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.36" effort="4.8" velocity="1"/>
+  </joint>
+  <link name="right_ring_middle">
+    <inertial>
+      <origin xyz="-0.00250308200880736 -2.09549542964232E-06 0.0110397403443072" rpy="0 0 0"/>
+      <mass value="0.0028304363455826"/>
+      <inertia ixx="2.610370084214E-07" ixy="-5.76575489930258E-11" ixz="-4.00111860002357E-08" iyy="2.3307766580208E-07" iyz="2.97027542466601E-11" izz="1.26543852008426E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/ring_middle.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/ring_middle.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_ring_pip" type="revolute">
+    <origin xyz="-0.00106974956301328 0 0.0356344124989653" rpy="0 0 0"/>
+    <parent link="right_ring_proximal"/>
+    <child link="right_ring_middle"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.78" effort="3.7" velocity="1"/>
+    <mimic joint="right_ring_mcp_pitch" multiplier="1.34" offset="0"/>
+  </joint>
+  <link name="right_ring_distal">
+    <inertial>
+      <origin xyz="-0.00060459286126547 5.09148089232817E-06 0.0121514427640609" rpy="0 0 0"/>
+      <mass value="0.00314460631735109"/>
+      <inertia ixx="1.64075455538032E-07" ixy="-2.1468512857682E-11" ixz="-4.27798116117893E-08" iyy="1.48367698956355E-07" iyz="1.93419127705868E-10" izz="9.78062648939272E-08"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/ring_distal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/ring_distal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_ring_dip" type="revolute">
+    <origin xyz="-0.00524443259686075 0 0.0257114125710868" rpy="0 0 -0.000213216385347256"/>
+    <parent link="right_ring_middle"/>
+    <child link="right_ring_distal"/>
+    <axis xyz="0.000213099161087669 0.999450193223668 -0.033155178387707"/>
+    <limit lower="0" upper="0.62" effort="10.43" velocity="1"/>
+    <mimic joint="right_ring_mcp_pitch" multiplier="0.46" offset="0"/>
+  </joint>
+  <link name="right_pinky_metacarpals">
+    <inertial>
+      <origin xyz="-0.00039404522692532 -6.96240700731598E-07 0.00909446058676422" rpy="0 0 0"/>
+      <mass value="0.00903700307878998"/>
+      <inertia ixx="4.89554195779539E-07" ixy="-3.94817181132792E-11" ixz="2.7309708213456E-08" iyy="7.37380317460272E-07" iyz="-6.33317017267926E-11" izz="5.5286276236961E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/pinky_metacarpals.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/pinky_metacarpals.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_pinky_mcp_roll" type="revolute">
+    <origin xyz="-0.00012074 -0.030346 0.12755" rpy="0.057596 -0.0087266 0"/>
+    <parent link="rightHand_link"/>
+    <child link="right_pinky_metacarpals"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="0.3" effort="4.29" velocity="1"/>
+  </joint>
+  <link name="right_pinky_proximal">
+    <inertial>
+      <origin xyz="-0.000129949532354408 1.17230680928004E-06 0.0104816807512055" rpy="0 0 0"/>
+      <mass value="0.00654983474179372"/>
+      <inertia ixx="4.43901730245286E-07" ixy="3.4507527836803E-12" ixz="-2.48149152090791E-08" iyy="4.58698159687316E-07" iyz="8.52432689792127E-11" izz="1.74206088330646E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/pinky_proximal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/pinky_proximal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_pinky_mcp_pitch" type="revolute">
+    <origin xyz="0.0022097 0 0.015275" rpy="0 0 0"/>
+    <parent link="right_pinky_metacarpals"/>
+    <child link="right_pinky_proximal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.36" effort="4.8" velocity="1"/>
+  </joint>
+  <link name="right_pinky_middle">
+    <inertial>
+      <origin xyz="-0.00250308414609457 -2.09612030866585E-06 0.0110397422037874" rpy="0 0 0"/>
+      <mass value="0.00283043670305552"/>
+      <inertia ixx="2.6103697292473E-07" ixy="-5.76245409160896E-11" ixz="-4.00111424508735E-08" iyy="2.33077589871973E-07" iyz="2.96769001441938E-11" izz="1.26543829688383E-07"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/pinky_middle.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/pinky_middle.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_pinky_pip" type="revolute">
+    <origin xyz="-0.0010697 0 0.035634" rpy="0 0 0"/>
+    <parent link="right_pinky_proximal"/>
+    <child link="right_pinky_middle"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="1.78" effort="3.7" velocity="1"/>
+    <mimic joint="right_pinky_mcp_pitch" multiplier="1.34" offset="0"/>
+  </joint>
+  <link name="right_pinky_distal">
+    <inertial>
+      <origin xyz="-0.000604482988543969 5.27153358490656E-06 0.0121512430050648" rpy="0 0 0"/>
+      <mass value="0.00314457409502053"/>
+      <inertia ixx="1.64068754964363E-07" ixy="-1.90437996173564E-11" ixz="-4.27789862984836E-08" iyy="1.48361079085349E-07" iyz="2.05110113267167E-10" izz="9.78068531228973E-08"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/pinky_distal.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.59 0.66 0.68 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/linkerhand_l20lite/right/pinky_distal.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_pinky_dip" type="revolute">
+    <origin xyz="-0.0052444 0 0.025711" rpy="0 0 0"/>
+    <parent link="right_pinky_middle"/>
+    <child link="right_pinky_distal"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="0.62" effort="10.43" velocity="1"/>
+    <mimic joint="right_pinky_mcp_pitch" multiplier="0.46" offset="0"/>
+  </joint>
+  <link name="head_link1">
+    <inertial>
+      <origin xyz="4.94085832321023E-05 -2.06584882667948E-05 0.0209237441027506" rpy="0 0 0"/>
+      <mass value="0.053525220001833"/>
+      <inertia ixx="1.40780023634754E-05" ixy="-4.22327563356865E-09" ixz="-1.41947069700493E-08" iyy="1.14772108691464E-05" iyz="1.23784522924004E-08" izz="8.88001319149579E-06"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/head_link1.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.866666666666667 0.866666666666667 0.890196078431372 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/head_link1.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="head_joint1" type="revolute">
+    <origin xyz="0.0012661 0.5221 0.010591" rpy="-1.5708 0 0"/>
+    <parent link="waist_link3"/>
+    <child link="head_link1"/>
+    <axis xyz="0.0024304 0 1"/>
+    <limit lower="0" upper="6.28" effort="0" velocity="0"/>
+  </joint>
+  <link name="head_link2">
+    <inertial>
+      <origin xyz="0.00912892714042846 0.0641498702435128 -0.0203712083138798" rpy="0 0 0"/>
+      <mass value="0.256259570812732"/>
+      <inertia ixx="0.000360273242687775" ixy="7.02823356521686E-06" ixz="3.40777771515068E-06" iyy="0.000325101173068163" iyz="-7.79023440933406E-07" izz="6.78023607829033E-05"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/head_link2.STL"/>
+      </geometry>
+      <material name="">
+        <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://esrobo_waist_with_head/meshes/head_link2.STL"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="head_joint2" type="revolute">
+    <origin xyz="5.1313E-05 -0.021 0.03525" rpy="1.5708 0 0"/>
+    <parent link="head_link1"/>
+    <child link="head_link2"/>
+    <axis xyz="-0.0016361 0 1"/>
+    <limit lower="0" upper="1.57" effort="0" velocity="0"/>
+  </joint>
+</robot>
