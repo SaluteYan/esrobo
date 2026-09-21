@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import socket
 import time
+import threading
 from typing import Optional
 
 import numpy as np
@@ -108,6 +109,8 @@ class LinkerHandDriver:
 
     def __init__(self, cfg: HandConfig, udp_host: str = "127.0.0.1", udp_port: int = 15051,
                  active_sides: tuple[str, ...] = ("left", "right")):
+        self._feedback_lock = threading.RLock()
+        self._geometry_feedback_time = {"left": None, "right": None}
         self._cfg = cfg
         self._mode = cfg.mode
         self._model = (cfg.model or "L10").upper()
@@ -186,6 +189,10 @@ class LinkerHandDriver:
         )
 
     def _poll_feedback(self) -> None:
+        with self._feedback_lock:
+            self._poll_feedback_locked()
+
+    def _poll_feedback_locked(self) -> None:
         if self._mode != "udp":
             return
         while True:
@@ -197,8 +204,13 @@ class LinkerHandDriver:
                 message = json.loads(payload.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
                 continue
+            if not isinstance(message, dict):
+                continue
             side = message.get("side")
-            values = np.asarray(message.get("position", []), dtype=np.float64).reshape(-1)
+            try:
+                values = np.asarray(message.get("position", []), dtype=np.float64).reshape(-1)
+            except (TypeError, ValueError):
+                continue
             valid_range = np.all(
                 (values >= self._cfg.out_min) & (values <= self._cfg.out_max)
             )
@@ -208,8 +220,21 @@ class LinkerHandDriver:
                 and np.all(np.isfinite(values))
                 and valid_range
             ):
+                source_stamp = message.get("sample_monotonic_s")
+                self._geometry_feedback_time[side] = (float(source_stamp)
+                    if isinstance(source_stamp, (int, float)) else None)
                 self._feedback[side] = values
                 self._feedback_time[side] = time.monotonic()
+
+    def geometry_state(self, side: str, horizon: float):
+        """Receive only; this never enables or commands the hand."""
+        from .hand_geometry import geometry_state
+        with self._feedback_lock:
+            self._poll_feedback_locked()
+            names = L10_PHYSICAL_JOINT_NAMES if self._model == "L10" else PHYSICAL_JOINT_ORDER
+            return geometry_state(self._feedback.get(side), self._geometry_feedback_time.get(side),
+                side, self._cfg.geometry_feedback_calibration, names, horizon,
+                self._cfg.geometry_feedback_timeout_s)
 
     def _feedback_is_fresh(self) -> bool:
         self._poll_feedback()
@@ -224,6 +249,10 @@ class LinkerHandDriver:
         )
 
     def set_enabled(self, enabled: bool) -> bool:
+        with self._feedback_lock:
+            return self._set_enabled_locked(enabled)
+
+    def _set_enabled_locked(self, enabled: bool) -> bool:
         if not enabled:
             self._enabled = False
             return False
@@ -441,6 +470,10 @@ class LinkerHandDriver:
                 self._publishers[side].publish(msg)
 
     def command(self, hand_joints: np.ndarray) -> None:
+        with self._feedback_lock:
+            self._command_locked(hand_joints)
+
+    def _command_locked(self, hand_joints: np.ndarray) -> None:
         """Command both hands from the 20-value teleop packet (radians)."""
         if not self._enabled:
             return

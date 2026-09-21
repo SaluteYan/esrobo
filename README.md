@@ -503,31 +503,14 @@ candump can_piper2
 ros2 launch servo_driver start_servo.py
 ```
 
-注意：当前舵机驱动启动时会自动发送：
-
-```text
-1号舵机 -> 1500
-2号舵机 -> 3450
-```
-
-启动前必须确认头部周围无遮挡。
-
-小幅测试：
-
-```bash
-ros2 topic pub /servo/ctrl std_msgs/msg/UInt16MultiArray "{data: [1, 1450, 5, 1]}" -1
-ros2 topic pub /servo/ctrl std_msgs/msg/UInt16MultiArray "{data: [1, 1500, 5, 1]}" -1
-ros2 topic pub /servo/ctrl std_msgs/msg/UInt16MultiArray "{data: [2, 3400, 5, 1]}" -1
-ros2 topic pub /servo/ctrl std_msgs/msg/UInt16MultiArray "{data: [2, 3450, 5, 1]}" -1
-```
-
-舵机范围按当前代码限制：
-
-```text
-1号俯仰：1000 - 2700
-2号左右：2000 - 5000
-速度：<= 15
-```
+默认只读，不自动使能或移动；使用 `ros2 topic echo /head/state --once` 检查反馈。
+旧 `/servo/ctrl` 接口已移除。需要调整时按
+[操作手册第 13.3 节](teleoperation/TELEOPERATION_RUNBOOK.md#133-网页调试头部相机视角)
+先托稳头部，使用 `allow_motion:=true` 启动驱动，通过 PICO 网页的“头部相机”页
+查看实时图像、开启调整、设置目标和锁定姿态。成功到位后可以连续调整，无需逐次调用 ROS 命令。
+ID1 俯仰范围 1000～2700，ID2 左右范围 2000～5000，单位为原始计数；
+单步最多 20，速度参数 1～5。正负物理方向需要现场小步确认。
+关闭调整不卸力，退出不自动回零；采集期间保持头部固定，只运行彩色＋深度 20 Hz 图像采集。
 
 ## 灵巧手
 
@@ -622,7 +605,7 @@ udevadm info -q path -n /dev/ttyACM0
 ## 已知风险和注意事项
 
 1. `start_esrobo_system_launch.py` 会同时启动多个执行机构，不适合首轮调试。
-2. 头部舵机驱动启动时会自动发位置命令。
+2. 头部舵机驱动默认只读；显式开启调整才可能使能/运动，退出不会自动卸力。
 3. 灵巧手驱动启动时会设置较高力矩/速度并移动到预设姿态。
 4. 机械臂 `move_j` 必须给完整 7 关节位置，避免缺失关节被错误处理。
 5. 底盘 `/cmd_vel` 测试后必须主动发送 0 速度。

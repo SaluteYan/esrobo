@@ -171,8 +171,15 @@ def _build_packet(xrt, sequence: int, include_full_body_arrays: bool) -> tuple[d
 
     body_timestamp_ns = _safe_int(xrt.get_body_timestamp_ns)
     xr_timestamp_ns = _safe_int(xrt.get_time_stamp_ns)
-    if body_timestamp_ns <= 0:
-        body_timestamp_ns = xr_timestamp_ns
+    joint_timestamps = []
+    try:
+        joint_timestamps = [int(value) for value in list(xrt.get_body_joints_timestamp() or [])]
+    except Exception:
+        joint_timestamps = []
+    # Teleoperation consumes shoulder/elbow/wrist joints 16..21.  A timestamp
+    # left on an unrelated lower-body joint must not keep a frozen arm alive.
+    arm_joint_timestamps = joint_timestamps[16:22] if len(joint_timestamps) >= 22 else []
+    body_joint_timestamp_ns = max(arm_joint_timestamps, default=0)
     frames: dict[str, Any] = {}
     valid = []
     positions = []
@@ -199,7 +206,13 @@ def _build_packet(xrt, sequence: int, include_full_body_arrays: bool) -> tuple[d
         "source_frame": "pico_tracking",
         "sequence": sequence,
         "xrt_body_timestamp_ns": body_timestamp_ns,
+        "xrt_body_joint_timestamp_ns": body_joint_timestamp_ns,
         "xrt_timestamp_ns": xr_timestamp_ns,
+        "body_freshness_source": (
+            "body-timestamp" if body_timestamp_ns > 0
+            else "joint-timestamp" if body_joint_timestamp_ns > 0
+            else "pose-change"
+        ),
         "quat_order": "xyzw",
         "frames": frames,
     }
@@ -216,14 +229,26 @@ def _build_packet(xrt, sequence: int, include_full_body_arrays: bool) -> tuple[d
 
 
 def _packet_signature(packet: dict[str, Any]) -> tuple:
-    timestamp_ns = int(packet.get("xrt_body_timestamp_ns", 0))
+    body_timestamp_ns = int(packet.get("xrt_body_timestamp_ns", 0))
+    joint_timestamp_ns = int(packet.get("xrt_body_joint_timestamp_ns", 0))
+    if body_timestamp_ns > 0:
+        return "body-timestamp", body_timestamp_ns
+    if joint_timestamp_ns > 0:
+        return "joint-timestamp", joint_timestamp_ns
     frames = packet.get("frames", {})
     frame_sig = tuple(
-        (name, tuple(round(float(value), 5) for value in frame.get("pos", [])[:3]))
+        (
+            name,
+            tuple(float(value) for value in frame.get("pos", [])[:3]),
+            tuple(float(value) for value in frame.get("quat_xyzw", [])[:4]),
+        )
         for name, frame in sorted(frames.items())
         if isinstance(frame, dict)
     )
-    return timestamp_ns, frame_sig
+    # The vendor's generic XR timestamp advances for head/controller traffic
+    # even when Body is only a stale cache.  With no Body/joint timestamp, only
+    # an actual pose change is evidence of a new body frame.
+    return "pose-change", frame_sig
 
 
 def _format_pose_summary(packet: dict[str, Any]) -> str:
@@ -433,12 +458,25 @@ def main(argv: list[str]) -> int:
                     print("[xrobotoolkit_body_bridge] body tracking unavailable; waiting for PICO body data.", flush=True)
                     last_wait_print = now
             else:
+                signature = _packet_signature(packet)
+                fresh_body_frame = signature != last_signature
+                if not fresh_body_frame:
+                    if now - last_print >= args.print_interval:
+                        print(
+                            "[xrobotoolkit_body_bridge] body tracking frozen: cached body pose "
+                            "is unchanged and no advancing body/joint timestamp is available; "
+                            "no UDP frame sent.",
+                            flush=True,
+                        )
+                        last_print = now
+                    elapsed = time.perf_counter() - loop_start
+                    if elapsed < step_s:
+                        time.sleep(step_s - elapsed)
+                    continue
+                source_change_times.append(now)
+                last_signature = signature
                 if viewer is not None:
                     viewer.update(packet)
-                signature = _packet_signature(packet)
-                if signature != last_signature:
-                    source_change_times.append(now)
-                    last_signature = signature
 
                 encoded = json.dumps(packet, separators=(",", ":")).encode("utf-8")
                 if record_writer is not None:
@@ -499,6 +537,8 @@ def main(argv: list[str]) -> int:
                         f"valid={latest_valid_count:02d}/{len(BODY_JOINT_NAMES)} "
                         f"frames=[{names}] "
                         f"body_timestamp_ns={packet.get('xrt_body_timestamp_ns', 0)} "
+                        f"body_joint_timestamp_ns={packet.get('xrt_body_joint_timestamp_ns', 0)} "
+                        f"freshness={packet.get('body_freshness_source', 'unknown')} "
                         f"bytes={latest_packet_size} "
                         f"recorded={record_writer.packet_count if record_writer is not None else 0} "
                         f"record_phase={latest_record_phase} "

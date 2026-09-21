@@ -8,28 +8,89 @@ robot:
   right_nero_firmware: DEFAULT         # right arm currently publishes legacy 0x501..0x507 feedback
   can_interface: socketcan
   can_bitrate: 1000000
+  can_send_timeout_s: 0.02       # bounded wait for a healthy SocketCAN TX queue to drain
   command_mode: j           # j is smoothed; js is SDK high-risk passthrough
   allow_unsafe_js: false    # must be explicit before SDK passthrough can run
-  speed_percent: 25
+  # The installed left controller repeatedly kept mode_feedback=1 when sent
+  # CPV requests. Use the repository's hardware-proven full-seven-joint
+  # MOVE_J path for live following and keep CPV available only as an opt-in.
+  left_tracking_control_mode: j
+  right_tracking_control_mode: j
+  cpv_inter_joint_interval_s: 0.002 # pace V112 mode + duplicated first-position bursts
+  # Both arms use the same continuous bounded MOVE_J stream. The left V112
+  # transport still repeats its J-mode frame before each seven-axis target.
+  left_command_backpressure_enabled: false
+  right_command_backpressure_enabled: false
+  left_command_backpressure_pause_s: 0.15   # legacy opt-in; inactive in current continuous mode
+  left_command_backpressure_timeout_s: 3.0  # legacy opt-in; inactive in current continuous mode
+  left_move_j_waypoint_deg: 0.5       # legacy opt-in stop-and-wait setting; inactive in current mode
+  right_command_backpressure_pause_s: 0.15
+  right_command_backpressure_timeout_s: 2.0
+  speed_percent: 30
+  # Keep smooth position control, but require controller collision protection
+  # and monitor measured torque relative to the stationary arming baseline.
+  collision_protection_enabled: true
+  # Both sides use the same commissioned protection levels. The left V1.12
+  # path wakes feedback at zero, disables again, then configures and verifies.
+  left_collision_protection_enabled: true
+  right_collision_protection_enabled: true
+  collision_protection_rating: [4, 4, 4, 4, 5, 5, 5]
+  require_collision_protection_readback: true
+  torque_monitor_enabled: true
+  torque_baseline_settle_s: 1.0
+  torque_baseline_samples: 15
+  torque_baseline_timeout_s: 4.0
+  torque_feedback_timeout_s: 0.3
+  # Software monitor is a slower secondary guard; controller collision ratings
+  # remain the fast first layer. Right-side limits include normal gravity/dynamics.
+  torque_deviation_limits_nm: [16.0, 16.0, 12.0, 12.0, 6.0, 6.0, 5.0]
+  left_torque_deviation_limits_nm: [25.0, 25.0, 12.0, 12.0, 6.0, 6.0, 5.0]
+  right_torque_deviation_limits_nm: [21.0, 21.0, 12.0, 12.0, 6.0, 6.0, 5.0]
+  torque_trip_consecutive_samples: 5
+  controller_status_monitor_enabled: true
+  controller_status_timeout_s: 0.3
+  torso_collision_enabled: true
+  # Live following (including feedback-gap recovery) skips geometric checks.
+  # Startup preflight and all slow return planning/execution keep the guard.
+  teleop_torso_collision_enabled: false
+  collision_package_dirs: []  # also search model/urdf beside the workspace
+  torso_collision_margin_m: 0.03
+  shoulder_collision_margin_m: 0.005  # installed link2/waist3 attachment clearance
   # Initial full-arm J1..J7 commissioning limits. Velocity is rad/s,
   # acceleration is rad/s^2, and step is rad per accepted feedback update.
-  max_joint_step: [0.038397, 0.038397, 0.038397, 0.043633, 0.043633, 0.043633, 0.043633]
-  max_joint_velocity: [0.314159, 0.314159, 0.314159, 0.349066, 0.349066, 0.349066, 0.349066]
-  max_joint_acceleration: [0.785398, 0.785398, 0.872665, 1.047198, 1.047198, 1.047198, 1.047198]
+  max_joint_step: [0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633]
+  max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.418879, 0.418879, 0.418879, 0.418879]
+  max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 0.872665, 0.872665, 0.872665]
   # Second-stage commissioning limits used by the single-arm PICO paths.
-  left_max_joint_step: [0.038397, 0.038397, 0.038397, 0.043633, 0.043633, 0.043633, 0.043633]
-  left_max_joint_velocity: [0.314159, 0.314159, 0.314159, 0.349066, 0.349066, 0.349066, 0.349066]
-  left_max_joint_acceleration: [0.785398, 0.785398, 0.872665, 1.047198, 1.047198, 1.047198, 1.047198]
-  right_max_joint_step: [0.038397, 0.038397, 0.038397, 0.043633, 0.043633, 0.043633, 0.043633]
-  right_max_joint_velocity: [0.314159, 0.314159, 0.314159, 0.349066, 0.349066, 0.349066, 0.349066]
-  right_max_joint_acceleration: [0.785398, 0.785398, 0.872665, 1.047198, 1.047198, 1.047198, 1.047198]
+  left_max_joint_step: [0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633]
+  left_max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.523599, 0.418879, 0.418879, 0.418879]
+  left_max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 0.872665, 0.872665, 0.872665]
+  right_max_joint_step: [0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633]
+  # Both J4 joints: 30 deg/s; acceleration and all other axes unchanged.
+  right_max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.523599, 0.418879, 0.418879, 0.418879]
+  right_max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 0.872665, 0.872665, 0.872665]
   synchronize_joint_motion: false
+  # Both single-arm and arm+hand entries use the same bounded command trajectory.
+  left_command_trajectory_enabled: true
+  right_command_trajectory_enabled: true
+  command_trajectory_lead_deg: [3, 3, 3, 3, 1.5, 1.5, 1.5]
+  command_trajectory_max_dt_s: 0.1
+  # Hold the last controller target during a brief assembled-feedback gap.
+  # Resume only after two consecutive fresh frames and a complete safety recheck.
+  runtime_feedback_recovery_timeout_s: 0.3
+  command_trajectory_lead_timeout_s: 2.0
   joint_sync_error_deadband_deg: 0.05
   # Initial full-arm commissioning envelope in URDF coordinates (J1..J7).
-  # deg lower=[-60,-75,-60,-8,-60,-30,-55]
-  # deg upper=[ 60,  7, 60,85, 60, 35, 55]
-  joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -1.047198, -0.139626, -1.047198, -0.523599, -0.959931]
-  joint_soft_upper_limits_urdf: [1.047198, 0.122173, 1.047198, 1.483530, 1.047198, 0.610865, 0.959931]
+  # deg lower=[-60,-75,-90,-8,-60,-30,-55]
+  # deg upper=[ 60,  7, 90,85, 60, 35, 55]
+  joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -1.570796, -0.139626, -1.047198, -0.523599, -0.959931]
+  joint_soft_upper_limits_urdf: [1.047198, 0.122173, 1.570796, 1.483530, 1.047198, 0.610865, 0.959931]
+  # Preserve the per-side commissioned limits updated on 2026-09-16.
+  # URDF J3: left [-150,+90] deg; right [-90,+150] deg. Both J4: [-8,+120] deg.
+  left_joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -2.617994, -0.139626, -1.047198, -0.523599, -0.959931]
+  left_joint_soft_upper_limits_urdf: [1.047198, 0.122173, 1.570796, 2.094395, 1.047198, 0.610865, 0.959931]
+  right_joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -1.570796, -0.139626, -1.047198, -0.523599, -0.959931]
+  right_joint_soft_upper_limits_urdf: [1.047198, 0.122173, 2.617994, 2.094395, 1.047198, 0.610865, 0.959931]
   max_joint_deviation_from_start: 0.0  # legacy uniform limit; disabled in favor of per-joint limits
   # SenseGlove pilot: only terminal physical joints 5/6/7 control hand orientation.
   right_wrist_joint_indices: [4, 5, 6]    # zero-based SDK joint indices
@@ -40,7 +101,12 @@ robot:
   wrist_return_tolerance_deg: 1.0             # q: feedback tolerance before disabling
   return_feedback_grace_s: 1.0                # tolerate short CAN gaps during controlled return
   return_verify_samples: 3                    # consecutive in-tolerance feedback frames required
-  return_phase_attempts: 2                    # retry before entering manual-intervention hold
+  return_plan_timeout_s: 5.0
+  return_plan_max_nodes: 5000
+  return_plan_seed: 0
+  return_speed_scale: 0.5
+  return_stationary_velocity_deg_s: 0.5
+  return_phase_attempts: 2                    # compatibility setting; planned arm return never retries
   disable_on_unconfirmed_return: false        # keep enabled for an operator s/d/x decision
   right_wrist_max_step: 0.004              # rad/command, about 0.23 deg
   right_wrist_max_velocity: 0.1396263      # rad/s, 8 deg/s
@@ -78,8 +144,38 @@ retarget:
   auto_start_reference_delay_s: 4.0         # stabilization + sample phase duration
   auto_start_reference_sample_start_s: 1.0  # first second of this phase is not sampled
   auto_start_reference_max_position_std_m: 0.05
+  # At 'e', require a stable recent multi-frame target. The angular fields below
+  # remain as diagnostic compatibility values; target-to-calibration deviation
+  # does not reject arming. Only initial calibration or explicit 'r' changes zero.
+  arm_reference_enable_window_s: 0.5
+  arm_reference_enable_prepare_s: 5.0
+  arm_reference_enable_max_flexion_delta_deg: 5.0
+  # Use the current PICO elbow angle directly. The calibration pose is only a
+  # coordinate-frame reference; subtracting its bend can incorrectly force a
+  # visibly bent human arm to an almost-straight robot target.
+  elbow_angle_mapping: direct_absolute
+  elbow_absolute_start_delta_deg: 5.0
+  elbow_absolute_full_delta_deg: 30.0
+  # Keep the retargeted wrist plane consistent with the IK J3 observability
+  # gate: freeze only when the actual elbow bend is below 4 deg, and fully
+  # observe the live bend plane at 10 deg.
+  bend_plane_observability_start_delta_deg: 4.0
+  bend_plane_observability_full_delta_deg: 10.0
+  arm_reference_enable_max_upper_delta_deg: 30.0
+  arm_reference_enable_max_forearm_delta_deg: 30.0
   arm_vector_max_reach: 0.72
-  max_endpoint_translation_velocity_m_s: 0.18
+  arm_vector_prediction_horizon_s: 0.03
+  arm_vector_prediction_lookback_s: 0.05
+  arm_vector_prediction_max_displacement_m: 0.03
+  # PICO points below 0.06 m/s are treated as tracker jitter; prediction fades
+  # in smoothly and is fully active above 0.25 m/s.
+  arm_vector_prediction_start_velocity_m_s: 0.06
+  arm_vector_prediction_full_velocity_m_s: 0.25
+  max_endpoint_translation_velocity_m_s: 0.22
+  # PICO segment direction filter: low cutoff at rest, higher cutoff in motion.
+  arm_vector_filter_min_cutoff_hz: 3.0
+  arm_vector_filter_max_cutoff_hz: 8.0
+  arm_vector_filter_speed_coefficient: 0.7
   use_hand_imu_orientation: true
   # Pure PICO left-arm tests may run without a glove. In that case J5-J7 hold
   # their current feedback values and only J1-J4 follow shoulder/elbow/wrist.
@@ -114,11 +210,30 @@ ik:
   # Keep the anatomical chain explicit: J1-J4 follow PICO arm segments while
   # J5-J7 follow the SenseGlove IMU in the URDF terminal-joint frame.
   partition_terminal_wrist_ik: true
-  # Compute J4 directly from the target upper-arm/forearm angle, then let IK
-  # use J1-J3 for shoulder direction and elbow bend-plane placement.
+  # In partitioned position IK the segment-angle estimate is only a seed.
+  # J1-J4 jointly fit elbow/hand-base positions; J4 is never locked to it.
   partition_elbow_flexion_from_segments: true
+  partition_position_max_evaluations: 24  # per bounded solve; at most 3 branch attempts
+  # A joint-bound IK rejection can pause and auto-resume only when measured
+  # feedback is already this close to the same commissioned position bound.
+  position_limit_hold_feedback_margin_deg: 0.25
+  # Resume only after the target is clearly back inside the 30 mm IK envelope
+  # for consecutive fresh cycles, preventing chatter at the boundary.
+  position_limit_recovery_error_m: 0.025
+  position_limit_recovery_frames: 3
+  # Legacy Pink-path gains; bounded position IK does not rescale solved J3.
+  left_j3_retarget_gain: 1.0
+  right_j3_retarget_gain: 1.0
+  # Shoulder/elbow/wrist points cannot identify the bend plane near a straight
+  # arm. Bounded position IK holds J3 only through 4 deg of actual Cartesian
+  # bend. The retargeter already blends the target plane over 4..10 deg; IK
+  # must not blend J3 a second time.
+  # The full-flexion field below is retained for the legacy Pink path.
+  j3_observability_start_flexion_deg: 4.0
+  j3_observability_full_flexion_deg: 10.0
   dt: 0.02
-  iterations_per_cycle: 1
+  # Legacy Pink path only; partitioned position IK uses the evaluation budget above.
+  iterations_per_cycle: 3
   position_cost: 32.0
   orientation_cost: 0.05
   elbow_position_cost: 80.0
@@ -131,6 +246,10 @@ hand:
   udp_host: 127.0.0.1
   udp_port: 15051
   feedback_udp_port: 15052
+  geometry_feedback_timeout_s: 0.1
+  # Independently measured feedback->URDF calibration, per side/joint.
+  # Empty means unknown finger pose (full URDF envelope), NOT zero fingers.
+  geometry_feedback_calibration: {}
   left_topic: /cb_left_hand_control_cmd
   right_topic: /cb_right_hand_control_cmd
   publish_hz: 50.0

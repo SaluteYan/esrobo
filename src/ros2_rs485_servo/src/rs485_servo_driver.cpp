@@ -1,210 +1,221 @@
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/u_int16_multi_array.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <std_srvs/srv/set_bool.hpp>
+#include <servo_driver/srv/head_jog.hpp>
+#include <array>
+#include <chrono>
+#include <cmath>
 #include <fcntl.h>
-#include <unistd.h>
+#include <poll.h>
+#include <sys/file.h>
+#include <sys/ioctl.h>
 #include <termios.h>
-#include <cstdint>
-#include <vector>
-#include <cstring>
+#include <unistd.h>
 
-class ServoDriver : public rclcpp::Node
-{
-private:
-  int serial_fd_ = -1;
-  std::string serial_port_;
-  int baudrate_;
+using Clock = std::chrono::steady_clock;
+using Bytes = std::vector<uint8_t>;
 
-  // 校验和：~(ID+LEN+CMD+DATA) & 0xFF
-  uint8_t calculate_checksum(const std::vector<uint8_t>& data)
-  {
-    uint16_t sum = 0;
-    for (auto b : data) sum += b;
-    return static_cast<uint8_t>(~sum & 0xFF);
+class ServoDriver : public rclcpp::Node {
+  struct State {
+    int position = 0, torque = 0, origin = 0, target = 0;
+    bool valid = false, pending = false;
+    Clock::time_point stamp{}, sent{};
+  };
+  int fd_ = -1;
+  bool allow_motion_, adjusting_ = false;
+  static constexpr int arrival_tolerance_ticks_ = 5;
+  std::string fault_;
+  std::array<State, 2> state_;
+  const std::array<int, 2> lower_{1000, 2000}, upper_{2700, 5000};
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pub_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr enable_;
+  rclcpp::Service<servo_driver::srv::HeadJog>::SharedPtr jog_;
+  rclcpp::TimerBase::SharedPtr timer_;
+
+  static double age(Clock::time_point stamp) {
+    return std::chrono::duration<double>(Clock::now() - stamp).count();
   }
-
-  // 发送舵机数据包
-  void send_packet(const std::vector<uint8_t>& packet)
-  {
-    if (serial_fd_ < 0) return;
-    write(serial_fd_, packet.data(), packet.size());
-    tcdrain(serial_fd_);
-    std::cout << "rs485 servo data: ";
-    for(int ii=0;ii<packet.size();ii++) std::cout << std::to_string(packet[ii]) << " ";
-    std::cout << std::endl;
+  void lock(const std::string & reason) { adjusting_ = false; fault_ = reason; }
+  Bytes exchange(int id, int instruction, const Bytes & params, size_t count) {
+    Bytes packet{255, 255, uint8_t(id), uint8_t(params.size() + 2), uint8_t(instruction)};
+    packet.insert(packet.end(), params.begin(), params.end());
+    unsigned sum = 0;
+    for (size_t i = 2; i < packet.size(); ++i) sum += packet[i];
+    packet.push_back(uint8_t(~sum));
+    tcflush(fd_, TCIFLUSH);
+    auto deadline = Clock::now() + std::chrono::milliseconds(80);
+    size_t offset = 0;
+    while (offset < packet.size()) {
+      if (Clock::now() >= deadline) throw std::runtime_error("serial write timeout");
+      pollfd p{fd_, POLLOUT, 0};
+      if (poll(&p, 1, 5) > 0) {
+        auto n = write(fd_, packet.data() + offset, packet.size() - offset);
+        if (n > 0) offset += size_t(n);
+      }
+    }
+    Bytes reply;
+    while (reply.size() < count + 6 && Clock::now() < deadline) {
+      pollfd p{fd_, POLLIN, 0};
+      if (poll(&p, 1, 5) > 0) {
+        uint8_t b;
+        if (read(fd_, &b, 1) == 1) reply.push_back(b);
+      }
+    }
+    if (reply.size() != count + 6) throw std::runtime_error("servo reply timeout");
+    sum = 0;
+    for (size_t i = 2; i < reply.size(); ++i) sum += reply[i];
+    if (reply[0] != 255 || reply[1] != 255 || reply[2] != id ||
+        reply[3] != count + 2 || (sum & 255) != 255 || reply[4] != 0)
+      throw std::runtime_error("invalid servo reply/checksum or device error");
+    return Bytes(reply.begin() + 5, reply.end() - 1);
   }
-  
-  void action() {
-  	std::vector<uint8_t> buf = {0xFF, 0xFF, 0xFE, 0x02, 0x05, 0xFA};
-  	send_packet(buf);
+  void goal(int id, int position, int speed) {
+    exchange(id, 3, {42, uint8_t(position), uint8_t(position >> 8), 0, 0,
+                    uint8_t(speed), uint8_t(speed >> 8)}, 0);
   }
-
-  // 控制舵机：ID, 位置(0~4095), 速度, 电流
-  void set_servo(uint8_t id, uint16_t position, uint16_t speed, bool now = true)
-  {
-    std::vector<uint8_t> buf;
-
-    // 帧头
-    buf.push_back(0xFF);
-    buf.push_back(0xFF);
-    buf.push_back(id);
-
-    // 长度：指令1 + 地址1 + 数据8 = 10 → 0x0A
-    buf.push_back(0x09);
-    buf.push_back(0x04);  // WRITE_DATA 指令
-
-    // 寄存器起始地址：目标位置 0x2A
-    buf.push_back(0x2A);
-
-    // 目标位置(2字节 小端)
-    buf.push_back(position & 0xFF);
-    buf.push_back((position >> 8) & 0xFF);
-
-    // 运行时间(2字节)
-    buf.push_back(0x00);
-    buf.push_back(0x00);
-
-    // 速度(2字节)
-    buf.push_back(speed & 0xFF);
-    buf.push_back((speed >> 8) & 0xFF);
-
-    // 电流(2字节)
-    // buf.push_back(current & 0xFF);
-    // buf.push_back((current >> 8) & 0xFF);
-
-    // 校验和
-    std::vector<uint8_t> ck_buf(buf.begin()+2, buf.end());
-    uint8_t checksum = calculate_checksum(ck_buf);
-    buf.push_back(checksum);
-
-    send_packet(buf);
-
-    RCLCPP_INFO(this->get_logger(),
-      "ID:%d | POS:%d | SPEED:%d",
-      id, position, speed);
-      
-    if(now) action();
+  void refresh() {
+    for (int i = 0; i < 2; ++i) {
+      auto & s = state_[i];
+      try {
+        auto p = exchange(i + 1, 2, {56, 2}, 2);
+        auto t = exchange(i + 1, 2, {40, 1}, 1);
+        s.position = p[0] | (int(p[1]) << 8);
+        s.torque = t[0]; s.valid = true; s.stamp = Clock::now();
+        if (s.pending && std::abs(s.position - s.target) <= arrival_tolerance_ticks_) s.pending = false;
+        if (s.pending && age(s.sent) > 5.0)
+          lock("ID " + std::to_string(i + 1) + " motion timeout; current=" +
+               std::to_string(s.position) + " target=" + std::to_string(s.target) +
+               "; inspect head before retry");
+        if (adjusting_ && s.torque != 1) lock("torque no longer enabled");
+      } catch (const std::exception & e) {
+        s.valid = false; lock("ID " + std::to_string(i + 1) + ": " + e.what());
+      }
+    }
   }
-  
-  bool checkLimits(uint8_t id, uint16_t position, uint16_t speed) {
-  
-  	if(speed > 15) return false;
-  	if(id == 2) {
-  		if(position < 2000 || position > 5000) return false;
-  		else return true;
-  	} else if(id == 1) {
-  		if(position < 1000 || position > 2700) return false;
-  		else return true;
-  	}
-  }
-
-  // 订阅话题：/servo/ctrl
-  //当发送的数据为4个时，如果最后一个是0，则代表只发送位置值，但不执行运动指令，如果最后一个不0，则收到位置后立即执行运动；
-  //当发送的数据为3个时，则代表只发送位置值，但不执行运动指令，
-  //如果发送的数据为1个时，只发送执行指令
-  rclcpp::Subscription<std_msgs::msg::UInt16MultiArray>::SharedPtr sub_;
-
-  void callback(const std_msgs::msg::UInt16MultiArray::SharedPtr msg)
-  {
-    if (msg->data.size() == 3) {
-    
-    	uint8_t id       = (uint8_t)msg->data[0];
-		uint16_t pos     = (msg->data[1]) ;
-		uint16_t speed   = (msg->data[2]);
-		//uint16_t current = (msg->data[6] << 8) | msg->data[5];
-		
-		if(checkLimits(id, pos, speed)) set_servo(id, pos, speed, false);
-    }
-    if (msg->data.size() == 4) {
-    
-    	uint8_t id       = (uint8_t)msg->data[0];
-		uint16_t pos     = (msg->data[1]) ;
-		uint16_t speed   = (msg->data[2]);
-		//uint16_t current = (msg->data[6] << 8) | msg->data[5];
-
-		if(msg->data[3] != 0) if(checkLimits(id, pos, speed)) set_servo(id, pos, speed, true);
-		else if(checkLimits(id, pos, speed)) set_servo(id, pos, speed, false);
-    }
-    else if (msg->data.size() == 1 && msg->data[0] != 0) {
-    
-    	action();
-    }
-
-    
-  }
-
-  // 打开串口
-  bool open_serial()
-  {
-    serial_fd_ = open(serial_port_.c_str(), O_RDWR | O_NOCTTY);
-    if (serial_fd_ < 0) {
-      RCLCPP_ERROR(this->get_logger(), "Failed to open %s", serial_port_.c_str());
-      return false;
-    }
-
-    struct termios tty;
-    memset(&tty, 0, sizeof(tty));
-    if (tcgetattr(serial_fd_, &tty) != 0) {
-      RCLCPP_ERROR(this->get_logger(), "tcgetattr failed");
-      return false;
-    }
-
-    cfsetospeed(&tty, B115200);
-    cfsetispeed(&tty, B115200);
-
-    tty.c_cflag &= ~PARENB;
-    tty.c_cflag &= ~CSTOPB;
-    tty.c_cflag &= ~CSIZE;
-    tty.c_cflag |= CS8;
-    tty.c_cflag |= CREAD | CLOCAL;
-
-    tty.c_lflag = 0;
-    tty.c_iflag = 0;
-    tty.c_oflag = 0;
-
-    tty.c_cc[VTIME] = 1;
-    tty.c_cc[VMIN] = 0;
-
-    if (tcsetattr(serial_fd_, TCSANOW, &tty) != 0) {
-      RCLCPP_ERROR(this->get_logger(), "tcsetattr failed");
-      return false;
-    }
-
-    RCLCPP_INFO(this->get_logger(), "Serial %s connected", serial_port_.c_str());
+  bool ready() const {
+    for (const auto & s : state_) if (!s.valid || age(s.stamp) > 0.3) return false;
     return true;
+  }
+  void publish() {
+    diagnostic_msgs::msg::DiagnosticArray msg;
+    msg.header.stamp = now();
+    for (int i = 0; i < 2; ++i) {
+      const auto & s = state_[i];
+      diagnostic_msgs::msg::DiagnosticStatus status;
+      status.name = i == 0 ? "head/pitch" : "head/yaw";
+      status.hardware_id = std::to_string(i + 1);
+      status.level = (!s.valid || !fault_.empty()) ? 2 : 0;
+      status.message = fault_.empty() ? (adjusting_ ? "adjustment enabled" : "adjustment locked") : fault_;
+      auto add = [&](const std::string & key, const std::string & value) {
+        diagnostic_msgs::msg::KeyValue kv; kv.key = key; kv.value = value;
+        status.values.push_back(kv);
+      };
+      add("valid", s.valid && age(s.stamp) <= 0.3 ? "true" : "false");
+      add("position_ticks", std::to_string(s.position));
+      add("torque_enabled", std::to_string(s.torque));
+      add("pending", s.pending ? "true" : "false");
+      add("arrival_tolerance_ticks", std::to_string(arrival_tolerance_ticks_));
+      add("pending_target_ticks", s.pending ? std::to_string(s.target) : "none");
+      add("pending_error_ticks", s.pending ? std::to_string(s.target - s.position) : "none");
+      add("pending_elapsed_s", s.pending ? std::to_string(age(s.sent)) : "0");
+      add("age_s", std::to_string(age(s.stamp)));
+      add("allow_motion", allow_motion_ ? "true" : "false");
+      add("adjustment_enabled", adjusting_ ? "true" : "false");
+      msg.status.push_back(status);
+    }
+    pub_->publish(msg);
   }
 
 public:
-  ServoDriver() : Node("servo_driver_node")
-  {
-    this->declare_parameter<std::string>("port", "/dev/ttyACM0");
-    this->get_parameter("port", serial_port_);
-
-    if (!open_serial()) {
-      RCLCPP_FATAL(this->get_logger(), "Cannot open serial");
-      return;
-    }
-    
-    set_servo(1, 1500, 10, true);
-    set_servo(2, 3450, 10, true);
-
-    sub_ = this->create_subscription<std_msgs::msg::UInt16MultiArray>(
-      "/servo/ctrl", 10,
-      std::bind(&ServoDriver::callback, this, std::placeholders::_1)
-    );
-
-    RCLCPP_INFO(this->get_logger(), "Servo driver ready!");
+  ServoDriver() : Node("servo_driver_node") {
+    auto port = declare_parameter<std::string>("port", "/dev/serial/by-path/pci-0000:00:14.0-usb-0:5.2:1.0");
+    allow_motion_ = declare_parameter<bool>("allow_motion", false);
+    fd_ = open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    try {
+      if (fd_ < 0 || flock(fd_, LOCK_EX | LOCK_NB) != 0 || ioctl(fd_, TIOCEXCL) != 0)
+        throw std::runtime_error("cannot exclusively open " + port);
+      termios tty{};
+      if (tcgetattr(fd_, &tty)) throw std::runtime_error("tcgetattr failed");
+      cfmakeraw(&tty); cfsetispeed(&tty, B115200); cfsetospeed(&tty, B115200);
+      tty.c_cflag = (tty.c_cflag & ~(PARENB | CSTOPB | CSIZE | CRTSCTS)) | CS8 | CLOCAL | CREAD;
+      if (tcsetattr(fd_, TCSANOW, &tty)) throw std::runtime_error("tcsetattr failed");
+    } catch (...) { if (fd_ >= 0) close(fd_); fd_ = -1; throw; }
+    pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/head/state", 10);
+    enable_ = create_service<std_srvs::srv::SetBool>("/head/adjust_enable",
+      [this](std_srvs::srv::SetBool::Request::SharedPtr req,
+             std_srvs::srv::SetBool::Response::SharedPtr res) {
+        try {
+          if (!req->data) {
+            adjusting_ = false; res->success = true;
+            res->message = "adjustment locked; torque and accepted target unchanged"; return;
+          }
+          if (!allow_motion_) throw std::runtime_error("read-only launch: allow_motion=false");
+          refresh();
+          if (!ready()) throw std::runtime_error("fresh feedback required for both axes");
+          if (adjusting_) { res->success = true; res->message = "already enabled"; return; }
+          for (int i = 0; i < 2; ++i) {
+            auto & s = state_[i];
+            if (s.pending)
+              throw std::runtime_error("ID " + std::to_string(i + 1) +
+                " pending motion: current=" + std::to_string(s.position) +
+                " target=" + std::to_string(s.target) + " error=" +
+                std::to_string(s.target - s.position) + " ticks; wait for arrival or inspect fault");
+            if (s.position < lower_[i] || s.position > upper_[i])
+              throw std::runtime_error("ID " + std::to_string(i + 1) +
+                " position=" + std::to_string(s.position) + " outside limits [" +
+                std::to_string(lower_[i]) + ", " + std::to_string(upper_[i]) + "]");
+          }
+          // Overwrite stale controller targets at measured positions before torque engagement.
+          for (int i = 0; i < 2; ++i) {
+            state_[i].origin = state_[i].position;
+            goal(i + 1, state_[i].position, 5);
+          }
+          for (int i = 0; i < 2; ++i)
+            if (state_[i].torque != 1) exchange(i + 1, 3, {40, 1}, 0);
+          refresh();
+          if (!ready()) throw std::runtime_error("enable readback missing; torque may be enabled");
+          for (const auto & s : state_)
+            if (s.torque != 1 || std::abs(s.position - s.origin) > 20)
+              throw std::runtime_error("enable readback mismatch; inspect head");
+          fault_.clear(); adjusting_ = true; res->success = true;
+          res->message = "adjustment enabled at measured pose; one small jog at a time";
+        } catch (const std::exception & e) { lock(e.what()); res->message = fault_; }
+      });
+    jog_ = create_service<servo_driver::srv::HeadJog>("/head/jog",
+      [this](servo_driver::srv::HeadJog::Request::SharedPtr req,
+             servo_driver::srv::HeadJog::Response::SharedPtr res) {
+        try {
+          if (!allow_motion_ || !adjusting_) throw std::runtime_error("adjustment locked");
+          if (req->servo_id < 1 || req->servo_id > 2 || req->delta_ticks == 0 ||
+              std::abs(int(req->delta_ticks)) > 20 || req->speed < 1 || req->speed > 5)
+            throw std::runtime_error("require ID 1/2, delta +/-1..20 ticks, speed 1..5");
+          refresh();
+          if (!ready() || !adjusting_) throw std::runtime_error("fresh enabled feedback required");
+          for (const auto & s : state_)
+            if (s.pending) throw std::runtime_error("previous jog not complete; no queued targets");
+          int i = req->servo_id - 1;
+          auto & s = state_[i];
+          int target = s.position + req->delta_ticks;
+          if (target < lower_[i] || target > upper_[i])
+            throw std::runtime_error("position outside joint limits");
+          s.target = target; s.sent = Clock::now(); s.pending = true;
+          goal(req->servo_id, target, req->speed);
+          res->success = true; res->message = "accepted target=" + std::to_string(target) + "; await feedback";
+        } catch (const std::exception & e) { lock(e.what()); res->message = fault_; }
+      });
+    timer_ = create_wall_timer(std::chrono::milliseconds(100), [this]() { refresh(); publish(); });
+    RCLCPP_INFO(get_logger(), "Head startup is read-only. No target or torque command sent. allow_motion=%s",
+                allow_motion_ ? "true" : "false");
   }
-
-  ~ServoDriver() override {
-    if (serial_fd_ >= 0) close(serial_fd_);
-  }
+  ~ServoDriver() override { if (fd_ >= 0) close(fd_); }
 };
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char ** argv) {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<ServoDriver>();
-  rclcpp::spin(node);
-  rclcpp::shutdown();
-  return 0;
+  try { rclcpp::spin(std::make_shared<ServoDriver>()); }
+  catch (const std::exception & e) {
+    RCLCPP_FATAL(rclcpp::get_logger("head"), "%s", e.what());
+    rclcpp::shutdown(); return 1;
+  }
+  rclcpp::shutdown(); return 0;
 }

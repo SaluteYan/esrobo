@@ -14,6 +14,8 @@ import json
 import socket
 import threading
 import time
+from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -51,6 +53,15 @@ class BodyDevice:
         if active_arm_side not in (None, "left", "right"):
             raise ValueError("active_arm_side must be None, 'left', or 'right'")
         self._cfg = cfg
+        values = [cfg.elbow_absolute_start_delta_deg, cfg.elbow_absolute_full_delta_deg,
+                  cfg.bend_plane_observability_start_delta_deg,
+                  cfg.bend_plane_observability_full_delta_deg,
+                  cfg.arm_reference_enable_prepare_s, cfg.arm_reference_enable_max_flexion_delta_deg]
+        if (cfg.elbow_angle_mapping not in (
+                "direct_absolute", "responsive_absolute", "smooth_absolute", "relative")
+                or not np.all(np.isfinite(values)) or min(values) < 0
+                or values[1] <= values[0] or values[3] <= values[2]):
+            raise ValueError("invalid elbow mapping or arming-reference parameters")
         self._active_arm_side = active_arm_side
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -114,15 +125,33 @@ class BodyDevice:
         # Auto-start reference (stable natural-hold pose used as the origin).
         self._reference_samples_left: list[dict[str, np.ndarray]] = []
         self._reference_samples_right: list[dict[str, np.ndarray]] = []
+        self._reference_sample_times: list[float] = []
         self._reference_left_points: Optional[dict[str, np.ndarray]] = None
         self._reference_right_points: Optional[dict[str, np.ndarray]] = None
         self._reference_wrist_rotations: dict[str, np.ndarray] = {}
         self._reference_waist_seen = False
         self._reference_locked = False
+        self._reference_lock = threading.RLock()
+        self._reference_diagnostic_path = (
+            Path(__file__).resolve().parents[3] / "log"
+            / f"pico_reference_{time.time_ns()}.jsonl"
+        )
         self._reference_start_time: Optional[float] = None
         self._reference_prompt_key: tuple[str, int] | None = None
 
         self._held_segment_directions: dict[str, dict[str, np.ndarray]] = {
+            "left": {},
+            "right": {},
+        }
+        self._filtered_segment_directions: dict[str, dict[str, np.ndarray]] = {
+            "left": {},
+            "right": {},
+        }
+        self._filtered_segment_timestamps: dict[str, dict[str, float]] = {
+            "left": {},
+            "right": {},
+        }
+        self._arm_retarget_diagnostics: dict[str, dict[str, Any]] = {
             "left": {},
             "right": {},
         }
@@ -178,12 +207,20 @@ class BodyDevice:
                 if pose is not None:
                     frames[frame_name] = self._transform_source_pose_to_robot_frame(pose)
         if frames:
-            self._frames = frames
-            self._last_body_frame_packet_time_monotonic = now
-            self._body_frame_history.append((now, frames))
-            if len(self._body_frame_history) > 200:
-                self._body_frame_history.pop(0)
-            self._update_auto_reference(now)
+            with self._reference_lock:
+                previous_time = self._last_body_frame_packet_time_monotonic
+                if (not self._reference_locked and previous_time is not None
+                        and now - previous_time > self._cfg.max_stale_time_s):
+                    self._reference_samples_left.clear()
+                    self._reference_samples_right.clear()
+                    self._reference_sample_times.clear()
+                    self._reference_start_time = None
+                self._frames = frames
+                self._last_body_frame_packet_time_monotonic = now
+                self._body_frame_history.append((now, frames))
+                if len(self._body_frame_history) > 200:
+                    self._body_frame_history.pop(0)
+                self._update_auto_reference(now)
 
         hand_joints = self._parse_hand_joints(message)
         if hand_joints is not None:
@@ -448,16 +485,7 @@ class BodyDevice:
         return matrix, frame_name
 
     def _current_arm_points(self, side: str) -> Optional[dict[str, np.ndarray]]:
-        shoulder = self._current_frame_matrix(f"{side}_shoulder")
-        elbow = self._current_frame_matrix(f"{side}_elbow")
-        wrist, _ = self._current_wrist_matrix(side)
-        if shoulder is None or elbow is None or wrist is None:
-            return None
-        return {
-            "shoulder": shoulder[:3, 3].copy(),
-            "elbow": elbow[:3, 3].copy(),
-            "wrist": wrist[:3, 3].copy(),
-        }
+        return self._arm_points_from_frames(self._frames, side)
 
     def _predicted_arm_points(self, side: str) -> Optional[dict[str, np.ndarray]]:
         current = self._current_arm_points(side)
@@ -483,6 +511,8 @@ class BodyDevice:
         for key in ARM_POINT_KEYS:
             velocity = (current[key] - previous_points[key]) / sample_dt
             vn = float(np.linalg.norm(velocity))
+            prediction_gain = self._prediction_velocity_gain(vn)
+            velocity *= prediction_gain
             if self._cfg.arm_vector_prediction_max_velocity_m_s <= 0.0:
                 velocity = np.zeros(3, dtype=np.float32)
             elif vn > self._cfg.arm_vector_prediction_max_velocity_m_s:
@@ -496,23 +526,39 @@ class BodyDevice:
             predicted[key] = (current[key] + displacement).astype(np.float32)
         return predicted
 
+    def _prediction_velocity_gain(self, speed_m_s: float) -> float:
+        """Smoothly suppress prediction caused by low-speed tracker jitter."""
+        start = max(0.0, float(self._cfg.arm_vector_prediction_start_velocity_m_s))
+        full = max(start, float(self._cfg.arm_vector_prediction_full_velocity_m_s))
+        if speed_m_s <= start:
+            return 0.0
+        if full <= start or speed_m_s >= full:
+            return 1.0
+        ratio = (float(speed_m_s) - start) / (full - start)
+        return ratio * ratio * (3.0 - 2.0 * ratio)
+
     def _arm_points_from_frames(
         self, frames: dict[str, np.ndarray], side: str
     ) -> Optional[dict[str, np.ndarray]]:
         waist_inverse = None
-        if self._cfg.auto_start_reference_require_waist and "waist" in frames:
+        if self._cfg.auto_start_reference_require_waist:
+            if "waist" not in frames or not np.all(np.isfinite(frames["waist"])):
+                return None
             waist_inverse = mu.invert_pose_matrix(mu.pose_array_to_matrix(frames["waist"]))
         points: dict[str, np.ndarray] = {}
         for key in ARM_POINT_KEYS:
             pose = frames.get(f"{side}_{key}")
             if pose is None and key == "wrist":
                 pose = frames.get(f"{side}_hand")
-            if pose is None:
+            if pose is None or not np.all(np.isfinite(pose)):
                 return None
             matrix = mu.pose_array_to_matrix(pose)
             if waist_inverse is not None:
                 matrix = waist_inverse @ matrix
             points[key] = matrix[:3, 3].copy()
+        for start, end in (("shoulder", "elbow"), ("elbow", "wrist")):
+            if np.linalg.norm(points[end] - points[start]) < 1.0e-6:
+                return None
         return points
 
     # ----------------------------------------------------------- calibration
@@ -533,8 +579,15 @@ class BodyDevice:
             if active_arm_side in ("left", "right")
             else ("left", "right")
         )
-        points = {side: self._current_arm_points(side) for side in active_sides}
+        points = {
+            side: self._current_arm_points(self._source_side_for_target(side))
+            for side in active_sides
+        }
         if any(value is None for value in points.values()):
+            self._reference_samples_left.clear()
+            self._reference_samples_right.clear()
+            self._reference_start_time = None
+            self._reference_sample_times = []
             return
         if self._reference_start_time is None:
             self._reference_start_time = now
@@ -543,7 +596,7 @@ class BodyDevice:
             print(
                 "\n============================================================\n"
                 " PICO 手臂参考姿态标定\n"
-                f" 动作：站直，{side_label}在身体侧面自然下垂，肘部自然伸直，手腕放松。\n"
+                f" 动作：站直，{side_label}在身体侧面自然放松下垂，肘部不必伸直、不要用力锁直，手腕放松。\n"
                 " 要求：保持肩、肘、手腕不动；此阶段机械臂不会运动。\n"
                 "============================================================",
                 flush=True,
@@ -570,6 +623,9 @@ class BodyDevice:
             return
 
         if phase_elapsed >= sample_start_s:
+            if not hasattr(self, "_reference_sample_times"):
+                self._reference_sample_times = []
+            self._reference_sample_times.append(now)
             if "left" in points:
                 self._reference_samples_left.append(points["left"])
             if "right" in points:
@@ -591,6 +647,7 @@ class BodyDevice:
         if max_std > self._cfg.auto_start_reference_max_position_std_m:
             self._reference_samples_left.clear()
             self._reference_samples_right.clear()
+            self._reference_sample_times.clear()
             self._reference_start_time = now
             self._reference_prompt_key = None
             print(
@@ -604,7 +661,13 @@ class BodyDevice:
         if self._reference_samples_right:
             self._reference_right_points = mu.average_arm_points(self._reference_samples_right)
         for side in active_sides:
-            wrist_matrix, _ = self._current_wrist_matrix(side)
+            reference = self._reference_left_points if side == "left" else self._reference_right_points
+            samples = self._reference_samples_left if side == "left" else self._reference_samples_right
+            self._record_reference_diagnostic(
+                "calibrated", side, reference, reference, len(samples), max_std,
+                self._reference_sample_times[0], now,
+            )
+            wrist_matrix, _ = self._current_wrist_matrix(self._source_side_for_target(side))
             if wrist_matrix is not None:
                 self._reference_wrist_rotations[side] = wrist_matrix[:3, :3].copy()
         self._reference_locked = True
@@ -613,6 +676,66 @@ class BodyDevice:
             "请继续托稳机械臂，确认安全后按 e 开始遥操作。",
             flush=True,
         )
+
+    def restart_arm_reference(self) -> None:
+        """Discard only PICO calibration; caller must prohibit active motors/following."""
+        with self._reference_lock:
+            self._reference_locked = False
+            self._reference_start_time = None
+            self._reference_prompt_key = None
+            self._reference_samples_left.clear()
+            self._reference_samples_right.clear()
+            self._reference_sample_times.clear()
+            self._reference_left_points = None
+            self._reference_right_points = None
+            self._reference_wrist_rotations.clear()
+            self._body_frame_history.clear()
+            self._frames = {}
+            self._last_body_frame_packet_time_monotonic = None
+            for side in ("left", "right"):
+                self._held_segment_directions[side].clear()
+                self._filtered_segment_directions[side].clear()
+                self._filtered_segment_timestamps[side].clear()
+
+    def _record_reference_diagnostic(
+        self, event, side, reference, candidate, count, std, start, end,
+        deviations=None,
+    ) -> None:
+        path = getattr(self, "_reference_diagnostic_path", None)
+        if path is None:
+            return
+
+        def describe(points):
+            if points is None:
+                return None
+            vectors = [points["elbow"] - points["shoulder"], points["wrist"] - points["elbow"]]
+            lengths = [float(np.linalg.norm(v)) for v in vectors]
+            directions = [v / length for v, length in zip(vectors, lengths)]
+            return {
+                "points_m": {k: v.tolist() for k, v in points.items()},
+                "lengths_m": lengths,
+                "directions": [v.tolist() for v in directions],
+                "flexion_deg": float(np.degrees(np.arccos(np.clip(
+                    np.dot(*directions), -1.0, 1.0)))),
+            }
+
+        record = {
+            "event": event, "wall_time_s": time.time(), "target_side": side,
+            "source_side": self._source_side_for_target(side),
+            "frame": "waist_local" if self._cfg.auto_start_reference_require_waist else "robot_world",
+            "sample_start_monotonic_s": start, "sample_end_monotonic_s": end,
+            "sample_count": count, "max_position_std_m": std,
+            "reference": describe(reference), "candidate": describe(candidate),
+            "deviation_deg": deviations,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+            std_text = "unavailable" if std is None else f"{std:.3f}m"
+            print(f"[PICO 参考] {event}: {side}, samples={count}, std={std_text}; log={path}", flush=True)
+        except (OSError, ValueError) as exc:
+            print(f"[PICO 参考] diagnostic log failed: {exc}", flush=True)
 
     # --------------------------------------------------------------- retarget
     def _source_side_for_target(self, target_side: str) -> str:
@@ -649,7 +772,7 @@ class BodyDevice:
     def _apply_segment_direction_deadband(
         self, target_side: str, segment_name: str, vector: np.ndarray, deadband_deg: float
     ) -> np.ndarray:
-        direction = mu.normalize_vector(vector)
+        direction = mu.normalize_vector(np.asarray(vector, dtype=np.float32))
         if direction is None:
             return vector
         previous = self._held_segment_directions[target_side].get(segment_name)
@@ -659,6 +782,40 @@ class BodyDevice:
                 return previous
         self._held_segment_directions[target_side][segment_name] = direction.copy()
         return direction
+
+    def _filter_segment_direction(
+        self, target_side: str, segment_name: str, vector: np.ndarray
+    ) -> np.ndarray:
+        """Smooth PICO segment direction once per source frame with adaptive lag."""
+        direction = mu.normalize_vector(np.asarray(vector, dtype=np.float32))
+        if direction is None:
+            return vector
+        frame_time = self._last_body_frame_packet_time_monotonic
+        previous = self._filtered_segment_directions[target_side].get(segment_name)
+        previous_time = self._filtered_segment_timestamps[target_side].get(segment_name)
+        if previous is None or previous_time is None or frame_time is None:
+            filtered = direction
+        else:
+            dt = float(frame_time - previous_time)
+            if dt <= 1.0e-6:
+                return previous
+            cosine = float(np.clip(np.dot(previous, direction), -1.0, 1.0))
+            angular_speed = float(np.arccos(cosine)) / dt
+            min_cutoff = max(0.0, self._cfg.arm_vector_filter_min_cutoff_hz)
+            max_cutoff = max(min_cutoff, self._cfg.arm_vector_filter_max_cutoff_hz)
+            cutoff = min(
+                max_cutoff,
+                min_cutoff
+                + max(0.0, self._cfg.arm_vector_filter_speed_coefficient) * angular_speed,
+            )
+            alpha = 1.0 - np.exp(-2.0 * np.pi * cutoff * dt)
+            filtered = mu.normalize_vector((1.0 - alpha) * previous + alpha * direction)
+            if filtered is None:
+                filtered = previous
+        self._filtered_segment_directions[target_side][segment_name] = filtered.copy()
+        if frame_time is not None:
+            self._filtered_segment_timestamps[target_side][segment_name] = frame_time
+        return filtered
 
     def _retarget_arm_segment_direction_positions(
         self, current_points: dict[str, np.ndarray], target_side: str
@@ -671,6 +828,8 @@ class BodyDevice:
         signed = mu.arm_points_relative_to_shoulder(current_points, self._signs)
         current_upper = signed["elbow"] - signed["shoulder"]
         current_forearm = signed["wrist"] - signed["elbow"]
+        source_upper_direction = mu.normalize_vector(current_upper)
+        source_forearm_direction = mu.normalize_vector(current_forearm)
 
         alignment_rotation = np.eye(3, dtype=np.float32)
         if self._cfg.arm_vector_position_mode == "segment_direction_relative":
@@ -681,9 +840,6 @@ class BodyDevice:
             )
             if reference_points is not None:
                 signed_reference = mu.arm_points_relative_to_shoulder(reference_points, self._signs)
-                # A natural-down arm is nearly straight, so shoulder/elbow/wrist
-                # cannot determine rotation about the arm. Align only the upper
-                # arm and preserve the fixed PICO-to-robot H1/H2 axes.
                 reference_upper = signed_reference["elbow"] - signed_reference["shoulder"]
                 robot_upper = robot_elbow - robot_shoulder
                 reference_alignment = mu.minimal_vector_alignment_rotation(
@@ -691,15 +847,76 @@ class BodyDevice:
                 )
                 if reference_alignment is not None:
                     alignment_rotation = reference_alignment
-
         mapped_upper = alignment_rotation @ current_upper
         mapped_forearm = alignment_rotation @ current_forearm
+        if self._cfg.arm_vector_position_mode == "segment_direction_relative" and reference_points is not None:
+            mapped_forearm = self._neutral_relative_forearm(
+                mapped_upper, mapped_forearm, self.arm_reference_flexion_rad(target_side),
+                robot_elbow - robot_shoulder, robot_wrist - robot_elbow,
+                mode=self._cfg.elbow_angle_mapping,
+                start_deg=self._cfg.elbow_absolute_start_delta_deg,
+                full_deg=self._cfg.elbow_absolute_full_delta_deg,
+                plane_start_deg=self._cfg.bend_plane_observability_start_delta_deg,
+                plane_full_deg=self._cfg.bend_plane_observability_full_delta_deg,
+            )
+        mapped_before_filter_upper = mu.normalize_vector(mapped_upper)
+        mapped_before_filter_forearm = mu.normalize_vector(mapped_forearm)
+        mapped_before_filter_deg = float(np.degrees(np.arccos(np.clip(
+            np.dot(mapped_before_filter_upper, mapped_before_filter_forearm),
+            -1.0, 1.0,
+        ))))
+        mapped_upper = self._filter_segment_direction(
+            target_side, "upper_arm", mapped_upper
+        )
+        mapped_forearm = self._filter_segment_direction(
+            target_side, "forearm", mapped_forearm
+        )
         mapped_upper = self._apply_segment_direction_deadband(
             target_side, "upper_arm", mapped_upper, self._cfg.upper_arm_angular_deadband_deg
         )
         mapped_forearm = self._apply_segment_direction_deadband(
             target_side, "forearm", mapped_forearm, self._cfg.forearm_angular_deadband_deg
         )
+        filtered_before_plane_upper = mu.normalize_vector(mapped_upper)
+        filtered_before_plane_forearm = mu.normalize_vector(mapped_forearm)
+        filtered_before_plane_gate_deg = float(np.degrees(np.arccos(np.clip(
+            np.dot(filtered_before_plane_upper, filtered_before_plane_forearm),
+            -1.0, 1.0,
+        ))))
+        if self._cfg.arm_vector_position_mode == "segment_direction_relative":
+            # Filtering the two segments independently can reduce the actual
+            # bend back into the near-straight region after the raw PICO bend
+            # has already exposed its noisy plane. Reapply the observability
+            # gate to the directions that will really become the target.
+            mapped_forearm = self._stabilize_forearm_plane(
+                mapped_upper,
+                mapped_forearm,
+                robot_elbow - robot_shoulder,
+                robot_wrist - robot_elbow,
+                plane_start_deg=self._cfg.bend_plane_observability_start_delta_deg,
+                plane_full_deg=self._cfg.bend_plane_observability_full_delta_deg,
+            )
+        desired_after_plane_upper = mu.normalize_vector(mapped_upper)
+        desired_after_plane_forearm = mu.normalize_vector(mapped_forearm)
+        desired_after_plane_gate_deg = float(np.degrees(np.arccos(np.clip(
+            np.dot(desired_after_plane_upper, desired_after_plane_forearm),
+            -1.0, 1.0,
+        ))))
+        stage_diagnostics = getattr(self, "_arm_retarget_diagnostics", None)
+        if stage_diagnostics is not None:
+            stage_diagnostics[target_side] = {
+                "source_predicted_upper_direction": source_upper_direction.tolist(),
+                "source_predicted_forearm_direction": source_forearm_direction.tolist(),
+                "mapped_before_filter_deg": mapped_before_filter_deg,
+                "mapped_before_filter_upper_direction": mapped_before_filter_upper.tolist(),
+                "mapped_before_filter_forearm_direction": mapped_before_filter_forearm.tolist(),
+                "filtered_before_plane_gate_deg": filtered_before_plane_gate_deg,
+                "filtered_before_plane_upper_direction": filtered_before_plane_upper.tolist(),
+                "filtered_before_plane_forearm_direction": filtered_before_plane_forearm.tolist(),
+                "desired_after_plane_gate_deg": desired_after_plane_gate_deg,
+                "desired_after_plane_upper_direction": desired_after_plane_upper.tolist(),
+                "desired_after_plane_forearm_direction": desired_after_plane_forearm.tolist(),
+            }
         upper_vector = mu.scale_vector_to_length(
             mapped_upper, upper_length, robot_elbow - robot_shoulder
         )
@@ -711,6 +928,331 @@ class BodyDevice:
         target_elbow_position = robot_shoulder + upper_vector
         target_wrist_position = target_elbow_position + forearm_vector
         return target_elbow_position.astype(np.float32), target_wrist_position.astype(np.float32)
+
+    @staticmethod
+    def _neutral_relative_forearm(upper, forearm, reference_bend, robot_upper, robot_forearm,
+                                  *, mode="relative", start_deg=5.0, full_deg=30.0,
+                                  plane_start_deg=4.0, plane_full_deg=10.0):
+        """Map elbow bend while suppressing its unobservable near-straight plane."""
+        u = mu.normalize_vector(upper)
+        f = mu.normalize_vector(forearm)
+        ru = mu.normalize_vector(robot_upper)
+        rf = mu.normalize_vector(robot_forearm)
+        if any(v is None for v in (u, f, ru, rf)):
+            raise ValueError("invalid arm segment for neutral-relative retargeting")
+        carry = mu.minimal_vector_alignment_rotation(ru, u)
+        if carry is None:
+            raise ValueError("cannot carry robot forearm with upper arm")
+        base = carry @ rf
+        bend = float(np.arccos(np.clip(np.dot(u, f), -1, 1)))
+        robot_bend = float(np.arccos(np.clip(np.dot(ru, rf), -1, 1)))
+        # Natural-down cannot extend through the elbow's straight configuration.
+        target_bend, _ = BodyDevice._mapped_elbow_angle(
+            bend, reference_bend, robot_bend, mode, start_deg, full_deg)
+        if mode != "direct_absolute" and abs(target_bend - robot_bend) < 1.0e-6:
+            return base
+
+        live_axis = mu.normalize_vector(np.cross(u, f))
+        if live_axis is None:
+            live_axis = mu.normalize_vector(np.cross(u, base))
+        if live_axis is None:
+            live_axis = mu.normalize_vector(np.cross(
+                u, np.eye(3)[np.argmin(np.abs(u))]
+            ))
+        mapped_live = mu.rotvec_to_rotation_matrix(live_axis * target_bend) @ u
+        return BodyDevice._stabilize_forearm_plane(
+            u,
+            mapped_live,
+            ru,
+            rf,
+            target_bend_rad=target_bend,
+            plane_start_deg=plane_start_deg,
+            plane_full_deg=plane_full_deg,
+        )
+
+    @staticmethod
+    def _stabilize_forearm_plane(upper, forearm, robot_upper, robot_forearm,
+                                 *, target_bend_rad=None,
+                                 plane_start_deg=4.0, plane_full_deg=10.0):
+        """Keep the bend plane calibrated until the actual bend is observable."""
+        u = mu.normalize_vector(upper)
+        f = mu.normalize_vector(forearm)
+        ru = mu.normalize_vector(robot_upper)
+        rf = mu.normalize_vector(robot_forearm)
+        if any(v is None for v in (u, f, ru, rf)):
+            raise ValueError("invalid arm segment for bend-plane stabilization")
+        carry = mu.minimal_vector_alignment_rotation(ru, u)
+        if carry is None:
+            raise ValueError("cannot carry robot forearm with upper arm")
+        base = carry @ rf
+        target_bend = (
+            float(np.arccos(np.clip(np.dot(u, f), -1, 1)))
+            if target_bend_rad is None else float(target_bend_rad)
+        )
+        robot_bend = float(np.arccos(np.clip(np.dot(ru, rf), -1, 1)))
+        if not np.isfinite(target_bend):
+            raise ValueError("invalid target elbow bend")
+        normalized_base = mu.normalize_vector(base)
+        if normalized_base is not None and np.linalg.norm(f - normalized_base) < 1.0e-5:
+            # Preserve the exact already-calibrated direction. Rebuilding it
+            # through another float32 rotation can otherwise create a small
+            # startup wrist translation despite an unchanged human pose.
+            return f
+        plane_start, plane_full = np.deg2rad([plane_start_deg, plane_full_deg])
+        if (not np.all(np.isfinite([plane_start, plane_full]))
+                or plane_start < 0 or plane_full <= plane_start):
+            raise ValueError("invalid elbow bend-plane transition")
+
+        # `base` carries the calibrated robot bend plane with the live upper
+        # arm. The PICO plane is noisy only near actual elbow extension because
+        # cross(u, f) is ill-conditioned there. Gate on the target bend itself,
+        # rather than its departure from the startup robot pose: a bent arm is
+        # observable even when the robot happened to start at the same bend.
+        base_axis = mu.normalize_vector(np.cross(u, base))
+        live_axis = mu.normalize_vector(np.cross(u, f))
+        if base_axis is None:
+            base_axis = live_axis
+        if base_axis is None:
+            base_axis = mu.normalize_vector(np.cross(
+                u, np.eye(3)[np.argmin(np.abs(u))]
+            ))
+        if live_axis is None:
+            live_axis = base_axis
+
+        observable_bend = max(0.0, target_bend)
+        if observable_bend <= plane_start:
+            visibility = 0.0
+        elif observable_bend >= plane_full:
+            visibility = 1.0
+        else:
+            ratio = (observable_bend - plane_start) / (plane_full - plane_start)
+            visibility = ratio * ratio * (3.0 - 2.0 * ratio)
+
+        stable = mu.rotvec_to_rotation_matrix(base_axis * target_bend) @ u
+        observed = mu.rotvec_to_rotation_matrix(live_axis * target_bend) @ u
+        blended = mu.normalize_vector((1.0 - visibility) * stable + visibility * observed)
+        if blended is None:
+            blended = stable if visibility < 0.5 else observed
+        blended_axis = mu.normalize_vector(np.cross(u, blended))
+        if blended_axis is None:
+            return blended
+        # Reproject after blending so the requested elbow angle is preserved.
+        return mu.rotvec_to_rotation_matrix(blended_axis * target_bend) @ u
+
+    @staticmethod
+    def _mapped_elbow_angle(bend, reference, robot_bend, mode, start_deg, full_deg):
+        if mode == "direct_absolute":
+            return float(np.clip(bend, 0, np.pi)), 1.0
+        if mode == "relative":
+            return float(np.clip(robot_bend + bend - reference, 0, np.pi)), 0.0
+        if mode not in ("smooth_absolute", "responsive_absolute"):
+            raise ValueError("unknown elbow angle mapping")
+        start, full = np.deg2rad([start_deg, full_deg])
+        if not np.all(np.isfinite([start, full])) or start < 0 or full <= start:
+            raise ValueError("invalid elbow angle transition")
+        t = float(np.clip((bend - reference - start) / (full - start), 0, 1))
+        weight = t * t * (3 - 2 * t)
+        base = robot_bend
+        if mode == "responsive_absolute":
+            # Add a smoothly engaged relative response before absolute blending
+            # dominates. Keep both the neutral band and full-angle endpoint.
+            departure = max(0.0, bend - reference - start)
+            onset = min(np.deg2rad(5.0), full - start)
+            u = float(np.clip(departure / onset, 0, 1))
+            base += departure * u * u * (3 - 2 * u)
+        return (1 - weight) * base + weight * bend, weight
+
+    @staticmethod
+    def _points_flexion(points):
+        upper = mu.normalize_vector(points["elbow"] - points["shoulder"])
+        forearm = mu.normalize_vector(points["wrist"] - points["elbow"])
+        if upper is None or forearm is None:
+            raise ValueError("invalid arm segments")
+        return float(np.arccos(np.clip(np.dot(upper, forearm), -1, 1)))
+
+    def elbow_diagnostics(self, side):
+        points = self._current_arm_points(self._source_side_for_target(side))
+        if points is None or not self._reference_locked:
+            return None
+        bend = self._points_flexion(points)
+        reference = self.arm_reference_flexion_rad(side)
+        shoulder, elbow, wrist, _ = self._robot_arm_reference(side)
+        robot = self._points_flexion(dict(shoulder=shoulder, elbow=elbow, wrist=wrist))
+        angle, weight = self._mapped_elbow_angle(
+            bend, reference, robot, self._cfg.elbow_angle_mapping,
+            self._cfg.elbow_absolute_start_delta_deg, self._cfg.elbow_absolute_full_delta_deg)
+        if self._cfg.arm_vector_position_mode != "segment_direction_relative":
+            angle, weight = bend, None
+        return dict(reference_deg=float(np.degrees(reference)), human_deg=float(np.degrees(bend)),
+                    blend_weight=weight, raw_mapped_deg=float(np.degrees(angle)))
+
+    def arm_retarget_diagnostics(self, side: str) -> dict[str, Any]:
+        """Return the latest stage-by-stage arm-vector target diagnostics."""
+        if side not in ("left", "right"):
+            raise ValueError("side must be left or right")
+        return dict(self._arm_retarget_diagnostics.get(side, {}))
+
+    def arm_reference_deviation_deg(self, target_side: str) -> Optional[tuple[float, float]]:
+        """Return current upper/forearm angular distance from the PICO reference."""
+        if target_side not in ("left", "right"):
+            raise ValueError("target_side must be 'left' or 'right'")
+        source_side = self._source_side_for_target(target_side)
+        current = self._current_arm_points(source_side)
+        reference = (
+            self._reference_left_points if target_side == "left" else self._reference_right_points
+        )
+        if current is None or reference is None:
+            return None
+        current_signed = mu.arm_points_relative_to_shoulder(current, self._signs)
+        reference_signed = mu.arm_points_relative_to_shoulder(reference, self._signs)
+
+        def segment_angle(start: str, end: str) -> float:
+            current_direction = mu.normalize_vector(current_signed[end] - current_signed[start])
+            reference_direction = mu.normalize_vector(
+                reference_signed[end] - reference_signed[start]
+            )
+            if current_direction is None or reference_direction is None:
+                return float("inf")
+            cosine = float(np.clip(np.dot(current_direction, reference_direction), -1.0, 1.0))
+            return float(np.degrees(np.arccos(cosine)))
+
+        return segment_angle("shoulder", "elbow"), segment_angle("elbow", "wrist")
+
+    def arm_reference_flexion_rad(self, side: str) -> float:
+        """Return the elbow bend in the accepted multi-frame human reference."""
+        if side not in ("left", "right"):
+            raise ValueError("side must be left or right")
+        points = self._reference_left_points if side == "left" else self._reference_right_points
+        if points is None:
+            raise ValueError("human arm reference is unavailable")
+        upper = mu.normalize_vector(points["elbow"] - points["shoulder"])
+        forearm = mu.normalize_vector(points["wrist"] - points["elbow"])
+        if upper is None or forearm is None:
+            raise ValueError("human arm reference contains a zero-length segment")
+        angle = float(np.arccos(np.clip(np.dot(upper, forearm), -1.0, 1.0)))
+        if not np.isfinite(angle):
+            raise ValueError("human arm reference angle is not finite")
+        return angle
+
+    def seed_arm_reference_filters(self, side: str) -> None:
+        """Start directional filtering at the accepted pose, before live motion."""
+        self.arm_reference_flexion_rad(side)
+        if self._cfg.elbow_angle_mapping == "direct_absolute":
+            # The formal calibration pose may sit at the edge of PICO tracking
+            # and can have a very different elbow bend from the stable target
+            # accepted at enable time.  Do not inject that stale pose into the
+            # filter.  The first live target is still rate-limited from measured
+            # robot feedback by _limit_arm_segment_translations().
+            for name in ("upper_arm", "forearm"):
+                self._filtered_segment_directions[side].pop(name, None)
+                self._held_segment_directions[side].pop(name, None)
+                self._filtered_segment_timestamps[side].pop(name, None)
+            return
+        points = self._reference_left_points if side == "left" else self._reference_right_points
+        signed = mu.arm_points_relative_to_shoulder(points, self._signs)
+        upper = signed["elbow"] - signed["shoulder"]
+        forearm = signed["wrist"] - signed["elbow"]
+        rotation = np.eye(3)
+        if self._cfg.arm_vector_position_mode == "segment_direction_relative":
+            shoulder, elbow, wrist, _ = self._robot_arm_reference(side)
+            rotation = mu.minimal_vector_alignment_rotation(upper, elbow - shoulder)
+            if rotation is None:
+                raise ValueError("cannot align human arm reference")
+        mapped = {"upper_arm": rotation @ upper, "forearm": rotation @ forearm}
+        if self._cfg.arm_vector_position_mode == "segment_direction_relative":
+            mapped["forearm"] = self._neutral_relative_forearm(
+                mapped["upper_arm"], mapped["forearm"], self.arm_reference_flexion_rad(side),
+                elbow - shoulder, wrist - elbow,
+                mode=self._cfg.elbow_angle_mapping,
+                start_deg=self._cfg.elbow_absolute_start_delta_deg,
+                full_deg=self._cfg.elbow_absolute_full_delta_deg,
+                plane_start_deg=self._cfg.bend_plane_observability_start_delta_deg,
+                plane_full_deg=self._cfg.bend_plane_observability_full_delta_deg,
+            )
+        for name, vector in mapped.items():
+            direction = mu.normalize_vector(vector)
+            self._filtered_segment_directions[side][name] = direction.copy()
+            self._held_segment_directions[side][name] = direction.copy()
+            self._filtered_segment_timestamps[side][name] = self._last_body_frame_packet_time_monotonic
+
+    def refresh_arm_reference_for_enable(
+        self, target_side: str
+    ) -> Optional[tuple[bool, float, float, float, int]]:
+        """Capture a stable recent tracking target without changing calibration."""
+        with getattr(self, "_reference_lock", nullcontext()):
+            result = self._refresh_arm_reference_for_enable(target_side)
+            if result is None:
+                reference = self._reference_left_points if target_side == "left" else self._reference_right_points
+                self._record_reference_diagnostic(
+                    "enable_unavailable_or_unstable", target_side, reference,
+                    None, 0, None, None, time.monotonic(),
+                )
+            return result
+
+    def _refresh_arm_reference_for_enable(self, target_side):
+        if target_side not in ("left", "right"):
+            raise ValueError("target_side must be 'left' or 'right'")
+        history = list(self._body_frame_history)
+        if not history:
+            return None
+        source_side = self._source_side_for_target(target_side)
+        if self._arm_points_from_frames(history[-1][1], source_side) is None:
+            return None
+        latest_time = history[-1][0]
+        if time.monotonic() - latest_time > self._cfg.max_stale_time_s:
+            return None
+        window_s = max(0.1, float(self._cfg.arm_reference_enable_window_s))
+        samples = []
+        sample_times = []
+        for timestamp, frames in history:
+            if latest_time - timestamp > window_s:
+                continue
+            points = self._arm_points_from_frames(frames, source_side)
+            if points is not None:
+                samples.append(points)
+                sample_times.append(timestamp)
+        minimum = max(5, int(self._cfg.auto_start_reference_min_samples))
+        if len(samples) < minimum:
+            return None
+        max_std = mu_arm_points_max_std(samples)
+        if max_std > self._cfg.auto_start_reference_max_position_std_m:
+            return None
+        candidate = mu.average_arm_points(samples)
+        reference = (
+            self._reference_left_points if target_side == "left" else self._reference_right_points
+        )
+        if candidate is None or reference is None:
+            return None
+
+        def angle(start: str, end: str) -> float:
+            candidate_direction = mu.normalize_vector(candidate[end] - candidate[start])
+            reference_direction = mu.normalize_vector(reference[end] - reference[start])
+            if candidate_direction is None or reference_direction is None:
+                return float("inf")
+            cosine = float(
+                np.clip(np.dot(candidate_direction, reference_direction), -1.0, 1.0)
+            )
+            return float(np.degrees(np.arccos(cosine)))
+
+        upper_delta = angle("shoulder", "elbow")
+        forearm_delta = angle("elbow", "wrist")
+        reference_bend = float(np.degrees(self._points_flexion(reference)))
+        candidate_bend = float(np.degrees(self._points_flexion(candidate)))
+        self._record_reference_diagnostic(
+            "enable_target_ready", target_side,
+            reference, candidate, len(samples), max_std,
+            sample_times[0], sample_times[-1],
+            [upper_delta, forearm_delta],
+        )
+        print(
+            f"[PICO 参考] latest stable target ready: elbow calibration="
+            f"{reference_bend:.1f}deg, current={candidate_bend:.1f}deg; "
+            f"upper/forearm offset={upper_delta:.1f}/{forearm_delta:.1f}deg. "
+            "Calibration remains fixed; the robot will approach this target through "
+            "the configured rate and trajectory limits.",
+            flush=True,
+        )
+        return True, upper_delta, forearm_delta, max_std, len(samples)
 
     def _hand_imu_delta_matrix_for_target(self, target_side: str) -> Optional[np.ndarray]:
         if not self._cfg.use_hand_imu_orientation:
@@ -832,6 +1374,35 @@ class BodyDevice:
         return target
 
     @staticmethod
+    def _slerp_direction(start: np.ndarray, end: np.ndarray, progress: float) -> np.ndarray:
+        """Interpolate two unit directions along a continuous shortest arc."""
+        first = mu.normalize_vector(start)
+        second = mu.normalize_vector(end)
+        if first is None or second is None:
+            raise ValueError("cannot interpolate a zero-length direction")
+        amount = float(np.clip(progress, 0.0, 1.0))
+        cosine = float(np.clip(np.dot(first, second), -1.0, 1.0))
+        if cosine > 1.0 - 1.0e-7:
+            result = mu.normalize_vector((1.0 - amount) * first + amount * second)
+            return first.copy() if result is None else result
+        if cosine < -1.0 + 1.0e-7:
+            basis = np.eye(3)[int(np.argmin(np.abs(first)))]
+            axis = mu.normalize_vector(np.cross(first, basis))
+            if axis is None:
+                return first.copy()
+            return (mu.rotvec_to_rotation_matrix(axis * np.pi * amount) @ first).astype(
+                np.float32
+            )
+        angle = float(np.arccos(cosine))
+        sine = float(np.sin(angle))
+        result = (
+            np.sin((1.0 - amount) * angle) / sine * first
+            + np.sin(amount * angle) / sine * second
+        )
+        normalized = mu.normalize_vector(result)
+        return first.copy() if normalized is None else normalized
+
+    @staticmethod
     def _limit_arm_segment_translations(
         previous_elbow_pose: np.ndarray,
         previous_wrist_pose: np.ndarray,
@@ -840,18 +1411,34 @@ class BodyDevice:
         shoulder_position: np.ndarray,
         max_velocity: float,
         dt: float,
+        *,
+        forearm_projector=None,
+        diagnostics: dict | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Synchronously limit a two-link arm while preserving both link lengths."""
+        """Advance a two-link arm through bounded geometric state increments.
+
+        The old implementation bisected a scalar interpolation progress while
+        applying the bend-plane projector inside every probe.  The projector is
+        state dependent around the 4--10 degree observability transition, so
+        endpoint displacement is not monotonic in that progress.  This version
+        computes the fully stabilized destination once, advances upper-arm
+        direction, elbow bend and bend-plane direction continuously, then only
+        backtracks toward the known-safe previous state if the reconstructed
+        endpoint step exceeds the Cartesian bound.
+        """
         previous_elbow = np.asarray(previous_elbow_pose, dtype=np.float32).reshape(7)
         previous_wrist = np.asarray(previous_wrist_pose, dtype=np.float32).reshape(7)
         target_elbow = np.asarray(target_elbow_pose, dtype=np.float32).reshape(7).copy()
         target_wrist = np.asarray(target_wrist_pose, dtype=np.float32).reshape(7).copy()
         shoulder = np.asarray(shoulder_position, dtype=np.float32).reshape(3)
-        if max_velocity <= 0.0:
-            return target_elbow, target_wrist
+        if diagnostics is not None:
+            diagnostics.clear()
+            diagnostics["method"] = "arm_state_arc_backtrack"
         if not np.isfinite(dt) or dt <= 0.0:
             target_elbow[:3] = previous_elbow[:3]
             target_wrist[:3] = previous_wrist[:3]
+            if diagnostics is not None:
+                diagnostics.update(progress=0.0, reason="invalid_dt")
             return target_elbow, target_wrist
 
         upper_length = float(np.linalg.norm(target_elbow[:3] - shoulder))
@@ -870,43 +1457,145 @@ class BodyDevice:
         ):
             target_elbow[:3] = previous_elbow[:3]
             target_wrist[:3] = previous_wrist[:3]
+            if diagnostics is not None:
+                diagnostics.update(progress=0.0, reason="invalid_segment")
             return target_elbow, target_wrist
 
+        # Stabilize the complete destination once.  It becomes the fixed goal
+        # for this cycle instead of changing independently at each search probe.
+        if forearm_projector is not None:
+            projected = mu.normalize_vector(forearm_projector(target_upper, target_forearm))
+            if projected is None:
+                target_elbow[:3] = previous_elbow[:3]
+                target_wrist[:3] = previous_wrist[:3]
+                if diagnostics is not None:
+                    diagnostics.update(progress=0.0, reason="invalid_projected_target")
+                return target_elbow, target_wrist
+            target_forearm = projected
+            target_wrist[:3] = target_elbow[:3] + target_forearm * forearm_length
+
+        previous_bend = float(
+            np.arccos(np.clip(np.dot(previous_upper, previous_forearm), -1.0, 1.0))
+        )
+        target_bend = float(
+            np.arccos(np.clip(np.dot(target_upper, target_forearm), -1.0, 1.0))
+        )
+        previous_axis = mu.normalize_vector(np.cross(previous_upper, previous_forearm))
+        target_axis = mu.normalize_vector(np.cross(target_upper, target_forearm))
+        if previous_axis is None:
+            previous_axis = target_axis
+        if target_axis is None:
+            target_axis = previous_axis
+        if previous_axis is None:
+            basis = np.eye(3)[int(np.argmin(np.abs(previous_upper)))]
+            previous_axis = mu.normalize_vector(np.cross(previous_upper, basis))
+            target_axis = previous_axis
+
         def candidate(progress: float) -> tuple[np.ndarray, np.ndarray]:
-            upper_direction = mu.normalize_vector(
-                (1.0 - progress) * previous_upper + progress * target_upper
-            )
-            forearm_direction = mu.normalize_vector(
-                (1.0 - progress) * previous_forearm + progress * target_forearm
-            )
-            if upper_direction is None or forearm_direction is None:
+            if progress <= 0.0:
                 return previous_elbow[:3].copy(), previous_wrist[:3].copy()
+            if progress >= 1.0:
+                return target_elbow[:3].copy(), target_wrist[:3].copy()
+            upper_direction = BodyDevice._slerp_direction(
+                previous_upper, target_upper, progress
+            )
+            plane_axis = BodyDevice._slerp_direction(
+                previous_axis, target_axis, progress
+            )
+            plane_axis = mu.normalize_vector(
+                plane_axis - upper_direction * np.dot(plane_axis, upper_direction)
+            )
+            if plane_axis is None:
+                provisional = BodyDevice._slerp_direction(
+                    previous_forearm, target_forearm, progress
+                )
+                plane_axis = mu.normalize_vector(np.cross(upper_direction, provisional))
+            if plane_axis is None:
+                return previous_elbow[:3].copy(), previous_wrist[:3].copy()
+            bend = (1.0 - progress) * previous_bend + progress * target_bend
+            forearm_direction = mu.normalize_vector(
+                mu.rotvec_to_rotation_matrix(plane_axis * bend) @ upper_direction
+            )
+            if forearm_direction is None:
+                return previous_elbow[:3].copy(), previous_wrist[:3].copy()
+            # Reapply the near-straight observability gate only to the selected
+            # state.  Backtracking always approaches the exact previous state;
+            # it does not binary-search a globally non-monotonic projection.
+            if forearm_projector is not None:
+                forearm_direction = mu.normalize_vector(
+                    forearm_projector(upper_direction, forearm_direction)
+                )
+                if forearm_direction is None:
+                    return previous_elbow[:3].copy(), previous_wrist[:3].copy()
             elbow_position = shoulder + upper_direction * upper_length
             wrist_position = elbow_position + forearm_direction * forearm_length
             return elbow_position, wrist_position
 
         max_distance = float(max_velocity) * dt
         full_elbow, full_wrist = candidate(1.0)
-        full_step = max(
-            float(np.linalg.norm(full_elbow - previous_elbow[:3])),
-            float(np.linalg.norm(full_wrist - previous_wrist[:3])),
-        )
+        full_elbow_step = float(np.linalg.norm(full_elbow - previous_elbow[:3]))
+        full_wrist_step = float(np.linalg.norm(full_wrist - previous_wrist[:3]))
+        if max_velocity <= 0.0:
+            target_elbow[:3], target_wrist[:3] = full_elbow, full_wrist
+            if diagnostics is not None:
+                diagnostics.update(
+                    progress=1.0,
+                    backtracks=0,
+                    max_distance_m=None,
+                    elbow_step_m=full_elbow_step,
+                    wrist_step_m=full_wrist_step,
+                )
+            return target_elbow, target_wrist
+
+        full_step = max(full_elbow_step, full_wrist_step)
         progress = 1.0
         if full_step > max_distance:
-            low, high = 0.0, 1.0
-            for _ in range(24):
-                middle = 0.5 * (low + high)
-                elbow_position, wrist_position = candidate(middle)
-                step = max(
-                    float(np.linalg.norm(elbow_position - previous_elbow[:3])),
-                    float(np.linalg.norm(wrist_position - previous_wrist[:3])),
-                )
-                if step <= max_distance:
-                    low = middle
-                else:
-                    high = middle
-            progress = low
-        target_elbow[:3], target_wrist[:3] = candidate(progress)
+            upper_angle = float(
+                np.arccos(np.clip(np.dot(previous_upper, target_upper), -1.0, 1.0))
+            )
+            forearm_angle = float(
+                np.arccos(np.clip(np.dot(previous_forearm, target_forearm), -1.0, 1.0))
+            )
+            arc_bound = max(
+                upper_length * upper_angle,
+                upper_length * upper_angle + forearm_length * forearm_angle,
+            )
+            progress = min(1.0, max_distance / arc_bound) if arc_bound > 0.0 else 0.0
+
+        backtracks = 0
+        elbow_position, wrist_position = candidate(progress)
+        elbow_step = float(np.linalg.norm(elbow_position - previous_elbow[:3]))
+        wrist_step = float(np.linalg.norm(wrist_position - previous_wrist[:3]))
+        while max(elbow_step, wrist_step) > max_distance + 1.0e-9 and progress > 1.0e-7:
+            progress *= 0.5
+            backtracks += 1
+            elbow_position, wrist_position = candidate(progress)
+            elbow_step = float(np.linalg.norm(elbow_position - previous_elbow[:3]))
+            wrist_step = float(np.linalg.norm(wrist_position - previous_wrist[:3]))
+        if max(elbow_step, wrist_step) > max_distance + 1.0e-9:
+            progress = 0.0
+            elbow_position, wrist_position = candidate(0.0)
+            elbow_step = wrist_step = 0.0
+
+        target_elbow[:3], target_wrist[:3] = elbow_position, wrist_position
+        if diagnostics is not None:
+            limited_upper = mu.normalize_vector(elbow_position - shoulder)
+            limited_forearm = mu.normalize_vector(wrist_position - elbow_position)
+            limited_bend = previous_bend
+            if limited_upper is not None and limited_forearm is not None:
+                limited_bend = float(np.arccos(np.clip(
+                    np.dot(limited_upper, limited_forearm), -1.0, 1.0
+                )))
+            diagnostics.update(
+                progress=float(progress),
+                backtracks=int(backtracks),
+                max_distance_m=float(max_distance),
+                elbow_step_m=elbow_step,
+                wrist_step_m=wrist_step,
+                previous_bend_deg=float(np.degrees(previous_bend)),
+                desired_bend_deg=float(np.degrees(target_bend)),
+                limited_bend_deg=float(np.degrees(limited_bend)),
+            )
         return target_elbow, target_wrist
 
     def _retarget_arm_vector_pair(
@@ -964,6 +1653,28 @@ class BodyDevice:
         )
         elbow_pose = mu.pose_matrix_to_array(target_elbow)
         wrist_pose = mu.pose_matrix_to_array(target_wrist)
+        desired_before_limit_deg = float(np.degrees(self._points_flexion({
+            "shoulder": robot_shoulder,
+            "elbow": elbow_pose[:3],
+            "wrist": wrist_pose[:3],
+        })))
+        forearm_projector = None
+        if self._cfg.arm_vector_position_mode == "segment_direction_relative":
+            _, robot_elbow, robot_wrist, _ = self._robot_arm_reference(target_side)
+            robot_upper = robot_elbow - robot_shoulder
+            robot_forearm = robot_wrist - robot_elbow
+
+            def forearm_projector(upper_direction, forearm_direction):
+                return self._stabilize_forearm_plane(
+                    upper_direction,
+                    forearm_direction,
+                    robot_upper,
+                    robot_forearm,
+                    plane_start_deg=self._cfg.bend_plane_observability_start_delta_deg,
+                    plane_full_deg=self._cfg.bend_plane_observability_full_delta_deg,
+                )
+
+        limiter_diagnostics: dict[str, float | int | str] = {}
         if target_side == "left":
             elbow_pose, wrist_pose = self._limit_arm_segment_translations(
                 self._previous_left_elbow_pose,
@@ -973,6 +1684,8 @@ class BodyDevice:
                 self._robot_left_shoulder,
                 self._cfg.max_endpoint_translation_velocity_m_s,
                 target_dt,
+                forearm_projector=forearm_projector,
+                diagnostics=limiter_diagnostics,
             )
             self._previous_left_elbow_pose = elbow_pose
             self._previous_left_pose = wrist_pose
@@ -985,9 +1698,28 @@ class BodyDevice:
                 self._robot_right_shoulder,
                 self._cfg.max_endpoint_translation_velocity_m_s,
                 target_dt,
+                forearm_projector=forearm_projector,
+                diagnostics=limiter_diagnostics,
             )
             self._previous_right_elbow_pose = elbow_pose
             self._previous_right_pose = wrist_pose
+        limited_deg = float(np.degrees(self._points_flexion({
+            "shoulder": robot_shoulder,
+            "elbow": elbow_pose[:3],
+            "wrist": wrist_pose[:3],
+        })))
+        limited_upper_direction = mu.normalize_vector(elbow_pose[:3] - robot_shoulder)
+        limited_forearm_direction = mu.normalize_vector(wrist_pose[:3] - elbow_pose[:3])
+        stage_diagnostics = getattr(self, "_arm_retarget_diagnostics", None)
+        if stage_diagnostics is not None:
+            stage_diagnostics.setdefault(target_side, {}).update(
+                desired_before_limit_deg=desired_before_limit_deg,
+                limited_deg=limited_deg,
+                limited_upper_direction=limited_upper_direction.tolist(),
+                limited_forearm_direction=limited_forearm_direction.tolist(),
+                target_dt_s=float(target_dt),
+                limiter=limiter_diagnostics,
+            )
         return elbow_pose, wrist_pose
 
     # ---------------------------------------------------------------- public
@@ -1032,6 +1764,8 @@ class BodyDevice:
                 else:
                     self._robot_right_reference_rotation = rotation
         self._held_segment_directions = {"left": {}, "right": {}}
+        self._filtered_segment_directions = {"left": {}, "right": {}}
+        self._filtered_segment_timestamps = {"left": {}, "right": {}}
         self._hand_imu_reference_delta_matrices.clear()
         self._last_target_update_time_monotonic = time.monotonic()
 

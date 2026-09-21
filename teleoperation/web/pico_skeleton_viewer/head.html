@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>头部相机 · ESROBO</title><link rel="stylesheet" href="./head.css"></head>
+<body>
+<header><h1>头部相机</h1><nav><a href="./index.html">PICO 骨架</a><a href="./head.html" aria-current="page">头部相机</a></nav><span id="connection">等待连接</span></header>
+<main>
+  <section class="camera" aria-label="相机图像">
+    <div class="camera-bar"><div role="tablist" aria-label="图像类型"><button role="tab" aria-selected="true" data-stream="color">彩色</button><button role="tab" aria-selected="false" data-stream="depth">深度</button></div><span id="image-age">--</span></div>
+    <div class="image-frame"><img id="preview" alt="头部相机实时图像" hidden><div id="image-empty">等待相机图像</div></div>
+    <div class="image-footer"><span>640 × 400 · 采集 20 Hz</span><span id="depth-scale" hidden>深度预览 0–3 m · 无效值为黑色</span><span id="preview-rate">预览 ≤ 10 Hz</span></div>
+  </section>
+  <section class="controls" aria-label="头部位置调整">
+    <div class="section-heading"><h2>两轴位置</h2><span>原始计数</span></div>
+    <div class="axis" data-axis="1"><h3>俯仰 <small>ID1</small></h3><div class="reading"><output id="position-1">--</output><span id="torque-1">力矩 --</span><span id="pending-1">--</span></div>
+      <label for="target-1">目标位置 <span>1000–2700</span></label><div class="target-row"><input id="target-1" type="number" min="1000" max="2700" step="1" inputmode="numeric"><button class="move" data-id="1" disabled>移动</button></div>
+      <div class="jog-row"><button class="jog" data-id="1" data-delta="-10" title="俯仰减少 10 个计数" disabled>−10</button><button class="jog" data-id="1" data-delta="10" title="俯仰增加 10 个计数" disabled>+10</button><button class="current" data-id="1" title="将实际位置填入目标">取当前值</button></div>
+      <p class="axis-detail" id="detail-1">等待反馈</p></div>
+    <div class="axis" data-axis="2"><h3>左右 <small>ID2</small></h3><div class="reading"><output id="position-2">--</output><span id="torque-2">力矩 --</span><span id="pending-2">--</span></div>
+      <label for="target-2">目标位置 <span>2000–5000</span></label><div class="target-row"><input id="target-2" type="number" min="2000" max="5000" step="1" inputmode="numeric"><button class="move" data-id="2" disabled>移动</button></div>
+      <div class="jog-row"><button class="jog" data-id="2" data-delta="-10" title="左右减少 10 个计数" disabled>−10</button><button class="jog" data-id="2" data-delta="10" title="左右增加 10 个计数" disabled>+10</button><button class="current" data-id="2" title="将实际位置填入目标">取当前值</button></div>
+      <p class="axis-detail" id="detail-2">等待反馈</p></div>
+    <div class="actions"><button id="enable" disabled>开启调整</button><button id="lock">锁定调整</button></div>
+    <p id="message" role="status">调整已锁定</p>
+    <p class="safety">锁定保留力矩，不是急停；已接受的小步目标可能继续完成。</p>
+  </section>
+</main><script type="module" src="./head.js"></script>
+</body></html>

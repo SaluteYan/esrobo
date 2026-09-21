@@ -1,7 +1,10 @@
 import json
 import socket
 import time
-from urllib.request import urlopen
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError
+
+import pytest
 
 from esrobo_teleop.debug.skeleton_viewer import SkeletonViewerServer, SkeletonViewerState
 
@@ -53,12 +56,63 @@ def test_viewer_http_serves_page_and_read_only_state(tmp_path):
         server.stop()
 
 
+def test_viewer_can_restart_immediately_on_the_same_port(tmp_path):
+    (tmp_path / "index.html").write_text("viewer-restarted", encoding="utf-8")
+    first = SkeletonViewerServer("127.0.0.1", 0, asset_root=tmp_path, diagnostics_port=0)
+    first.start()
+    port = first.bound_port
+    first.stop()
+
+    second = SkeletonViewerServer(
+        "127.0.0.1", port, asset_root=tmp_path, diagnostics_port=0
+    )
+    second.start()
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/", timeout=2) as response:
+            assert response.read() == b"viewer-restarted"
+    finally:
+        second.stop()
+
+
 def test_viewer_marks_old_data_stale():
     state = SkeletonViewerState()
     state.update(_packet())
     state._received_monotonic = time.monotonic() - 0.6
 
     assert state.snapshot()["connected"] is False
+
+
+def test_head_proxy_requires_same_origin_and_forwards_only_allowed_paths(monkeypatch, tmp_path):
+    import io
+    import esrobo_teleop.debug.skeleton_viewer as module
+    calls = []
+    def upstream(request, timeout):
+        calls.append(request)
+        reply = io.BytesIO(b'{"ok":true}')
+        reply.status = 200
+        reply.headers = {'Content-Type': 'application/json'}
+        return reply
+    monkeypatch.setattr(module, 'urlopen', upstream)
+    server = SkeletonViewerServer('127.0.0.1', 0, asset_root=tmp_path, diagnostics_port=0)
+    server.start()
+    base = f'http://127.0.0.1:{server.bound_port}'
+    try:
+        for origin in ('http://other.example', ''):
+            with pytest.raises(HTTPError) as error:
+                urlopen(Request(base + '/api/head/enable', data=b'{}', headers={
+                    'Origin': origin, 'X-Head-Control': '1', 'Content-Type': 'application/json'}))
+            assert error.value.code == 403
+        assert not calls
+        with urlopen(Request(base + '/api/head/enable', data=b'{"session":"testuser"}', headers={
+                'Origin': base, 'X-Head-Control': '1', 'Content-Type': 'application/json'})) as response:
+            assert json.load(response)['ok']
+        assert calls[0].full_url == 'http://127.0.0.1:8766/api/head/enable'
+        assert calls[0].data == b'{"session":"testuser"}'
+        with pytest.raises(HTTPError) as error:
+            urlopen(base + '/api/head/enable')
+        assert error.value.code == 404
+    finally:
+        server.stop()
 
 
 def test_viewer_receives_arm_diagnostics_udp(tmp_path):

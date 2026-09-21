@@ -20,6 +20,7 @@
         <span id="rate">-- Hz</span>
       </div>
       <div class="toolbar">
+        <a class="command" href="./head.html">头部相机</a>
         <select id="view-mode" aria-label="骨架数据层">
           <option value="raw">PICO 原始</option>
           <option value="robot">固定映射</option>
@@ -53,6 +54,10 @@
           <div><dt>左前臂</dt><dd id="left-fore">-- m</dd></div>
           <div><dt>右大臂</dt><dd id="right-upper">-- m</dd></div>
           <div><dt>右前臂</dt><dd id="right-fore">-- m</dd></div>
+          <div><dt>IK 肘/腕误差</dt><dd id="ik-position-error">-- / -- cm</dd></div>
+          <div><dt>IK 大/前臂方向</dt><dd id="ik-direction-error">-- / -- deg</dd></div>
+          <div><dt>实体肘/腕误差</dt><dd id="feedback-position-error">-- / -- cm</dd></div>
+          <div><dt>实体大/前臂方向</dt><dd id="feedback-direction-error">-- / -- deg</dd></div>
         </dl>
       </section>
 

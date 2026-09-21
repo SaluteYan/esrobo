@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Safely launch PICO position tracking for one physical NERO arm J1..J4.
+# Safely launch PICO tracking for one NERO arm, optionally with its glove/hand.
 
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CONDA_PYTHON="${MINICONDA_DIR:-/home/esrobo/miniconda3}/envs/${ENV_NAME:-teleop_esrobo}/bin/python"
 LEFT_SERIAL="${SENSEGLOVE_LEFT_SERIAL:-00885}"
+RIGHT_SERIAL="${SENSEGLOVE_RIGHT_SERIAL:-00892}"
 WITH_LEFT_IMU=0
+WITH_RIGHT_IMU=0
 ARM_SIDE="left"
 FORWARD_ARGS=()
 BRIDGE_PID=""
@@ -14,7 +16,9 @@ BRIDGE_PID=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --with-left-imu) WITH_LEFT_IMU=1; shift;;
+    --with-right-imu) WITH_RIGHT_IMU=1; shift;;
     -l|--left-serial) LEFT_SERIAL="$2"; shift 2;;
+    -r|--right-serial) RIGHT_SERIAL="$2"; shift 2;;
     --recalibrate|--no-hardware) FORWARD_ARGS+=("$1"); shift;;
     --imu-calibration-mode) FORWARD_ARGS+=("$1" "$2"); shift 2;;
     --arm-side) ARM_SIDE="$2"; shift 2;;
@@ -39,17 +43,31 @@ else
   ARM_USB_PATH="5.4:1.0"
 fi
 
+if [[ "${WITH_LEFT_IMU}" == "1" && "${WITH_RIGHT_IMU}" == "1" ]]; then
+  echo "ERROR: choose only one of --with-left-imu or --with-right-imu." >&2
+  exit 2
+fi
+
 if [[ "${WITH_LEFT_IMU}" == "1" ]]; then
-  if [[ "${ARM_SIDE}" != "left" ]]; then
+  [[ "${ARM_SIDE}" == "left" ]] || {
     echo "ERROR: --with-left-imu is only valid with --arm-side left." >&2
     exit 2
-  fi
+  }
   exec "${ROOT_DIR}/scripts/run_senseglove_hand_teleop.sh" \
     --left-serial "${LEFT_SERIAL}" --pico-left-arm-hand "${FORWARD_ARGS[@]}"
 fi
 
+if [[ "${WITH_RIGHT_IMU}" == "1" ]]; then
+  [[ "${ARM_SIDE}" == "right" ]] || {
+    echo "ERROR: --with-right-imu is only valid with --arm-side right." >&2
+    exit 2
+  }
+  exec "${ROOT_DIR}/scripts/run_senseglove_hand_teleop.sh" \
+    --right-serial "${RIGHT_SERIAL}" --pico-right-arm-hand "${FORWARD_ARGS[@]}"
+fi
+
 if [[ "${#FORWARD_ARGS[@]}" -gt 0 ]]; then
-  echo "ERROR: SenseGlove options require --with-left-imu." >&2
+  echo "ERROR: SenseGlove options require --with-left-imu or --with-right-imu." >&2
   exit 2
 fi
 
@@ -120,17 +138,8 @@ echo "==> 等待 PICO ${ARM_CN}肩、${ARM_CN}肘、${ARM_CN}腕数据（最多 
 env LD_LIBRARY_PATH="${ROOT_DIR}/external/XRoboToolkit-PC-Service-Pybind/lib:$("${CONDA_PYTHON}" -c 'import sys; print(sys.prefix)')/lib:${LD_LIBRARY_PATH:-}" \
   "${CONDA_PYTHON}" "${ROOT_DIR}/scripts/check_xrobotoolkit_body.py" --side "${ARM_SIDE}" --wait-seconds 20
 
-ensure_arm_can
-echo
-echo "==> ${ARM_CN}臂可能没有 CAN 主动上报；此处不发送使能、模式或位置命令。"
-echo "==> 标定结束并按 e 后，主程序才以自然下垂零位限速唤醒并验证反馈。"
-echo
-echo "==> 标定姿态：站直，${ARM_CN}臂在身体${ARM_CN}侧自然下垂，肘部伸直但不要用力。"
-echo "==> 按 Enter 后先提供 5 秒动作准备和 1 秒稳定缓冲，再采集约 3 秒。"
-read -r -p "确认机器人${ARM_CN}臂自然下垂且有人托稳后，按 Enter 进入标定流程："
-
 mkdir -p "${ROOT_DIR}/log"
-setsid "${ROOT_DIR}/bridges/run_xrobotoolkit_bridge.sh" --print-poses \
+setsid "${ROOT_DIR}/bridges/run_xrobotoolkit_bridge.sh" \
   > "${ROOT_DIR}/log/pico_${ARM_SIDE}_arm_bridge.log" 2>&1 &
 BRIDGE_PID=$!
 sleep 1
@@ -139,11 +148,24 @@ if ! kill -0 "${BRIDGE_PID}" 2>/dev/null; then
   tail -n 30 "${ROOT_DIR}/log/pico_${ARM_SIDE}_arm_bridge.log" >&2 || true
   exit 1
 fi
+echo "==> PICO 数据桥和标定前骨架预览已启动。"
+echo "==> 请先在本机打开 http://${PICO_SKELETON_VIEWER_HOST:-127.0.0.1}:${PICO_SKELETON_VIEWER_PORT:-8765} 检查 PICO 原始数据。"
+echo "==> 当前只接收和显示数据，不发送机械臂控制命令；SSH 端口转发见操作文档 12.5 节。"
 
-echo "==> PICO 数据桥已启动。请按终端中的 [PICO 标定] 倒计时保持姿态。"
-echo "==> 骨架调试页已启动：http://${PICO_SKELETON_VIEWER_HOST:-127.0.0.1}:${PICO_SKELETON_VIEWER_PORT:-8765}（SSH 本机端口转发见操作文档 12.5 节）。"
+ensure_arm_can
+echo
+echo "==> ${ARM_CN}臂可能没有 CAN 主动上报；此处不发送使能、模式或位置命令。"
+echo "==> 标定结束并按 e 后，主程序才以自然下垂零位限速唤醒并验证反馈。"
+echo
+echo "==> 标定姿态：站直，${ARM_CN}臂舒适地下垂并保持在 PICO 捕捉范围内，允许自然微屈，不要锁直肘部。"
+echo "==> 按 Enter 后先提供 5 秒动作准备和 1 秒稳定缓冲，再采集约 3 秒。"
+read -r -p "确认机器人${ARM_CN}臂自然下垂且有人托稳后，按 Enter 进入标定流程："
+
+echo "==> 即将进入 PICO 标定；骨架调试页会继续显示实时数据。"
 echo "==> 标定完成后仍不会运动；托稳${ARM_CN}臂并按 e 才开始 J1-J4 跟随。"
 if [[ "${ARM_SIDE}" == "left" ]]; then
-  echo "==> 可选手套模式：在命令末尾添加 --with-left-imu --left-serial 00885。"
+  echo "==> 可选联合模式：添加 --with-left-imu --left-serial 00885。"
+else
+  echo "==> 可选联合模式：添加 --with-right-imu --right-serial 00892。"
 fi
 "${ROOT_DIR}/scripts/run_teleop.sh" --arm-only --arm-side "${ARM_SIDE}"

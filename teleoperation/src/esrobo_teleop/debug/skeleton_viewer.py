@@ -1,4 +1,4 @@
-"""Threaded HTTP server for the read-only PICO skeleton diagnostic page."""
+"""PICO diagnostics server with an isolated loopback proxy for the head camera page."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ import threading
 import time
 from typing import Any
 from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 
 DEFAULT_SOURCE_TO_ROBOT_ROTATION = (
@@ -19,6 +21,13 @@ DEFAULT_SOURCE_TO_ROBOT_ROTATION = (
     -1.0, 0.0, 0.0,
     0.0, 1.0, 0.0,
 )
+
+
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    """Permit an immediate viewer restart after the previous bridge exits."""
+
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 class SkeletonViewerState:
@@ -46,7 +55,10 @@ class SkeletonViewerState:
                 frame = frames.get(name, {})
                 pos = frame.get("pos", []) if isinstance(frame, dict) else []
                 arm_points.extend(round(float(value), 5) for value in pos[:3])
-        return (int(packet.get("xrt_body_timestamp_ns", 0)), *arm_points)
+        body_timestamp = int(packet.get("xrt_body_timestamp_ns", 0))
+        joint_timestamp = int(packet.get("xrt_body_joint_timestamp_ns", 0))
+        timestamp = body_timestamp if body_timestamp > 0 else joint_timestamp
+        return (timestamp, *arm_points)
 
     def update(self, packet: dict[str, Any]) -> None:
         now = time.monotonic()
@@ -120,8 +132,58 @@ class SkeletonViewerServer:
         state = self.state
 
         class Handler(BaseHTTPRequestHandler):
+            def head_proxy(self, post=False):
+                path = urlsplit(self.path).path
+                allowed = ('state', 'color.jpg', 'depth.jpg') if not post else ('enable', 'move', 'lock', 'heartbeat')
+                if path not in tuple('/api/head/' + name for name in allowed):
+                    self.send_error(404)
+                    return
+                payload = None
+                headers = {}
+                if post:
+                    origin = urlsplit(self.headers.get('Origin', ''))
+                    if (origin.netloc != self.headers.get('Host') or origin.scheme != 'http'
+                            or self.headers.get('X-Head-Control') != '1'
+                            or self.headers.get('Content-Type') != 'application/json'):
+                        self.send_error(403)
+                        return
+                    try:
+                        size = int(self.headers.get('Content-Length', '0'))
+                    except ValueError:
+                        size = 0
+                    if not 0 < size <= 1024:
+                        self.send_error(400)
+                        return
+                    payload = self.rfile.read(size)
+                    headers = {'Content-Type': 'application/json', 'X-Head-Control': '1',
+                               'Origin': 'http://127.0.0.1:8766'}
+                try:
+                    request = Request('http://127.0.0.1:8766' + path, data=payload, headers=headers)
+                    with urlopen(request, timeout=3) as response:
+                        body = response.read(2 * 1024 * 1024)
+                        code, mime = response.status, response.headers.get('Content-Type')
+                except HTTPError as exc:
+                    body, code, mime = exc.read(4096), exc.code, 'application/json'
+                except (URLError, TimeoutError, OSError):
+                    body, code, mime = b'{"error":"head camera bridge unavailable"}', 503, 'application/json'
+                self.send_response(code)
+                self.send_header('Content-Type', mime)
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def do_POST(self):
+                self.head_proxy(post=True)
+
             def do_GET(self) -> None:  # noqa: N802 - HTTP handler API
                 path = urlsplit(self.path).path
+                if path.startswith('/api/head/'):
+                    self.head_proxy()
+                    return
                 if path == "/api/state":
                     payload = json.dumps(state.snapshot(), separators=(",", ":")).encode("utf-8")
                     self.send_response(HTTPStatus.OK)
@@ -158,7 +220,7 @@ class SkeletonViewerServer:
             def log_message(self, _format: str, *_args: Any) -> None:
                 return
 
-        self._httpd = ThreadingHTTPServer((self.host, self.port), Handler)
+        self._httpd = ReusableThreadingHTTPServer((self.host, self.port), Handler)
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
             name="pico-skeleton-viewer",

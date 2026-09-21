@@ -425,6 +425,24 @@ elif [ "${RIGHT_ONLY}" = "1" ]; then
 fi
 echo "============================================================"
 
+# Start the read-only PICO stream before any glove/arm calibration so the
+# operator can inspect raw tracking first. This path never sends robot commands.
+if [ "${PICO_ARM}" = "1" ] && [ "${CALIB_ONLY}" = "0" ]; then
+  echo
+  echo "==> 启动并检查 XRoboToolkit PC Service"
+  "${ROOT_DIR}/scripts/xrobotoolkit_pc_service.sh" start
+  echo "==> 请在 PICO 中启动 XRoboToolkit，并开启全身追踪。"
+  echo "==> 等待${PICO_ARM_CN}肩、${PICO_ARM_CN}肘、${PICO_ARM_CN}腕数据；此时尚未配置机器人 CAN。"
+  env LD_LIBRARY_PATH="${ROOT_DIR}/external/XRoboToolkit-PC-Service-Pybind/lib:$(${CONDA_PYTHON} -c 'import sys; print(sys.prefix)')/lib:${LD_LIBRARY_PATH:-}" \
+    "${CONDA_PYTHON}" "${ROOT_DIR}/scripts/check_xrobotoolkit_body.py" \
+      --side "${PICO_ARM_SIDE}" --wait-seconds 20
+  start_bg "pico_${PICO_ARM_SIDE}_arm_bridge" \
+    "${ROOT_DIR}/bridges/run_xrobotoolkit_bridge.sh"
+  sleep 1
+  echo "==> PICO 标定前骨架预览已启动：http://${PICO_SKELETON_VIEWER_HOST:-127.0.0.1}:${PICO_SKELETON_VIEWER_PORT:-8765}"
+  echo "==> 请先检查 PICO 原始数据；当前只读，不会使能或控制机器人。SSH 转发见操作文档 12.5 节。"
+fi
+
 # Verify SenseCom and the requested glove before touching either robot CAN bus.
 if [ "${NO_HW}" = "0" ]; then
   ensure_sensecom_headless
@@ -477,7 +495,7 @@ fi
 
 # --------------------------------------------------------- hand_ros_bridge
 if [ "${PICO_ARM}" = "1" ] && [ "${PICO_ARM_HAND}" = "0" ]; then
-  : # Full-arm mode does not initialize either LinkerHand ROS bridge.
+  : # Arm-only mode neither initializes nor reads LinkerHand.
 elif [ "${LEFT_ONLY}" = "1" ]; then
   start_bg hand_ros_bridge \
     python3 -u "${ROOT_DIR}/bridges/hand_ros_bridge.py" --port 15051 --side left
@@ -600,25 +618,16 @@ else
 fi
 
 # ---------------------------------------------------- PICO + single-arm preparation
-# Complete the glove calibration before even configuring the robot CAN bus.
+# The read-only PICO viewer is already live; configure robot CAN only after the
+# glove calibration has completed.
 if [ "${PICO_ARM}" = "1" ] && [ "${CALIB_ONLY}" = "0" ]; then
   echo
-  echo "==> 启动并检查 XRoboToolkit PC Service"
-  "${ROOT_DIR}/scripts/xrobotoolkit_pc_service.sh" start
-  echo "==> 请在 PICO 中启动 XRoboToolkit，并开启全身追踪。"
-  echo "==> 等待${PICO_ARM_CN}肩、${PICO_ARM_CN}肘、${PICO_ARM_CN}腕数据；此时尚未配置机械臂 CAN。"
-  env LD_LIBRARY_PATH="${ROOT_DIR}/external/XRoboToolkit-PC-Service-Pybind/lib:$(${CONDA_PYTHON} -c 'import sys; print(sys.prefix)')/lib:${LD_LIBRARY_PATH:-}" \
-    "${CONDA_PYTHON}" "${ROOT_DIR}/scripts/check_xrobotoolkit_body.py" \
-      --side "${PICO_ARM_SIDE}" --wait-seconds 20
-
   ensure_can "${PICO_ARM_CAN}" "${PICO_ARM_USB_PATH}" "${PICO_ARM_CN}机械臂"
   echo
   echo "==> 数据职责已固定：PICO ${PICO_ARM_CN}肩/${PICO_ARM_CN}肘/${PICO_ARM_CN}腕位置 -> J1-J4；${PICO_ARM_CN}手套 IMU -> J5-J7。"
   echo "==> ${PICO_ARM_CN}臂保持失能，不发送位置命令；按 e 后才执行限速唤醒。"
   read -r -p "请托稳自然下垂的${PICO_ARM_CN}臂、确认周围无夹点，按 Enter 进入 PICO 标定："
-  start_bg "pico_${PICO_ARM_SIDE}_arm_bridge" \
-    "${ROOT_DIR}/bridges/run_xrobotoolkit_bridge.sh" --print-poses
-  echo "==> 骨架调试页已启动：http://${PICO_SKELETON_VIEWER_HOST:-127.0.0.1}:${PICO_SKELETON_VIEWER_PORT:-8765}（SSH 本机端口转发见操作文档 12.5 节）。"
+  echo "==> 即将进入 PICO 标定；骨架调试页会继续显示实时数据。"
 fi
 
 # ------------------------------------------------------- SenseGlove 桥接(流式)

@@ -3,6 +3,10 @@
 实际设备启动、标定、按键和故障排查步骤见
 [`TELEOPERATION_RUNBOOK.md`](TELEOPERATION_RUNBOOK.md)。
 
+当前程序实际执行的数据流、IK、轨迹限制、安全检查和回零状态机见
+[`TELEOPERATION_RUNTIME_LOGIC.md`](TELEOPERATION_RUNTIME_LOGIC.md)。历史修改原因仍记录在
+[`TELEOPERATION_CHANGELOG.md`](TELEOPERATION_CHANGELOG.md)。
+
 独立的 **实机运动** 遥操作包，放在 ESROBO 项目根目录下的 `teleoperation/` 文件夹中，
 与原有 esrobo ROS2 工作空间代码完全分开（不混源码、不改动 `src/` 里的任何东西）。
 

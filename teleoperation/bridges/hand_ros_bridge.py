@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import socket
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -28,28 +29,33 @@ from sensor_msgs.msg import JointState
 class HandBridge(Node):
     def __init__(self, udp_host: str, udp_port: int, feedback_host: str, feedback_port: int,
                  left_topic: str, right_topic: str, left_state_topic: str,
-                 right_state_topic: str, side: str):
+                 right_state_topic: str, side: str, feedback_only: bool = False):
         super().__init__("esrobo_hand_ros_bridge")
-        self._pub_left = self.create_publisher(JointState, left_topic, 10)
-        self._pub_right = self.create_publisher(JointState, right_topic, 10)
+        self._feedback_only = feedback_only
+        if not feedback_only:
+            self._pub_left = self.create_publisher(JointState, left_topic, 10)
+            self._pub_right = self.create_publisher(JointState, right_topic, 10)
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind((udp_host, udp_port))
+        if not feedback_only:
+            self._sock.bind((udp_host, udp_port))
         self._sock.settimeout(0.05)
         self._feedback_addr = (feedback_host, feedback_port)
         self._active_sides = ("left", "right") if side == "both" else (side,)
         if "left" in self._active_sides:
             self.create_subscription(
-                JointState, left_state_topic, lambda msg: self._send_feedback("left", msg), 10
+                JointState, left_state_topic, lambda msg: self._send_feedback("left", msg), 1
             )
         if "right" in self._active_sides:
             self.create_subscription(
-                JointState, right_state_topic, lambda msg: self._send_feedback("right", msg), 10
+                JointState, right_state_topic, lambda msg: self._send_feedback("right", msg), 1
             )
         self.get_logger().info(f"listening on {udp_host}:{udp_port}")
 
     def spin_once(self) -> None:
-        rclpy.spin_once(self, timeout_sec=0.0)
+        rclpy.spin_once(self, timeout_sec=0.02 if self._feedback_only else 0.0)
+        if self._feedback_only:
+            return
         try:
             payload, _addr = self._sock.recvfrom(65535)
         except socket.timeout:
@@ -70,7 +76,7 @@ class HandBridge(Node):
             (self._pub_left if side == "left" else self._pub_right).publish(js)
 
     def _send_feedback(self, side: str, msg: JointState) -> None:
-        payload = json.dumps({"side": side, "position": list(msg.position)}).encode("utf-8")
+        payload = json.dumps({"side": side, "position": list(msg.position), "sample_monotonic_s": time.monotonic()}).encode("utf-8")
         self._sock.sendto(payload, self._feedback_addr)
 
     def close(self) -> None:
@@ -88,13 +94,14 @@ def main(argv=None) -> int:
     ap.add_argument("--left-state-topic", default="/cb_left_hand_state")
     ap.add_argument("--right-state-topic", default="/cb_right_hand_state")
     ap.add_argument("--side", choices=("both", "left", "right"), default="both")
+    ap.add_argument("--feedback-only", action="store_true", help="Subscribe only; no command publisher/socket")
     args = ap.parse_args(argv)
 
     rclpy.init()
     node = HandBridge(
         args.host, args.port, args.feedback_host, args.feedback_port,
         args.left_topic, args.right_topic, args.left_state_topic, args.right_state_topic,
-        args.side,
+        args.side, args.feedback_only,
     )
     try:
         while rclpy.ok():

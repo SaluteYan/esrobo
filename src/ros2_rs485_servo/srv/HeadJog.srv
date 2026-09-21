@@ -1,0 +1,6 @@
+uint8 servo_id
+int16 delta_ticks
+uint16 speed
+---
+bool success
+string message

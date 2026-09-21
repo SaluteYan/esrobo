@@ -21,9 +21,63 @@ class RobotConfig:
     right_nero_firmware: str = "DEFAULT"      # right arm publishes legacy 0x501..0x507 feedback
     can_interface: str = "socketcan"
     can_bitrate: int = 1000000
-    speed_percent: int = 25                   # applies to the safe move_j mode
+    # python-can defaults to a non-blocking SocketCAN send.  A short bounded
+    # wait lets the kernel drain an otherwise healthy small TX queue instead
+    # of turning a sub-millisecond command burst into ENOBUFS.
+    can_send_timeout_s: float = 0.02
+    speed_percent: int = 30                   # applies to the safe move_j mode
     command_mode: str = "j"                   # "j" (smoothed) | "js" (unsafe passthrough)
     allow_unsafe_js: bool = False
+    # Firmware 1.12+ exposes CPV specifically for continuously refreshed joint
+    # positions. Keep this available only as an explicit diagnostic option;
+    # the commissioned runtime uses smoothed MOVE_J on both arms.
+    left_tracking_control_mode: str = "j"     # "j" | "cpv" (V112 only)
+    right_tracking_control_mode: str = "j"    # right legacy controller: J only
+    # V112 CPV emits a mode frame and may duplicate the first position frame
+    # for every joint. Pace joint calls so a seven-joint batch cannot overrun
+    # the default ten-frame SocketCAN transmit queue.
+    cpv_inter_joint_interval_s: float = 0.002
+    # Current commissioning uses the same continuous bounded MOVE_J stream on
+    # both arms. The optional producer backpressure path remains available for
+    # diagnostics, but is not part of either normal single-arm entry.
+    left_command_backpressure_enabled: bool = False
+    right_command_backpressure_enabled: bool = False
+    # Legacy opt-in stop-and-wait/backpressure parameters. They are inactive
+    # while left_command_backpressure_enabled is false.
+    left_command_backpressure_pause_s: float = 0.15
+    left_command_backpressure_timeout_s: float = 3.0
+    right_command_backpressure_pause_s: float = 0.15
+    right_command_backpressure_timeout_s: float = 2.0
+    left_move_j_waypoint_deg: float = 0.5  # legacy opt-in stop-and-wait setting
+    # Controller-side collision detection plus host-side torque deviation
+    # monitoring. Runtime YAML enables these after hardware commissioning.
+    collision_protection_enabled: bool = True
+    left_collision_protection_enabled: Optional[bool] = True
+    right_collision_protection_enabled: Optional[bool] = True
+    collision_protection_rating: tuple = (4, 4, 4, 4, 5, 5, 5)
+    require_collision_protection_readback: bool = True
+    torque_monitor_enabled: bool = False
+    torque_baseline_settle_s: float = 1.0
+    torque_baseline_samples: int = 15
+    torque_baseline_timeout_s: float = 4.0
+    torque_feedback_timeout_s: float = 0.3
+    torque_deviation_limits_nm: tuple = (16.0, 16.0, 12.0, 12.0, 6.0, 6.0, 5.0)
+    left_torque_deviation_limits_nm: Optional[tuple] = (
+        25.0, 25.0, 12.0, 12.0, 6.0, 6.0, 5.0,
+    )
+    right_torque_deviation_limits_nm: Optional[tuple] = (
+        21.0, 21.0, 12.0, 12.0, 6.0, 6.0, 5.0,
+    )
+    torque_trip_consecutive_samples: int = 5
+    controller_status_monitor_enabled: bool = True
+    controller_status_timeout_s: float = 0.3
+    torso_collision_enabled: bool = True
+    # Software geometry during live following only. Preflight and planned
+    # returns still use torso_collision_enabled and cannot bypass the guard.
+    teleop_torso_collision_enabled: bool = False
+    collision_package_dirs: tuple = ()
+    torso_collision_margin_m: float = 0.03
+    shoulder_collision_margin_m: float = 0.005
     # physical = direction * URDF + offset. The J2 +pi/2 offset follows the
     # pyAgxArm NERO limits and this project's URDF limits exactly.
     left_joint_directions: tuple = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
@@ -43,43 +97,65 @@ class RobotConfig:
     # deliberately asymmetric limits sit inside the SDK hard limits and are
     # converted to each arm's physical convention by the driver.
     joint_soft_lower_limits_urdf: tuple = (
-        -1.047198, -1.308997, -1.047198, -0.139626, -1.047198, -0.523599, -0.959931,
+        -1.047198, -1.308997, -1.570796, -0.139626, -1.047198, -0.523599, -0.959931,
     )
     joint_soft_upper_limits_urdf: tuple = (
-        1.047198, 0.122173, 1.047198, 1.483530, 1.047198, 0.610865, 0.959931,
+        1.047198, 0.122173, 1.570796, 1.483530, 1.047198, 0.610865, 0.959931,
+    )
+    # Match the commissioned per-side YAML limits (updated 2026-09-16).
+    left_joint_soft_lower_limits_urdf: Optional[tuple] = (
+        -1.047198, -1.308997, -2.617994, -0.139626, -1.047198, -0.523599, -0.959931,
+    )
+    left_joint_soft_upper_limits_urdf: Optional[tuple] = (
+        1.047198, 0.122173, 1.570796, 2.094395, 1.047198, 0.610865, 0.959931,
+    )
+    right_joint_soft_lower_limits_urdf: Optional[tuple] = (
+        -1.047198, -1.308997, -1.570796, -0.139626, -1.047198, -0.523599, -0.959931,
+    )
+    right_joint_soft_upper_limits_urdf: Optional[tuple] = (
+        1.047198, 0.122173, 2.617994, 2.094395, 1.047198, 0.610865, 0.959931,
     )
     # Initial full-arm commissioning rate limits for J1..J7.  Scalars remain
     # accepted by the driver for compatibility with older configuration files.
     max_joint_step: tuple = (
-        0.038397, 0.038397, 0.038397, 0.043633, 0.043633, 0.043633, 0.043633,
+        0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633,
     )
     max_joint_velocity: tuple = (
-        0.314159, 0.314159, 0.314159, 0.349066, 0.349066, 0.349066, 0.349066,
+        0.453786, 0.453786, 0.418879, 0.418879, 0.418879, 0.418879, 0.418879,
     )
     max_joint_acceleration: tuple = (
-        0.785398, 0.785398, 0.872665, 1.047198, 1.047198, 1.047198, 1.047198,
+        0.698132, 0.698132, 0.785398, 0.872665, 0.872665, 0.872665, 0.872665,
     )
-    # Second-stage full-arm commissioning limits, shared by both sides.
+    # Both arms use the same rate envelope; J4 is 30 deg/s.
     left_max_joint_step: Optional[tuple] = (
-        0.038397, 0.038397, 0.038397, 0.043633, 0.043633, 0.043633, 0.043633,
+        0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633,
     )
     left_max_joint_velocity: Optional[tuple] = (
-        0.314159, 0.314159, 0.314159, 0.349066, 0.349066, 0.349066, 0.349066,
+        0.453786, 0.453786, 0.418879, 0.523599, 0.418879, 0.418879, 0.418879,
     )
     left_max_joint_acceleration: Optional[tuple] = (
-        0.785398, 0.785398, 0.872665, 1.047198, 1.047198, 1.047198, 1.047198,
+        0.698132, 0.698132, 0.785398, 0.872665, 0.872665, 0.872665, 0.872665,
     )
-    # Match the left-arm pilot envelope while commissioning the right arm.
+    # Keep per-side overrides available for future hardware commissioning.
     right_max_joint_step: Optional[tuple] = (
-        0.038397, 0.038397, 0.038397, 0.043633, 0.043633, 0.043633, 0.043633,
+        0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633,
     )
     right_max_joint_velocity: Optional[tuple] = (
-        0.314159, 0.314159, 0.314159, 0.349066, 0.349066, 0.349066, 0.349066,
+        0.453786, 0.453786, 0.418879, 0.523599, 0.418879, 0.418879, 0.418879,
     )
     right_max_joint_acceleration: Optional[tuple] = (
-        0.785398, 0.785398, 0.872665, 1.047198, 1.047198, 1.047198, 1.047198,
+        0.698132, 0.698132, 0.785398, 0.872665, 0.872665, 0.872665, 0.872665,
     )
     synchronize_joint_motion: bool = False
+    left_command_trajectory_enabled: bool = True
+    right_command_trajectory_enabled: bool = True
+    command_trajectory_lead_deg: tuple = (3.0, 3.0, 3.0, 3.0, 1.5, 1.5, 1.5)
+    command_trajectory_max_dt_s: float = 0.1
+    # A single delayed assembled seven-joint frame must not immediately latch
+    # the arm.  No command is sent during this grace period; two consecutive
+    # fresh frames are required before the command trajectory is re-based.
+    runtime_feedback_recovery_timeout_s: float = 0.3
+    command_trajectory_lead_timeout_s: float = 2.0
     joint_sync_error_deadband_deg: float = 0.05
     # Legacy optional limit relative to the angles captured when armed.  Keep
     # disabled when absolute per-joint URDF soft limits are configured.
@@ -92,6 +168,11 @@ class RobotConfig:
     wrist_return_tolerance_deg: float = 1.0
     return_feedback_grace_s: float = 1.0
     return_verify_samples: int = 3
+    return_plan_timeout_s: float = 5.0
+    return_plan_max_nodes: int = 5000
+    return_plan_seed: int = 0
+    return_speed_scale: float = 0.5
+    return_stationary_velocity_deg_s: float = 0.5
     return_phase_attempts: int = 2
     disable_on_unconfirmed_return: bool = False
     right_wrist_max_step: float = 0.004
@@ -133,6 +214,16 @@ class RetargetConfig:
     # Natural-down calibration applies only the minimum rotation needed to
     # align the upper-arm zero direction; it must not redefine transverse axes.
     arm_vector_position_mode: str = "segment_direction_relative"
+    # Preserve the live PICO elbow angle.  The natural-down reference aligns
+    # coordinate frames; it must not be subtracted from elbow flexion.
+    elbow_angle_mapping: str = "direct_absolute"  # direct_absolute | responsive_absolute | smooth_absolute | relative
+    elbow_absolute_start_delta_deg: float = 5.0
+    elbow_absolute_full_delta_deg: float = 30.0
+    # Near a straight arm the shoulder/elbow/wrist points do not reliably
+    # identify the elbow bend plane. Match the IK J3 observability transition:
+    # carry the calibrated robot plane first, then blend in the live PICO plane.
+    bend_plane_observability_start_delta_deg: float = 4.0
+    bend_plane_observability_full_delta_deg: float = 10.0
     position_delta_signs: tuple = (1.0, 1.0, 1.0)
     position_scale: float = 1.0
     source_to_robot_rotation: tuple = (
@@ -148,16 +239,30 @@ class RetargetConfig:
     auto_start_reference_max_position_std_m: float = 0.05
     auto_start_reference_min_samples: int = 5
     auto_start_reference_require_waist: bool = True
+    arm_reference_enable_window_s: float = 0.5
+    arm_reference_enable_prepare_s: float = 5.0
+    arm_reference_enable_max_flexion_delta_deg: float = 5.0
+    arm_reference_enable_max_upper_delta_deg: float = 30.0
+    arm_reference_enable_max_forearm_delta_deg: float = 30.0
     calibration_delay_s: float = 10.0
     calibration_sample_start_s: float = 6.0
     arm_vector_max_reach: float = 0.72
-    arm_vector_prediction_horizon_s: float = 0.02
-    arm_vector_prediction_lookback_s: float = 0.03
+    arm_vector_prediction_horizon_s: float = 0.03
+    arm_vector_prediction_lookback_s: float = 0.05
     arm_vector_prediction_max_velocity_m_s: float = 2.5
-    arm_vector_prediction_max_displacement_m: float = 0.035
-    max_endpoint_translation_velocity_m_s: float = 0.18
+    arm_vector_prediction_max_displacement_m: float = 0.03
+    # Do not extrapolate low-speed tracker jitter. Prediction fades in smoothly
+    # between these two measured point speeds.
+    arm_vector_prediction_start_velocity_m_s: float = 0.06
+    arm_vector_prediction_full_velocity_m_s: float = 0.25
+    max_endpoint_translation_velocity_m_s: float = 0.22
     upper_arm_angular_deadband_deg: float = 0.25
     forearm_angular_deadband_deg: float = 0.30
+    # Adaptive direction smoothing suppresses PICO joint-position jitter while
+    # opening its bandwidth during deliberate arm motion.
+    arm_vector_filter_min_cutoff_hz: float = 3.0
+    arm_vector_filter_max_cutoff_hz: float = 8.0
+    arm_vector_filter_speed_coefficient: float = 0.7
     use_hand_imu_orientation: bool = True
     # Full-arm PICO control uses shoulder/elbow/wrist positions only.  Require a
     # calibrated glove IMU for terminal orientation instead of falling back to
@@ -267,15 +372,29 @@ class IkConfig:
     lm_damping: float = 0.012
     elbow_lm_damping: float = 0.006
     gain: float = 1.0
-    iterations_per_cycle: int = 1
+    iterations_per_cycle: int = 3  # Legacy Pink integration iterations.
+    partition_position_max_evaluations: int = 24
+    # An IK rejection is a recoverable position-limit hold only after measured
+    # feedback has physically reached the same bound as the bounded solution.
+    position_limit_hold_feedback_margin_deg: float = 0.25
+    position_limit_recovery_error_m: float = 0.025
+    position_limit_recovery_frames: int = 3
     enable_elbow_tasks: bool = True
     # In single-arm commissioning, solve human upper/forearm positions with
     # J1..J4 and reserve J5..J7 for the calibrated SenseGlove orientation.
     partition_terminal_wrist_ik: bool = True
-    # A NERO J4 angle is the geometric bend between the upper-arm and forearm
-    # segments. Set it explicitly so Cartesian IK cannot absorb elbow flexion
-    # into the shoulder joints J1..J3.
+    # Legacy name: use the segment bend only as a flexed-branch initial guess.
+    # Hand-base geometry depends on J5-J7; its unsigned bend is not signed J4.
     partition_elbow_flexion_from_segments: bool = True
+    # Legacy Pink-path morphology gains. Bounded position IK never rescales
+    # J3 after solving because that would invalidate endpoint geometry.
+    left_j3_retarget_gain: float = 1.0
+    right_j3_retarget_gain: float = 1.0
+    # Bounded position IK gates J3 from the actual Cartesian segment bend.
+    # Cartesian plane blending has already happened in the retargeter. The
+    # full threshold is retained for the legacy Pink path.
+    j3_observability_start_flexion_deg: float = 4.0
+    j3_observability_full_flexion_deg: float = 10.0
     task_error_tolerance: float = 1.0e-4
     max_command_lead: float = 0.50
     max_command_step: float = 0.0
@@ -298,6 +417,9 @@ class HandConfig:
     udp_port: int = 15051
     feedback_udp_host: str = "127.0.0.1"
     feedback_udp_port: int = 15052
+    # Independent measured-feedback calibration; never invert command mapping.
+    geometry_feedback_calibration: dict = field(default_factory=dict)
+    geometry_feedback_timeout_s: float = 0.1
     left_topic: str = "/cb_left_hand_control_cmd"
     right_topic: str = "/cb_right_hand_control_cmd"
     hand_joint_count: int = 20              # teleop packet: 10 left + 10 right active

@@ -172,9 +172,22 @@ function updateDiagnostics(state) {
   const packet = state.packet || {};
   latestFrames = packet.frames && typeof packet.frames === "object" ? packet.frames : {};
   latestDiagnostics = state.diagnostics;
+  const diagnosticModes = ["retarget", "ik", "command", "feedback"];
+  const diagnosticFrames = latestDiagnostics?.frames?.[mode];
+  const diagnosticsFresh = Number.isFinite(state.diagnostics_age_ms)
+    && state.diagnostics_age_ms <= 500;
+  let layerFallback = false;
+  if (diagnosticModes.includes(mode) && (!diagnosticsFresh || !diagnosticFrames)) {
+    mode = "raw";
+    document.querySelector("#view-mode").value = mode;
+    resetCamera();
+    layerFallback = true;
+  }
   const statusDot = document.querySelector("#status-dot");
   statusDot.className = `status-dot ${state.connected ? "live" : state.packet ? "stale" : "waiting"}`;
-  document.querySelector("#status-text").textContent = state.connected ? "实时数据正常" : state.packet ? "数据已停止" : "等待骨架数据";
+  document.querySelector("#status-text").textContent = layerFallback
+    ? "控制诊断层尚未启动，已显示 PICO 原始骨架"
+    : state.connected ? "实时数据正常" : state.packet ? "数据已停止" : "等待骨架数据";
   document.querySelector("#freshness").textContent = state.age_ms == null ? "-- ms" : `${Math.round(state.age_ms)} ms`;
   document.querySelector("#rate").textContent = `${Number(state.source_update_hz || 0).toFixed(1)} Hz`;
   document.querySelector("#sequence").textContent = packet.sequence == null ? "序列 --" : `序列 ${packet.sequence}`;
@@ -213,6 +226,18 @@ function updateDiagnostics(state) {
   document.querySelector("#joint-rows").innerHTML = Array.from({ length: 7 }, (_, index) =>
     `<tr><td>J${index + 1}</td><td>${jointValue("ik", index)}</td><td>${jointValue("command", index)}</td><td>${jointValue("feedback", index)}</td></tr>`
   ).join("");
+
+  const errors = latestDiagnostics?.errors || {};
+  const errorText = (layer, first, second, unit) => {
+    const values = errors[layer];
+    const a = Number.isFinite(values?.[first]) ? values[first].toFixed(1) : "--";
+    const b = Number.isFinite(values?.[second]) ? values[second].toFixed(1) : "--";
+    return `${a} / ${b} ${unit}`;
+  };
+  document.querySelector("#ik-position-error").textContent = errorText("ik_vs_retarget", "elbow_cm", "wrist_cm", "cm");
+  document.querySelector("#ik-direction-error").textContent = errorText("ik_vs_retarget", "upper_deg", "forearm_deg", "deg");
+  document.querySelector("#feedback-position-error").textContent = errorText("feedback_vs_retarget", "elbow_cm", "wrist_cm", "cm");
+  document.querySelector("#feedback-direction-error").textContent = errorText("feedback_vs_retarget", "upper_deg", "forearm_deg", "deg");
 }
 
 function setMode(nextMode) {

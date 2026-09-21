@@ -11,15 +11,20 @@ Safety: the robot arms are only commanded while teleoperation is armed
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import os
 import signal
+import select
 import socket
 import sys
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
+from .debug.async_json_log import AsyncJsonLog, numpy_json_default
+from .debug.arm_probe import ArmProbe
 
 from . import math_utils as mu
 from .config import TeleopConfig, build_config, load_config
@@ -54,6 +59,18 @@ class TeleopNode:
         self._return_hand_open_on_close = False
         self._stop = False
         self._manual_intervention_required = False
+        self._return_thread = None
+        self._startup_alignment = False
+        self._startup_alignment_required = False
+        self._arming_thread = None
+        self._arming_cancel = threading.Event()
+        self._quit_after_arming_cancel = False
+        self._quit_after_return = False
+        self._startup_power_cycle_required = False
+        # The keyboard/arming worker and the real-time loop both touch the
+        # stateful retarget filters and IK seed.  Keep startup rebasing and
+        # session initialization atomic with respect to preview/control solves.
+        self._arm_control_lock = threading.RLock()
 
         self._body = BodyDevice(cfg.retarget, active_arm_side=arm_side if arm_only else None)
         cfg.ik.urdf_path = cfg.ik.urdf_path or default_urdf_path()
@@ -68,11 +85,33 @@ class TeleopNode:
                 if arm_only
                 else NeroDualArmDriver(cfg.robot)
             )
+            if arm_only and not self._wrist_imu_side and self._driver.command_trajectory_enabled:
+                physical_lower, physical_upper = self._driver._effective_position_limits(arm_side)
+                directions, offsets = self._driver._mapping(arm_side)
+                a, b = (physical_lower - offsets) / directions, (physical_upper - offsets) / directions
+                self._ik.configure_position_envelope(arm_side, np.minimum(a, b), np.maximum(a, b))
+                self._driver.configure_command_trajectory(
+                    self._ik.make_command_fk(arm_side),
+                    cfg.retarget.max_endpoint_translation_velocity_m_s,
+                )
+                if cfg.robot.torso_collision_enabled:
+                    from .robot.torso_collision import TorsoCollisionGuard
+                    # Fail closed before connect/enable if geometry is missing.
+                    self._driver.configure_collision_guard(TorsoCollisionGuard(
+                        self._ik, arm_side, cfg.robot.collision_package_dirs,
+                        cfg.robot.torso_collision_margin_m,
+                        cfg.robot.shoulder_collision_margin_m,
+                        include_fingers=self._arm_with_hand))
 
-        active_sides = ("left", "right") if hand_side == "both" else (hand_side,)
+        active_sides = (arm_side,) if arm_only else (("left", "right") if hand_side == "both" else (hand_side,))
         self._hand = None if arm_only and not self._arm_with_hand else LinkerHandDriver(
             cfg.hand, udp_port=cfg.hand.udp_port, active_sides=active_sides
         )
+
+        if arm_only and self._arm_with_hand and self._driver is not None:
+            guard = getattr(self._driver, "_collision_guard", None)
+            if guard is not None:
+                guard.hand_state_provider = lambda horizon: self._hand.geometry_state(arm_side, horizon)
 
         self._current_arm_joints: np.ndarray | None = None
         self._motors_enabled = False
@@ -86,8 +125,17 @@ class TeleopNode:
         self._last_wrist_diagnostic_time = 0.0
         self._wrist_diagnostics_enabled = False
         self._command_rejected = False
+        self._position_limit_hold_active = False
+        self._position_limit_recovery_count = 0
         self._arm_diagnostics_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if arm_only else None
         self._last_arm_diagnostics_time = 0.0
+        self._elbow_log_path = Path(__file__).resolve().parents[2] / "log" / f"pico_elbow_{time.time_ns()}.jsonl"
+        self._elbow_log_failed = False
+        self._diagnostic_writer = None
+        self._startup_writer = None
+        self._arm_probe = None
+        if arm_only and self._driver is not None:
+            self._driver.startup_event_sink = self._record_startup_event
         self._key_thread = None
         if self._wrist_imu_side:
             self._configure_wrist_mapping(np.zeros(7, dtype=np.float64))
@@ -315,6 +363,13 @@ class TeleopNode:
     def start(self) -> None:
         if self._driver is not None:
             self._driver.connect()
+            if self._arm_only and os.environ.get("ESROBO_ARM_DIAGNOSTICS", "0") == "1":
+                path = self._elbow_log_path.with_name(self._elbow_log_path.name.replace("pico_elbow", "pico_arm_probe"))
+                self._arm_probe = ArmProbe(path, self._driver, lambda: dict(
+                    armed=self._arm_armed, motors_enabled=self._motors_enabled,
+                    manual_intervention=bool(getattr(self, "_manual_intervention_required", False))))
+                self._driver.probe_sink = self._arm_probe.submit
+                print(f"[teleop] passive arm diagnostics: {path}; raw CAN: {self._arm_probe.raw_path}", flush=True)
             if self._arm_only:
                 label = self._arm_side.capitalize()
                 self._current_arm_joints = self._driver.read_full_urdf_joints()
@@ -357,11 +412,12 @@ class TeleopNode:
                 print("[teleop] NERO arms connected.", flush=True)
                 self._current_arm_joints = self._driver.read_full_urdf_joints()
         self._ensure_startup_zero_pose()
-        self._key_thread = threading.Thread(target=self._key_loop, daemon=True)
-        self._key_thread.start()
+        if getattr(self, "_key_thread", None) is None:
+            self._key_thread = threading.Thread(target=self._key_loop, daemon=True)
+            self._key_thread.start()
 
     def _ensure_startup_zero_pose(self) -> None:
-        """Align robot zero after glove calibration, then gate keyboard control."""
+        """Inspect startup zero; defer full-arm motion to the single-key arm gate."""
         if getattr(self, "_arm_only", False):
             if self._driver is None:
                 return
@@ -396,36 +452,22 @@ class TeleopNode:
                             "startup full-arm zero alignment needs an interactive terminal "
                             "for safety confirmation"
                         )
-                    input(
+                    self._startup_alignment_required = True
+                    print(
                         f"[等待操作] {self._arm_side} 机械臂当前处于失能非零位。"
-                        "请人工托稳机械臂并清空周围夹点，按 Enter 后将从当前实测位置使能，"
-                        "再按该侧低速限制缓慢回到自然下垂零位并失能；按 Ctrl-C 取消："
-                    )
-                    print(
-                        f"[teleop ZERO] {self._arm_side.upper()} startup alignment: "
-                        "holding measured feedback as the first target, then slowly returning "
-                        "J4..J7 first and J1..J3 second to natural-down zero.",
-                        flush=True,
-                    )
-                    returned, disabled = self._driver.align_startup_zero_and_disable()
-                    self._motors_enabled = not disabled
-                    if not returned or not disabled:
-                        raise RuntimeError(
-                            f"{self._arm_side} startup natural-down alignment failed: "
-                            f"zero_verified={returned}, disable_verified={disabled}"
-                        )
-                    print(
-                        f"[teleop ZERO] {self._arm_side.upper()} FULL-ARM NATURAL-DOWN ZERO "
-                        "VERIFIED; all joints are DISABLED. PICO calibration may continue.",
+                        "请人工托稳机械臂并清空周围夹点；完成 PICO 标定后按一次 e。"
+                        "程序将先检查 PICO 姿态，再从当前实测位置限速避碰回零并确认失能，"
+                        "随后复检 PICO 姿态并进入遥操作；不需要按 Enter。",
                         flush=True,
                     )
                 else:
+                    self._startup_alignment_required = False
                     print(
                         f"[teleop ZERO] {self._arm_side.upper()} FULL-ARM NATURAL-DOWN ZERO "
                         "VERIFIED; motors remain DISABLED.",
                         flush=True,
                     )
-            if getattr(self, "_hand", None) is None:
+            if not getattr(self, "_arm_with_hand", False) or getattr(self, "_hand", None) is None:
                 return
 
         if self._hand is None:
@@ -618,12 +660,110 @@ class TeleopNode:
                 print(f"[teleop] failed to restore terminal settings: {exc}", flush=True)
 
     def _handle_key(self, ch: str) -> None:
-        if ch == "e":
+        probe = getattr(self, "_arm_probe", None)
+        if probe is not None and ch in ("e", "s", "d", "x", "q", "r", "z"):
+            probe.submit(dict(event="operator_key", key=ch))
+        if getattr(self, "_arm_only", False):
+            if getattr(self, "_startup_power_cycle_required", False):
+                if ch == "q":
+                    self._exit_for_startup_power_cycle("operator pressed 'q'")
+                    return
+                if ch in ("e", "s", "z"):
+                    print(
+                        f"[teleop] {ch.upper()} REFUSED: {self._arm_side} controller "
+                        "requires a power-cycle after incomplete startup feedback. No "
+                        "enable, return, or position command was sent; press q to E-stop "
+                        "and exit.",
+                        flush=True,
+                    )
+                    return
+            worker = getattr(self, "_return_thread", None)
+            arming_worker = getattr(self, "_arming_thread", None)
+            arming_active = arming_worker is not None and arming_worker.is_alive()
+            returning = ((worker is not None and worker.is_alive())
+                         or arming_active
+                         or getattr(self, "_startup_alignment", False))
+            if returning:
+                if arming_active and ch in ("s", "q", "x", "d"):
+                    cancel = getattr(self, "_arming_cancel", None)
+                    if cancel is not None:
+                        cancel.set()
+                    if ch == "q":
+                        self._quit_after_arming_cancel = True
+                if ch == "s":
+                    self._quit_after_arming_cancel = False
+                    self._quit_after_return = False
+                    self._driver.cancel_return()
+                    print("[teleop] Return cancelled; following remains locked. Use d/x if needed.", flush=True)
+                    return
+                if ch == "q":
+                    self._quit_after_return = True
+                    print(
+                        "[teleop] Safe return or arming cancellation is still in progress; "
+                        "q keeps the pending exit active. Use s to cancel, d to disable, "
+                        "or x for E-stop.",
+                        flush=True,
+                    )
+                    return
+                if ch not in ("x", "d"):
+                    print("[teleop] Return in progress; s cancels, x emergency-stops, d disables.", flush=True)
+                    return
+            fault_latched = self._full_arm_fault_latched()
+            if ch == "s" and getattr(self, "_motors_enabled", False) and fault_latched:
+                print(
+                    "[teleop] STOP ALREADY ACTIVE: following is locked by the arm fault. "
+                    "Press q to request checked recovery return and exit, or z to return "
+                    "without exiting. Physical contact, torque/controller faults, stale "
+                    "feedback, or unsafe geometry will still refuse motion; d/x remain available.",
+                    flush=True,
+                )
+                return
+            if ch in ("s", "q", "z"):
+                if ch == "q" and not self._motors_enabled and not fault_latched:
+                    self._stop = True
+                    return
+                recover = ch == "z" or (ch == "q" and fault_latched)
+                if ch == "q" and fault_latched:
+                    print(
+                        "[teleop] EXIT REQUEST: fault is latched; starting the same checked "
+                        "recovery return used by z. Exit occurs only after zero and seven-joint "
+                        "disable are both verified.",
+                        flush=True,
+                    )
+                self._start_full_arm_return(
+                    f"operator pressed '{ch}'", recover=recover, quit_after=ch == "q")
+                return
+            if ch == "h" and not getattr(self, "_arm_with_hand", False):
+                print("[teleop] Hand feedback is read-only in arm-only mode.", flush=True)
+                return
+        if ch == "r":
+            if not getattr(self, "_arm_only", False):
+                print("[teleop] PICO RECALIBRATION REFUSED: only available in single-arm PICO modes.", flush=True)
+                return
+            if (self._motors_enabled or self._arm_armed or self._hand_enabled
+                    or getattr(self, "_manual_intervention_required", False)
+                    or getattr(self._driver, "safety_fault_reason", None)):
+                print("[teleop] PICO RECALIBRATION REFUSED: motors/following or safety lock active; no hardware command sent.", flush=True)
+                return
+            self._body.restart_arm_reference()
+            self._ik.reset_j3_observability_baseline(self._arm_side)
+            print(
+                "[PICO 标定] 已清除旧 PICO 参考。请放松手臂、允许自然微屈，保持在捕捉范围内；"
+                "新数据到达后开始准备倒计时。手套标定保持不变，完成后仍需按 e。",
+                flush=True,
+            )
+        elif ch == "e":
+            if (getattr(self, "_arm_only", False)
+                    and not getattr(self, "_arm_with_hand", False)
+                    and not getattr(self, "_wrist_imu_side", None)):
+                self._start_pending_startup_arming()
+                return
             if getattr(self, "_arm_with_hand", False):
+                side = self._arm_side
                 if self._body.hand_joints() is None:
                     print(
-                        "[teleop] LINKED ENABLE REFUSED: fresh left SenseGlove finger "
-                        "targets are unavailable.",
+                        f"[teleop] LINKED ENABLE REFUSED: fresh {side} SenseGlove "
+                        "finger targets are unavailable.",
                         flush=True,
                     )
                     self._arm_armed = False
@@ -631,7 +771,8 @@ class TeleopNode:
                     return
                 if self._hand is None or not self._hand.feedback_ready():
                     print(
-                        "[teleop] LINKED ENABLE REFUSED: fresh left-hand feedback is unavailable.",
+                        f"[teleop] LINKED ENABLE REFUSED: fresh {side}-hand feedback "
+                        "is unavailable.",
                         flush=True,
                     )
                     self._arm_armed = False
@@ -647,48 +788,25 @@ class TeleopNode:
                 else:
                     self._hand_enabled = self._hand.set_enabled(True)
                     if not self._hand_enabled:
-                        _, disabled = self._return_full_arm_to_zero_and_disable(
-                            "left-hand feedback disappeared during linked enable"
-                        )
-                        print(
-                            "[teleop] LINKED ENABLE CANCELLED: hand feedback disappeared; "
-                            + (
-                                "left arm was returned to zero and disabled."
-                                if disabled
-                                else "left arm remains enabled in manual-intervention hold."
-                            ),
-                            flush=True,
-                        )
+                        self._stop_full_arm_for_fault(
+                            f"{side}-hand feedback disappeared during linked enable")
+                        print("[teleop] LINKED ENABLE CANCELLED: hand feedback disappeared; "
+                              "following locked. Clear the fault before z recovery.", flush=True)
                     else:
                         print(
-                            "[teleop] LEFT ARM + LEFT HAND LINKED FOLLOWING ENABLED.",
+                            f"[teleop] {side.upper()} ARM + {side.upper()} HAND "
+                            "LINKED FOLLOWING ENABLED.",
                             flush=True,
                         )
             else:
                 self._arm_armed = self._arm_robot()
+
         elif ch == "s":
             self._arm_armed = False
-            linked_hand = getattr(self, "_arm_with_hand", False) and self._hand is not None
-            if linked_hand:
-                self._hand.set_enabled(False)
-                self._hand_enabled = False
             if self._wrist_imu_side and self._driver is not None:
                 self._return_wrist_to_zero_and_disable("operator pressed 's'")
-            elif getattr(self, "_arm_only", False) and self._driver is not None:
-                self._return_full_arm_to_zero_and_disable("operator pressed 's'")
             else:
-                print(
-                    "[teleop] ARM FOLLOWING STOPPED - controller holding position.",
-                    flush=True,
-                )
-            if linked_hand:
-                opened = self._hand.return_to_open()
-                print(
-                    "[teleop] LEFT HAND RETURNED TO NATURAL OPEN POSE."
-                    if opened else
-                    "[teleop] LEFT HAND OPEN SKIPPED: fresh feedback unavailable.",
-                    flush=True,
-                )
+                print("[teleop] ARM FOLLOWING STOPPED - controller holding position.", flush=True)
         elif ch == "d":
             self._arm_armed = False
             self._manual_intervention_required = False
@@ -707,7 +825,7 @@ class TeleopNode:
                 )
         elif ch == "x":
             self._arm_armed = False
-            self._manual_intervention_required = False
+            self._manual_intervention_required = True
             if getattr(self, "_arm_with_hand", False) and self._hand is not None:
                 self._hand.set_enabled(False)
                 self._hand_enabled = False
@@ -722,6 +840,7 @@ class TeleopNode:
                 else "both arms"
             )
             print(f"[teleop] ELECTRONIC E-STOP sent to {scope}.", flush=True)
+
         elif ch == "h":
             if self._hand is None:
                 print("[teleop] hand control is unavailable in arm-only mode.", flush=True)
@@ -742,39 +861,235 @@ class TeleopNode:
         elif ch == "q":
             self._arm_armed = False
             self._return_hand_open_on_close = self._hand is not None
-            if getattr(self, "_arm_only", False):
-                if self._motors_enabled:
-                    print(
-                        f"[teleop] quitting: slowly returning {self._arm_side} J4..J7, "
-                        "then J1..J3 to natural-down zero before disabling the arm.",
-                        flush=True,
-                    )
-                    _, disabled = self._return_full_arm_to_zero_and_disable(
-                        "operator pressed 'q'"
-                    )
-                    if not disabled:
-                        self._stop = False
-                        print(
-                            f"[teleop] QUIT CANCELLED: {self._arm_side} arm remains "
-                            "enabled with following locked. Keep supporting it; press "
-                            "'s' to retry zero return, 'd' to disable, or 'x' for E-stop.",
-                            flush=True,
-                        )
-                        return
-                else:
-                    print(
-                        f"[teleop] quitting: {self._arm_side} arm is already disabled; "
-                        "no return motion will be sent.",
-                        flush=True,
-                    )
-                self._stop = True
-            else:
+            self._stop = True
+            print("[teleop] quitting: returning wrist J5/J6/J7 to zero, disabling arm, "
+                  "then returning hand to open pose.", flush=True)
+
+    def _enabled_fault_requires_explicit_disable(self) -> bool:
+        return bool(
+            getattr(self, "_arm_only", False)
+            and getattr(self, "_driver", None) is not None
+            and getattr(self, "_motors_enabled", False)
+            and (
+                getattr(self, "_manual_intervention_required", False)
+                or getattr(self._driver, "_return_inhibited", False)
+            )
+        )
+
+    def _full_arm_fault_latched(self) -> bool:
+        driver = getattr(self, "_driver", None)
+        reason = None if driver is None else getattr(driver, "safety_fault_reason", None)
+        return bool(
+            getattr(self, "_manual_intervention_required", False)
+            or (isinstance(reason, str) and bool(reason))
+            or (
+                driver is not None
+                and getattr(driver, "_return_inhibited", False) is True
+            )
+        )
+
+    def _exit_for_startup_power_cycle(self, source: str) -> bool:
+        """Stop an unobservable startup without attempting a position return."""
+        if not getattr(self, "_startup_power_cycle_required", False):
+            return False
+        self._arm_armed = False
+        self._manual_intervention_required = True
+        if getattr(self, "_arm_with_hand", False) and self._hand is not None:
+            self._hand.set_enabled(False)
+            self._hand_enabled = False
+        try:
+            self._driver.emergency_stop()
+        except Exception as exc:  # noqa: BLE001
+            if getattr(self, "_startup_transport_unavailable", False):
                 self._stop = True
                 print(
-                    "[teleop] quitting: returning wrist J5/J6/J7 to zero, disabling arm, "
-                    "then returning hand to open pose.",
+                    f"[teleop] POWER-CYCLE EXIT: electronic E-stop could not be delivered "
+                    f"because CAN is unavailable ({type(exc).__name__}: {exc}). No return "
+                    "position was commanded; motor state remains unverified. Use the "
+                    "physical emergency stop and power-cycle the arm controller before "
+                    "reconnecting.",
                     flush=True,
                 )
+                return True
+            print(
+                f"[teleop] POWER-CYCLE EXIT REFUSED: electronic E-stop send failed "
+                f"({type(exc).__name__}: {exc}). Keep supporting the arm, use the "
+                "physical emergency stop, then press Ctrl-C again.",
+                flush=True,
+            )
+            return False
+        self._motors_enabled = False
+        self._stop = True
+        print(
+            f"[teleop] POWER-CYCLE EXIT: {source}; electronic E-stop sent, no return "
+            "position was commanded. Seven-joint disable is unverified because feedback "
+            f"is absent. Keep supporting the arm, power-cycle the {self._arm_side} "
+            "controller, and "
+            "verify feedback before the next enable.",
+            flush=True,
+        )
+        return True
+
+    @staticmethod
+    def _report_enabled_fault_exit_refusal(source: str) -> None:
+        print(
+            f"[teleop] {source} REFUSED: the arm fault is latched and seven-joint "
+            "disable is not confirmed. Keep supporting the arm. Press 'q' to request "
+            "a checked recovery return and exit; if return remains unsafe or hardware "
+            "faults remain active, press 'd' once and wait for "
+            "'OPERATOR DISABLE: DISABLED' before exiting.",
+            flush=True,
+        )
+
+    def _start_pending_startup_arming(self) -> None:
+        """Run single-arm alignment/arming without racing the control-loop IK state."""
+        worker = getattr(self, "_arming_thread", None)
+        if worker is not None and worker.is_alive():
+            print("[teleop] Startup alignment/arming is already in progress.", flush=True)
+            return
+        cancel = getattr(self, "_arming_cancel", None)
+        if cancel is None:
+            cancel = threading.Event()
+            self._arming_cancel = cancel
+        cancel.clear()
+
+        def run():
+            try:
+                lock = getattr(self, "_arm_control_lock", None)
+                if lock is None:  # Compatibility for small isolated test doubles.
+                    armed = self._arm_robot()
+                else:
+                    with lock:
+                        armed = self._arm_robot()
+                if armed and cancel.is_set():
+                    disabled = bool(self._driver.disable())
+                    self._motors_enabled = not disabled
+                    print(
+                        f"[teleop] Startup arming was cancelled after enable; "
+                        f"{self._arm_side} arm "
+                        f"{'DISABLED' if disabled else 'DISABLE NOT CONFIRMED'}.",
+                        flush=True,
+                    )
+                    armed = False
+                self._arm_armed = bool(armed and not cancel.is_set())
+            except Exception as exc:  # noqa: BLE001
+                self._arm_armed = False
+                self._manual_intervention_required = True
+                print(
+                    f"[teleop] STARTUP ARMING FAILED: {type(exc).__name__}: {exc}; "
+                    "following remains locked.",
+                    flush=True,
+                )
+            finally:
+                if getattr(self, "_quit_after_arming_cancel", False):
+                    self._quit_after_arming_cancel = False
+                    if getattr(self, "_startup_power_cycle_required", False):
+                        self._exit_for_startup_power_cycle(
+                            "operator pressed 'q' during startup arming"
+                        )
+                    else:
+                        fault_latched = self._full_arm_fault_latched()
+                        if not getattr(self, "_motors_enabled", False) and not fault_latched:
+                            self._stop = True
+                        else:
+                            self._start_full_arm_return(
+                                "operator pressed 'q' during startup arming",
+                                recover=fault_latched,
+                                quit_after=True,
+                            )
+
+        self._arming_thread = threading.Thread(
+            target=run, name="startup-arm-enable", daemon=True
+        )
+        self._arming_thread.start()
+
+    def _arm_startup_active(self) -> bool:
+        worker = getattr(self, "_arming_thread", None)
+        return bool(worker is not None and worker.is_alive())
+
+    def _align_pending_startup_zero(self) -> bool:
+        if not getattr(self, "_startup_alignment_required", False):
+            return True
+        error = self._driver.startup_zero_error()
+        tolerance = np.deg2rad(max(
+            0.1, float(self._cfg.robot.full_arm_startup_zero_tolerance_deg)
+        ))
+        if error is not None and np.max(np.abs(error)) <= tolerance:
+            self._startup_alignment_required = False
+            return True
+        print(
+            f"[teleop ZERO] {self._arm_side.upper()} startup alignment: holding fresh "
+            "measured feedback as the first target, then slowly returning along a "
+            "collision-checked path to natural-down zero.",
+            flush=True,
+        )
+        self._startup_alignment = True
+        try:
+            returned, disabled = self._driver.align_startup_zero_and_disable()
+        finally:
+            self._startup_alignment = False
+        self._motors_enabled = not disabled
+        if not returned or not disabled:
+            self._manual_intervention_required = True
+            print(
+                f"[teleop] ARMING REFUSED: {self._arm_side} startup natural-down "
+                f"alignment failed: zero_verified={returned}, "
+                f"disable_verified={disabled}.",
+                flush=True,
+            )
+            return False
+        self._startup_alignment_required = False
+        print(
+            f"[teleop ZERO] {self._arm_side.upper()} FULL-ARM NATURAL-DOWN ZERO "
+            "VERIFIED; all joints are DISABLED. Rechecking PICO reference before enable.",
+            flush=True,
+        )
+        return True
+
+    def _start_full_arm_return(self, reason, *, recover=False, quit_after=False):
+        """Keep the keyboard responsive while planning/executing a return."""
+        if self._driver is None:
+            return
+        if not recover and getattr(self, "_manual_intervention_required", False):
+            print("[teleop] Return inhibited by fault; clear the fault before explicit z recovery.", flush=True)
+            return
+        if not recover and not getattr(self, "_motors_enabled", True):
+            print("[teleop] Arm already disabled; no return motion requested.", flush=True)
+            return
+        worker = getattr(self, "_return_thread", None)
+        if worker is not None and worker.is_alive():
+            if quit_after:
+                self._quit_after_return = True
+            return
+        if quit_after:
+            self._quit_after_return = True
+        self._arm_armed = False
+        self._manual_intervention_required = True
+        self._hand_enabled = False
+        self._return_hand_open_on_close = False
+        if self._hand is not None:
+            self._hand.set_enabled(False)
+        request_id = self._driver.prepare_return()
+        if request_id is None:
+            return
+        def run():
+            try:
+                result = self._driver.safe_return(recover=recover, request_id=request_id)
+                self._motors_enabled = not result.disabled
+                self._manual_intervention_required = not (result.returned and result.disabled)
+                pending_exit = bool(
+                    quit_after or getattr(self, "_quit_after_return", False)
+                )
+                if pending_exit and result.returned and result.disabled:
+                    self._stop = True
+                print(f"[teleop] {reason}: {result.stage}: {result.reason or 'zero verified'}", flush=True)
+            except Exception as exc:
+                self._manual_intervention_required = True
+                print(f"[teleop] Return failed: {exc}; following locked.", flush=True)
+            finally:
+                self._quit_after_return = False
+        self._return_thread = threading.Thread(target=run, name="safe-arm-return", daemon=True)
+        self._return_thread.start()
 
     def _return_full_arm_to_zero_and_disable(self, reason: str) -> tuple[bool, bool]:
         self._arm_armed = False
@@ -786,7 +1101,7 @@ class TeleopNode:
             return False, True
         print(
             f"[teleop] {self._arm_side.upper()} ARM STOPPED: {reason}; slowly returning "
-            "J4..J7 first, then J1..J3 to natural-down zero before disable.",
+            "along a collision-checked path to natural-down zero before disable.",
             flush=True,
         )
         returned, disabled = self._driver.return_to_zero_and_disable()
@@ -795,16 +1110,91 @@ class TeleopNode:
         if returned:
             status = "ZERO VERIFIED; DISABLED" if disabled else "ZERO VERIFIED; DISABLE NOT CONFIRMED"
         elif disabled:
-            status = "ZERO RETURN NOT CONFIRMED; DISABLED BY CONFIGURED FALLBACK"
+            status = "ZERO RETURN NOT CONFIRMED; ARM DISABLED"
         else:
             status = (
                 "ZERO RETURN NOT CONFIRMED; FOLLOWING LOCKED, ARM REMAINS ENABLED. "
-                "Press 's' to retry, 'd' to disable, or 'x' for E-stop"
+                "After clearing the fault, press 'z' for recovery; 'd' disables, 'x' E-stops"
             )
         print(f"[teleop] {self._arm_side.upper()} ARM {status}.", flush=True)
         return returned, disabled
 
+    def _trajectory_active(self):
+        return (getattr(self, "_arm_only", False)
+                and bool(getattr(self._cfg.robot, f"{self._arm_side}_command_trajectory_enabled", False)))
+
+    def _stop_full_arm_for_fault(self, reason):
+        if (getattr(self._driver, "_return_active", False)
+                or getattr(self._driver, "_return_pending", False)):
+            return False, False
+        if not self._trajectory_active():
+            return self._return_full_arm_to_zero_and_disable(reason)
+        self._arm_armed = False
+        self._manual_intervention_required = True
+        if self._driver is not None:
+            self._driver.latch_return_fault(reason)
+        if getattr(self, "_arm_with_hand", False) and self._hand is not None:
+            self._hand.set_enabled(False)
+            self._hand_enabled = False
+        print(f"[teleop] {self._arm_side.upper()} ARM SAFETY STOP: {reason}; following locked, "
+              "last controller target retained; no zero/disable command sent. Clear the fault before z; d/x remain available.", flush=True)
+        return False, False
+
+    def _report_silent_startup_failure(self):
+        failure = getattr(self._driver, "last_startup_failure", None)
+        self._manual_intervention_required = True
+        if not isinstance(failure, dict):
+            print("[teleop] ARMING REFUSED: startup failed without stage diagnostics; "
+                  "verify controller state and inspect logs before retrying.", flush=True)
+            return
+        print(f"[teleop] ARMING REFUSED: {self._arm_side} startup stage="
+              f"{failure['stage']}: {failure['reason']}.", flush=True)
+        if failure.get("wake_attempted"):
+            # A failed wake does not establish that the arm is disabled.
+            self._motors_enabled = True
+            print("[teleop] A controller wake was attempted; current motor state requires verification.", flush=True)
+        else:
+            print("[teleop] Rejected before controller wake; this attempt issued no wake, "
+                  "enable, position or disable commands.", flush=True)
+        if failure.get("disable_attempted"):
+            print("[teleop] Disable commands were attempted; this alone does not confirm all motors disabled.", flush=True)
+        if failure.get("power_cycle_required"):
+            self._startup_power_cycle_required = True
+            self._startup_transport_unavailable = bool(
+                failure.get("transport_unavailable")
+            )
+            if self._startup_transport_unavailable:
+                print(
+                    f"[teleop] CAN TRANSPORT UNAVAILABLE: {self._arm_side} controller "
+                    "did not acknowledge frames and motor state cannot be verified. "
+                    "Do not retry e/z. Use the physical emergency stop, check controller "
+                    "power and the arm CAN cable, then exit and power-cycle before retrying.",
+                    flush=True,
+                )
+            print(
+                f"[teleop] POWER-CYCLE REQUIRED: {self._arm_side} controller returned no "
+                "complete seven-joint state after its bounded wake. Further e/z/return "
+                "attempts are locked. Keep supporting the arm; q sends electronic E-stop "
+                "and exits without a position command, then power-cycle the controller "
+                "and verify feedback before retrying.",
+                flush=True,
+            )
+        geometry = failure.get("geometry") or {}
+        if geometry:
+            print(f"[teleop] Startup geometry diagnostics: {geometry}", flush=True)
+        if failure['stage'] == "geometry":
+            print("[teleop] Check fresh hand-state feedback and verified feedback-to-URDF calibration; "
+                  "do not bypass the collision guard. Power-cycling does not resolve this preflight rejection.", flush=True)
+
     def _arm_robot(self) -> bool:
+        if getattr(self, "_startup_power_cycle_required", False):
+            print(
+                f"[teleop] ARMING REFUSED: {self._arm_side} controller still requires "
+                "a power-cycle after incomplete startup feedback. No enable or position "
+                "command was sent; press q to E-stop and exit first.",
+                flush=True,
+            )
+            return False
         if getattr(self, "_manual_intervention_required", False):
             print(
                 "[teleop] ARMING REFUSED: manual intervention is required after an "
@@ -916,9 +1306,66 @@ class TeleopNode:
             )
             return True
 
+        if getattr(self, "_arm_only", False):
+            if getattr(self, "_arm_armed", False):
+                return True
+            if not self._wait_for_arm_prepare():
+                return False
+            cancel = getattr(self, "_arming_cancel", None)
+            if cancel is not None and cancel.is_set():
+                print("[teleop] Startup arming cancelled before hardware checks.", flush=True)
+                return False
         if not self._body.is_ready():
             print("[teleop] ARMING REFUSED: body tracking/reference is not ready.", flush=True)
             return False
+        if getattr(self, "_arm_only", False):
+            snapshot = self._body.refresh_arm_reference_for_enable(self._arm_side)
+            if snapshot is None:
+                print(
+                    "[teleop] ARMING REFUSED: recent PICO arm data is unavailable or "
+                    "unstable; no motor-enable or position command was sent.",
+                    flush=True,
+                )
+                return False
+            target_ready, upper_delta, forearm_delta, max_std, sample_count = snapshot
+            if not target_ready:
+                print(
+                    "[teleop] ARMING REFUSED: the recent human-arm target is invalid; "
+                    "no motor-enable or position command was sent.",
+                    flush=True,
+                )
+                return False
+            print(
+                f"[teleop] PICO latest target accepted from {sample_count} stable frames "
+                f"(position_std={max_std:.3f}m, offset_from_calibration="
+                f"{upper_delta:.1f}/{forearm_delta:.1f}deg); robot has not moved.",
+                flush=True,
+            )
+            if getattr(self, "_startup_alignment_required", False):
+                if not self._align_pending_startup_zero():
+                    return False
+                cancel = getattr(self, "_arming_cancel", None)
+                if cancel is not None and cancel.is_set():
+                    print("[teleop] Startup arming cancelled after zero alignment.", flush=True)
+                    return False
+                snapshot = self._body.refresh_arm_reference_for_enable(self._arm_side)
+                if snapshot is None or not snapshot[0]:
+                    detail = "unstable/unavailable" if snapshot is None else (
+                        f"upper={snapshot[1]:.1f}deg, forearm={snapshot[2]:.1f}deg"
+                    )
+                    print(
+                        f"[teleop] ARMING REFUSED: the latest PICO target became unavailable "
+                        f"or unstable during startup alignment ({detail}); the arm is verified "
+                        "at zero and disabled. Hold the desired pose steadily and press e again.",
+                        flush=True,
+                    )
+                    return False
+                print(
+                    f"[teleop] PICO latest target reverified after startup alignment "
+                    f"(position_std={snapshot[3]:.3f}m, offset_from_calibration="
+                    f"{snapshot[1]:.1f}/{snapshot[2]:.1f}deg).",
+                    flush=True,
+                )
         if not self._driver.capture_session_start():
             if not (
                 getattr(self, "_arm_only", False)
@@ -932,13 +1379,7 @@ class TeleopNode:
                 flush=True,
             )
             if not self._driver.enable_from_natural_down():
-                print(
-                    f"[teleop] ARMING REFUSED: {self._arm_side} arm returned no complete "
-                    "seven-joint feedback at natural-down zero. Broadcast and J1..J7 "
-                    "disable commands were sent. Do not repeatedly press 'e'; power-cycle "
-                    "the arm controller, then restart this program.",
-                    flush=True,
-                )
+                self._report_silent_startup_failure()
                 return False
             self._motors_enabled = True
             if not self._driver.capture_session_start():
@@ -975,9 +1416,17 @@ class TeleopNode:
             self._ik.current_task_frame_poses(self._current_arm_joints)
         )
         if not self._motors_enabled:
+            cancel = getattr(self, "_arming_cancel", None)
+            if cancel is not None and cancel.is_set():
+                print("[teleop] Startup arming cancelled before motor enable.", flush=True)
+                return False
             self._motors_enabled = self._driver.enable()
             if not self._motors_enabled:
-                print("[teleop] ARMING REFUSED: motor enable failed.", flush=True)
+                if isinstance(getattr(self._driver, "last_startup_failure", None), dict):
+                    self._report_silent_startup_failure()
+                else:
+                    reason = getattr(self._driver, "safety_fault_reason", None)
+                    print(f"[teleop] ARMING REFUSED: {reason or 'motor enable failed'}.", flush=True)
                 return False
             self._driver.set_speed(self._cfg.robot.speed_percent)
         if self._arm_only and not self._body.is_ready():
@@ -990,6 +1439,49 @@ class TeleopNode:
                 flush=True,
             )
             return False
+        if getattr(self, "_arm_only", False):
+            snapshot = self._body.refresh_arm_reference_for_enable(self._arm_side)
+            if snapshot is None or not snapshot[0]:
+                detail = "unstable/unavailable" if snapshot is None else (
+                    f"upper={snapshot[1]:.1f}deg, forearm={snapshot[2]:.1f}deg"
+                )
+                print(
+                    f"[teleop] ARMING REFUSED: latest PICO target check failed after "
+                    f"enable/torque settling ({detail}). Following remains locked; "
+                    "the arm remains enabled holding its verified startup target. Hold the "
+                    "desired human-arm pose steadily and press 'e' again.",
+                    flush=True,
+                )
+                return False
+        if getattr(self, "_arm_only", False):
+            try:
+                startup_snapshot = None
+                if self._trajectory_active():
+                    # One post-enable measurement anchors FK, IK and trajectory.
+                    measured = self._driver.read_full_urdf_joints()
+                    if measured is None:
+                        raise ValueError("post-enable joint feedback unavailable")
+                    startup_snapshot = self._driver._arm._runtime_feedback
+                    self._current_arm_joints = measured
+                    self._body.rebase_robot_reference(self._ik.current_task_frame_poses(measured))
+                    if self._cfg.ik.partition_terminal_wrist_ik:
+                        self._configure_full_arm_wrist_mapping(measured)
+                    self._driver.record_startup_event("reference_checks_passed")
+                self._ik.initialize_arm_session(
+                    self._arm_side, self._current_arm_joints,
+                    self._body.arm_reference_flexion_rad(self._arm_side),
+                    relative_elbow_reference=(
+                        self._cfg.retarget.arm_vector_position_mode == "segment_direction_relative"
+                    ),
+                )
+                self._body.seed_arm_reference_filters(self._arm_side)
+                if self._trajectory_active() and not self._driver.initialize_command_trajectory(startup_snapshot):
+                    self._stop_full_arm_for_fault(
+                        self._driver.safety_fault_reason or "command trajectory initialization failed")
+                    return False
+            except (ValueError, TypeError) as exc:
+                print(f"[teleop] ARMING REFUSED: invalid calibrated arm reference: {exc}", flush=True)
+                return False
         scope = (
             f"{self._arm_side.upper()} ARM"
             if getattr(self, "_arm_only", False)
@@ -1002,11 +1494,42 @@ class TeleopNode:
         )
         return True
 
+    def _wait_for_arm_prepare(self) -> bool:
+        seconds = self._cfg.retarget.arm_reference_enable_prepare_s
+        deadline = time.monotonic() + seconds
+        last = None
+        while not getattr(self, "_stop", False):
+            # The keyboard thread is busy in this countdown: keep stop keys live.
+            if sys.stdin.isatty() and select.select([sys.stdin], [], [], 0)[0]:
+                key = os.read(sys.stdin.fileno(), 1).decode("utf-8", errors="ignore").lower()
+                if key in ("q", "s", "x"):
+                    self._handle_key(key)
+                    return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            shown = int(np.ceil(remaining))
+            if shown != last:
+                print(
+                    f"[PICO 使能准备] 请放下按键的手，并稳定保持希望机械臂缓慢跟随的当前姿态，"
+                    f"{shown} 秒后检查。Ctrl-C 取消。",
+                    flush=True,
+                )
+                last = shown
+            time.sleep(min(.1, remaining))
+        return False
+
     def _read_current_joints(self) -> np.ndarray | None:
         if self._driver is None:
             if self._current_arm_joints is None:
                 self._current_arm_joints = np.zeros(14, dtype=np.float64)
             return self._current_arm_joints.copy()
+        if getattr(self, "_arm_armed", False) and self._trajectory_active():
+            joints = self._driver.read_control_cycle_joints()
+            if joints is None:
+                return None  # Never substitute the last valid pose during following.
+            self._current_arm_joints = joints
+            return joints.copy()
         joints = (
             self._driver.read_joints()
             if self._wrist_imu_side
@@ -1023,6 +1546,13 @@ class TeleopNode:
         if self._hand_only:
             print("[teleop] hand-only mode", flush=True)
         elif getattr(self, "_arm_only", False):
+            live_collision = (self._cfg.robot.torso_collision_enabled
+                              and self._cfg.robot.teleop_torso_collision_enabled)
+            print(
+                f"[teleop] Live-following torso geometry checks: {'ON' if live_collision else 'OFF'}; "
+                "slow returns retain collision preflight, planning and execution checks.",
+                flush=True,
+            )
             if getattr(self, "_arm_with_hand", False):
                 print(
                     f"[teleop] PICO {self._arm_side} arm + SenseGlove/LinkerHand linked mode; "
@@ -1037,7 +1567,8 @@ class TeleopNode:
                 )
             print(
                 "[teleop] keep the human arm naturally down until 'Calibration locked'; "
-                "then press 'e' to enable, 's' to return/disable, 'd' for operator-confirmed "
+                "after calibration, hold the current desired pose steadily and press 'e' to "
+                "approach it gradually; 's' returns/disables, 'z' requests recovery return, 'd' performs operator-confirmed "
                 "disable, 'x' for E-stop, or 'q' to quit.",
                 flush=True,
             )
@@ -1058,6 +1589,10 @@ class TeleopNode:
 
         while not self._stop:
             frame_start = time.monotonic()
+            previous_start = getattr(self, "_previous_cycle_start", frame_start)
+            self._cycle_timings = {"cycle_period_ms": (frame_start - previous_start) * 1000,
+                                   "previous_cycle_work_ms": getattr(self, "_previous_cycle_work_ms", None)}
+            self._previous_cycle_start = frame_start
 
             hand_joints = self._body.hand_joints() if self._hand is not None else None
             if (
@@ -1067,8 +1602,8 @@ class TeleopNode:
             ):
                 self._hand.set_enabled(False)
                 self._hand_enabled = False
-                self._return_full_arm_to_zero_and_disable(
-                    "left SenseGlove finger targets became stale"
+                self._stop_full_arm_for_fault(
+                    f"{self._arm_side} SenseGlove finger targets became stale"
                 )
                 print(
                     "[teleop] LINKED SAFETY STOP: hand following disabled.",
@@ -1084,8 +1619,8 @@ class TeleopNode:
                 if self._hand_enabled and not self._hand.is_enabled():
                     self._hand_enabled = False
                     if getattr(self, "_arm_with_hand", False) and self._arm_armed:
-                        self._return_full_arm_to_zero_and_disable(
-                            "left LinkerHand feedback became stale"
+                        self._stop_full_arm_for_fault(
+                            f"{self._arm_side} LinkerHand feedback became stale"
                         )
                         print(
                             "[teleop] LINKED SAFETY STOP: hand following disabled.",
@@ -1129,123 +1664,329 @@ class TeleopNode:
                     time.sleep(loop_dt - elapsed)
                 continue
 
-            targets = self._body.advance()
-            if targets is None:
-                if (
-                    getattr(self, "_arm_only", False)
-                    and self._arm_armed
-                    and not self._body.is_ready()
-                ):
-                    imu_missing = (
-                        self._cfg.retarget.require_hand_imu_for_active_arm
-                        and self._body.hand_orientation_delta(self._arm_side) is None
-                    )
-                    reason = (
-                        f"{self._arm_side} SenseGlove IMU became stale"
-                        if imu_missing
-                        else "PICO body data became stale"
-                    )
-                    if getattr(self, "_arm_with_hand", False) and self._hand is not None:
-                        self._hand.set_enabled(False)
-                        self._hand_enabled = False
-                    self._return_full_arm_to_zero_and_disable(reason)
-                time.sleep(0.005)
+            # Single-arm arming runs in a worker so stop/disable keys stay
+            # responsive.  Do not let the preview loop mutate the same body
+            # filters or IK seed while that worker rebases them to fresh
+            # measured feedback.  The lock also closes the small race where a
+            # control cycle began immediately before the worker became alive.
+            if self._arm_only and self._arm_startup_active():
+                elapsed = time.monotonic() - frame_start
+                if elapsed < loop_dt:
+                    time.sleep(loop_dt - elapsed)
                 continue
-
-            current = self._read_current_joints()
-            if current is None:
-                time.sleep(0.005)
-                continue
-
-            partitioned_side = None
-            terminal_targets = None
-            compensate_full_arm_imu = False
-            if self._arm_only and self._cfg.ik.partition_terminal_wrist_ik:
-                imu_delta = self._body.hand_orientation_delta(self._arm_side)
-                try:
-                    if imu_delta is None:
-                        # PICO-only commissioning: do not infer terminal
-                        # orientation from the tracker. Preserve measured URDF
-                        # J5/J6/J7 while J1..J4 solve the arm-segment positions.
-                        side_offset = 0 if self._arm_side == "left" else 7
-                        terminal_targets = current[side_offset + 4:side_offset + 7].copy()
-                    else:
-                        # First solve shoulder/elbow geometry at neutral wrist.
-                        # The second solve below removes this arm-generated
-                        # world rotation from the glove's desired palm pose.
-                        terminal_targets = self._full_arm_terminal_targets(np.eye(3))
-                        compensate_full_arm_imu = True
-                    partitioned_side = self._arm_side
-                except (TypeError, ValueError, np.linalg.LinAlgError) as exc:
-                    if self._arm_armed:
-                        self._return_full_arm_to_zero_and_disable(
-                            f"SenseGlove wrist mapping failed: {exc}"
-                        )
+            # A preview cycle must finish before startup can rebase the robot.
+            # Locking advance/solve separately leaves old local targets and
+            # feedback alive across the entire enable worker. Keep acquisition,
+            # solving, fault decisions, sending and FK diagnostics in one epoch.
+            cycle_lock = getattr(self, "_arm_control_lock", None)
+            with cycle_lock if cycle_lock is not None else nullcontext():
+                if self._arm_only and self._arm_startup_active():
                     continue
-
-            arm_targets = self._ik.solve(
-                left_wrist_pose=targets["left_wrist"],
-                right_wrist_pose=targets["right_wrist"],
-                current_arm_joint_pos=current,
-                left_elbow_pose=targets["left_elbow"] if self._cfg.ik.enable_elbow_tasks else None,
-                right_elbow_pose=targets["right_elbow"] if self._cfg.ik.enable_elbow_tasks else None,
-                partitioned_side=partitioned_side,
-                terminal_joint_targets=terminal_targets,
-            )
-
-            if compensate_full_arm_imu:
-                try:
-                    terminal_targets = self._compensated_full_arm_terminal_targets(
-                        targets[f"{self._arm_side}_wrist"], arm_targets
-                    )
-                    arm_targets = self._ik.solve(
-                        left_wrist_pose=targets["left_wrist"],
-                        right_wrist_pose=targets["right_wrist"],
-                        current_arm_joint_pos=current,
-                        left_elbow_pose=(
-                            targets["left_elbow"]
-                            if self._cfg.ik.enable_elbow_tasks else None
-                        ),
-                        right_elbow_pose=(
-                            targets["right_elbow"]
-                            if self._cfg.ik.enable_elbow_tasks else None
-                        ),
-                        partitioned_side=partitioned_side,
-                        terminal_joint_targets=terminal_targets,
-                    )
-                except (KeyError, TypeError, ValueError, np.linalg.LinAlgError) as exc:
-                    if self._arm_armed:
+                stage_start = time.monotonic()
+                targets = self._body.advance()
+                self._cycle_timings["retarget_ms"] = (time.monotonic() - stage_start) * 1000
+                if targets is None:
+                    if (
+                        getattr(self, "_arm_only", False)
+                        and self._arm_armed
+                        and not self._body.is_ready()
+                    ):
+                        imu_missing = (
+                            self._cfg.retarget.require_hand_imu_for_active_arm
+                            and self._body.hand_orientation_delta(self._arm_side) is None
+                        )
+                        reason = (
+                            f"{self._arm_side} SenseGlove IMU became stale"
+                            if imu_missing
+                            else "PICO body data became stale"
+                        )
                         if getattr(self, "_arm_with_hand", False) and self._hand is not None:
                             self._hand.set_enabled(False)
                             self._hand_enabled = False
-                        self._return_full_arm_to_zero_and_disable(
-                            f"full-arm IMU compensation failed: {exc}"
-                        )
+                        self._stop_full_arm_for_fault(reason)
+                    time.sleep(0.005)
                     continue
 
-            if self._driver is not None and self._arm_armed:
-                commanded = self._driver.command_full_urdf(arm_targets)
-                if not commanded and not self._command_rejected:
-                    print("[teleop] command rejected: invalid/missing arm feedback.", flush=True)
-                if not commanded and self._arm_only:
-                    self._arm_armed = False
-                    self._manual_intervention_required = True
+                stage_start = time.monotonic()
+                current = self._read_current_joints()
+                self._cycle_timings["feedback_read_ms"] = (time.monotonic() - stage_start) * 1000
+                if current is None:
+                    if self._arm_armed and self._trajectory_active():
+                        failure = getattr(self._driver, "feedback_failure_diagnostics", None)
+                        detail = failure.get("reason") if isinstance(failure, dict) else None
+                        transient = bool(failure.get("transient")) if isinstance(failure, dict) else False
+                        if transient:
+                            if not getattr(self, "_feedback_gap_notice_active", False):
+                                print(
+                                    "[teleop SAFETY] brief joint-feedback gap: holding the last "
+                                    "controller target; no new position command is being sent.",
+                                    flush=True,
+                                )
+                            self._feedback_gap_notice_active = True
+                        else:
+                            self._stop_full_arm_for_fault("joint feedback unavailable" + (f": {detail}" if detail else ""))
+                    time.sleep(0.005)
+                    continue
+                if getattr(self, "_feedback_gap_notice_active", False):
                     print(
-                        f"[teleop] {self._arm_side.upper()} ARM SAFETY STOP: feedback "
-                        "invalid; no zero target or disable command was sent. Following "
-                        "is locked and the arm remains enabled at its last controller "
-                        "target. Keep supporting it; press 's', 'd', or 'x'.",
+                        "[teleop SAFETY] joint feedback recovered and passed the trajectory "
+                        "safety recheck; bounded following resumed.",
                         flush=True,
                     )
-                self._command_rejected = not commanded
+                    self._feedback_gap_notice_active = False
 
-            self._publish_arm_diagnostics(targets, arm_targets, current)
+                partitioned_side = None
+                terminal_targets = None
+                compensate_full_arm_imu = False
+                if self._arm_only and self._cfg.ik.partition_terminal_wrist_ik:
+                    imu_delta = self._body.hand_orientation_delta(self._arm_side)
+                    try:
+                        if imu_delta is None:
+                            # PICO-only commissioning: do not infer terminal
+                            # orientation from the tracker. Preserve measured URDF
+                            # J5/J6/J7 while J1..J4 solve the arm-segment positions.
+                            side_offset = 0 if self._arm_side == "left" else 7
+                            terminal_targets = current[side_offset + 4:side_offset + 7].copy()
+                        else:
+                            # First solve shoulder/elbow geometry at neutral wrist.
+                            # The second solve below removes this arm-generated
+                            # world rotation from the glove's desired palm pose.
+                            terminal_targets = self._full_arm_terminal_targets(np.eye(3))
+                            compensate_full_arm_imu = True
+                        partitioned_side = self._arm_side
+                    except (TypeError, ValueError, np.linalg.LinAlgError) as exc:
+                        if self._arm_armed:
+                            self._stop_full_arm_for_fault(
+                                f"SenseGlove wrist mapping failed: {exc}"
+                            )
+                        continue
+
+                stage_start = time.monotonic()
+                # Let a newly queued startup worker acquire the lock without
+                # spending another solve on a preview that will be discarded.
+                if self._arm_only and self._arm_startup_active():
+                    continue
+                arm_targets = self._ik.solve(
+                    left_wrist_pose=targets["left_wrist"],
+                    right_wrist_pose=targets["right_wrist"],
+                    current_arm_joint_pos=current,
+                    left_elbow_pose=targets["left_elbow"] if self._cfg.ik.enable_elbow_tasks else None,
+                    right_elbow_pose=targets["right_elbow"] if self._cfg.ik.enable_elbow_tasks else None,
+                    partitioned_side=partitioned_side,
+                    terminal_joint_targets=terminal_targets,
+                )
+
+                if compensate_full_arm_imu:
+                    try:
+                        terminal_targets = self._compensated_full_arm_terminal_targets(
+                            targets[f"{self._arm_side}_wrist"], arm_targets
+                        )
+                        arm_targets = self._ik.solve(
+                            left_wrist_pose=targets["left_wrist"],
+                            right_wrist_pose=targets["right_wrist"],
+                            current_arm_joint_pos=current,
+                            left_elbow_pose=(
+                                targets["left_elbow"]
+                                if self._cfg.ik.enable_elbow_tasks else None
+                            ),
+                            right_elbow_pose=(
+                                targets["right_elbow"]
+                                if self._cfg.ik.enable_elbow_tasks else None
+                            ),
+                            partitioned_side=partitioned_side,
+                            terminal_joint_targets=terminal_targets,
+                        )
+                    except (KeyError, TypeError, ValueError, np.linalg.LinAlgError) as exc:
+                        if self._arm_armed:
+                            if getattr(self, "_arm_with_hand", False) and self._hand is not None:
+                                self._hand.set_enabled(False)
+                                self._hand_enabled = False
+                            self._stop_full_arm_for_fault(
+                                f"full-arm IMU compensation failed: {exc}"
+                            )
+                        continue
+
+                self._cycle_timings["ik_and_wrist_compensation_ms"] = (time.monotonic() - stage_start) * 1000
+                position_limit_hold = False
+                if not self._ik.last_solution_valid:
+                    position_limit_hold = bool(
+                        self._arm_armed
+                        and self._ik.solution_diagnostics.get(
+                            "recoverable_position_limit", False
+                        )
+                    )
+                    if position_limit_hold:
+                        self._position_limit_recovery_count = 0
+                        self._report_position_limit_hold(True)
+                    elif self._arm_armed:
+                        self._record_startup_event({
+                            "phase": "ik_geometry_rejected",
+                            "timestamp": time.time(),
+                            "monotonic_s": time.monotonic(),
+                            "diagnostics": dict(self._ik.solution_diagnostics),
+                            "current_urdf_rad": np.asarray(current, dtype=float).tolist(),
+                            "retarget_positions_m": {
+                                name: np.asarray(targets[name][:3], dtype=float).tolist()
+                                for name in (f"{self._arm_side}_elbow", f"{self._arm_side}_wrist")
+                            },
+                        })
+                        self._stop_full_arm_for_fault(
+                            f"IK geometry rejected: {self._ik.solution_diagnostics}")
+                        continue
+                    else:
+                        continue
+                else:
+                    position_limit_hold = self._position_limit_recovery_pending(
+                        self._ik.solution_diagnostics
+                    )
+                    if not position_limit_hold:
+                        self._position_limit_recovery_count = 0
+                        self._report_position_limit_hold(False)
+                        self._report_workspace_limit()
+                stage_start = time.monotonic()
+                if self._driver is not None and self._arm_armed:
+                    commanded = (
+                        self._driver.hold_command_trajectory()
+                        if position_limit_hold
+                        else self._driver.command_full_urdf(arm_targets)
+                    )
+                    if position_limit_hold and commanded:
+                        held = self._driver.last_commanded_full_urdf()
+                        if held is not None:
+                            arm_targets = held
+                    if not commanded and not self._command_rejected:
+                        reason = getattr(self._driver, "safety_fault_reason", None)
+                        print(
+                            f"[teleop] command rejected: {reason or 'invalid/missing arm feedback'}.",
+                            flush=True,
+                        )
+                    if not commanded and self._arm_only:
+                        self._arm_armed = False
+                        self._manual_intervention_required = True
+                        if self._trajectory_active() and getattr(self, "_arm_with_hand", False) and self._hand is not None:
+                            self._hand.set_enabled(False)
+                            self._hand_enabled = False
+                        fault_context = (getattr(self._driver, "trajectory_diagnostics", None) or {}).get("fault_context", {})
+                        controller_stop = fault_context.get("controller_stop")
+                        if controller_stop:
+                            stop_text = (
+                                "Electronic stop send returned; controller stop and motor disable are not yet verified. "
+                                if controller_stop.get("send_returned") else
+                                "ELECTRONIC STOP SEND FAILED; use the physical emergency stop. "
+                            )
+                        else:
+                            stop_text = (
+                                "No zero target or disable command was sent. The last controller target "
+                                "is retained and may still execute; stopping target updates does not prove standstill. "
+                            )
+                        print(
+                            f"[teleop] {self._arm_side.upper()} ARM SAFETY STOP: "
+                            f"{getattr(self._driver, 'safety_fault_reason', None) or 'feedback invalid'}; "
+                            f"Following is locked. {stop_text}"
+                            "Keep supporting the arm; 'd' requests disable, 'x' requests E-stop. "
+                            "Clear the fault before requesting recovery with 'z'.",
+                            flush=True,
+                        )
+                    self._command_rejected = not commanded
+                self._cycle_timings["driver_command_ms"] = (time.monotonic() - stage_start) * 1000
+                self._cycle_timings["control_before_diagnostics_ms"] = (time.monotonic() - frame_start) * 1000
+                packet_time = self._body._last_body_frame_packet_time_monotonic
+                self._cycle_timings["body_packet_age_ms"] = None if packet_time is None else (time.monotonic() - packet_time) * 1000
+                self._publish_arm_diagnostics(targets, arm_targets, current)
 
             elapsed = time.monotonic() - frame_start
+            self._previous_cycle_work_ms = elapsed * 1000
             if elapsed < loop_dt:
                 time.sleep(loop_dt - elapsed)
 
         self.close()
+
+    def _position_limit_recovery_pending(self, diagnostics: dict) -> bool:
+        """Require a short geometric hysteresis before leaving a limit hold."""
+        if not getattr(self, "_position_limit_hold_active", False):
+            return False
+        geometry_error = max(
+            float(diagnostics.get("elbow_error_m", float("inf"))),
+            float(diagnostics.get("wrist_error_m", float("inf"))),
+        )
+        if geometry_error <= self._cfg.ik.position_limit_recovery_error_m:
+            self._position_limit_recovery_count = (
+                getattr(self, "_position_limit_recovery_count", 0) + 1
+            )
+        else:
+            self._position_limit_recovery_count = 0
+        return (
+            self._position_limit_recovery_count
+            < self._cfg.ik.position_limit_recovery_frames
+        )
+
+    def _report_position_limit_hold(self, active: bool):
+        """Report a recoverable pause at a measured commissioned joint bound."""
+        active = bool(active)
+        if active == getattr(self, "_position_limit_hold_active", False):
+            return
+        self._position_limit_hold_active = active
+        diagnostics = dict(getattr(self._ik, "solution_diagnostics", {}) or {})
+        if active:
+            bounds = diagnostics.get("active_position_bounds", [])
+            summary = ", ".join(
+                f"J{item['joint']} {item['bound']} "
+                f"({np.degrees(item['limit_rad']):.1f}deg)"
+                for item in bounds
+            ) or "commissioned joint bound"
+            print(
+                f"[teleop] {self._arm_side.upper()} TARGET PAUSED at {summary}: "
+                "controlled braking/hold is active; move the PICO arm back into "
+                "the reachable workspace to resume automatically.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[teleop] {self._arm_side.upper()} target returned inside the "
+                "commissioned joint workspace; following resumed.",
+                flush=True,
+            )
+        self._record_startup_event(dict(
+            phase=("ik_position_limit_hold" if active
+                   else "ik_position_limit_recovered"),
+            timestamp=time.time(), monotonic_s=time.monotonic(),
+            diagnostics=diagnostics,
+        ))
+
+    def _report_workspace_limit(self):
+        """Report input saturation separately from IK failure, once per transition."""
+        if not self._arm_armed or not getattr(self, "_arm_only", False):
+            return
+        diagnostics = getattr(self._ik, "solution_diagnostics", {})
+        if not isinstance(diagnostics, dict):
+            return
+        limited = bool(diagnostics.get("workspace_limited", False))
+        if limited == getattr(self, "_workspace_limit_active", False):
+            return
+        self._workspace_limit_active = limited
+        if limited:
+            print(
+                f"[teleop] {self._arm_side.upper()} TARGET LIMITED: requested bend "
+                f"{diagnostics['requested_bend_deg']:.1f}deg exceeds the wrist-dependent "
+                f"reachable bend {diagnostics['bend_limit_deg']:.1f}deg; "
+                f"J4 stays within {diagnostics['j4_upper_limit_deg']:.1f}deg. "
+                "Following continues with the bounded target.", flush=True,
+            )
+        else:
+            print(f"[teleop] {self._arm_side.upper()} target returned inside the elbow workspace.", flush=True)
+        self._record_startup_event(dict(
+            phase="ik_workspace_limited" if limited else "ik_workspace_recovered",
+            timestamp=time.time(), monotonic_s=time.monotonic(), diagnostics=dict(diagnostics)))
+
+    def _record_startup_event(self, event):
+        probe = getattr(self, "_arm_probe", None)
+        if probe is not None:
+            probe.submit(dict(event, event="startup_phase"))
+        if self._startup_writer is None:
+            path = self._elbow_log_path.with_name(self._elbow_log_path.name.replace("pico_elbow", "pico_startup"))
+            self._startup_writer = AsyncJsonLog(path)
+            print(f"[teleop] startup diagnostic log: {path}", flush=True)
+        self._startup_writer.submit(dict(event, side=self._arm_side))
 
     def _publish_arm_diagnostics(
         self, targets: dict[str, np.ndarray], ik_targets: np.ndarray, feedback: np.ndarray
@@ -1283,12 +2024,82 @@ class TeleopNode:
                 f"{side}_elbow": {"pos": targets[f"{side}_elbow"][:3].tolist()},
                 f"{side}_wrist": {"pos": targets[f"{side}_wrist"][:3].tolist()},
             }
+
+            def position_errors(reference, actual):
+                if reference is None or actual is None:
+                    return None
+                shoulder = np.asarray(reference[f"{side}_shoulder"][:3], dtype=float)
+                ref_elbow = np.asarray(reference[f"{side}_elbow"][:3], dtype=float)
+                ref_wrist = np.asarray(reference[f"{side}_wrist"][:3], dtype=float)
+                act_elbow = np.asarray(actual[f"{side}_elbow"][:3], dtype=float)
+                act_wrist = np.asarray(actual[f"{side}_wrist"][:3], dtype=float)
+
+                def direction_error(a, b):
+                    a_norm = np.linalg.norm(a)
+                    b_norm = np.linalg.norm(b)
+                    if a_norm <= 1.0e-9 or b_norm <= 1.0e-9:
+                        return None
+                    cosine = np.clip(np.dot(a, b) / (a_norm * b_norm), -1.0, 1.0)
+                    return float(np.degrees(np.arccos(cosine)))
+
+                return {
+                    "elbow_cm": float(100.0 * np.linalg.norm(act_elbow - ref_elbow)),
+                    "wrist_cm": float(100.0 * np.linalg.norm(act_wrist - ref_wrist)),
+                    "upper_deg": direction_error(ref_elbow - shoulder, act_elbow - shoulder),
+                    "forearm_deg": direction_error(
+                        ref_wrist - ref_elbow, act_wrist - act_elbow
+                    ),
+                }
+
+            reference_poses = {
+                f"{side}_shoulder": feedback_poses[f"{side}_shoulder"],
+                f"{side}_elbow": targets[f"{side}_elbow"],
+                f"{side}_wrist": targets[f"{side}_wrist"],
+            }
             offset = 0 if side == "left" else 7
+            elbow_diagnostic = self._body.elbow_diagnostics(side)
+            if elbow_diagnostic is not None:
+                elbow_diagnostic = dict(elbow_diagnostic)
+                points = {name: reference_poses[f"{side}_{name}"][:3]
+                          for name in ("shoulder", "elbow", "wrist")}
+                elbow_diagnostic.update(
+                    retarget_deg=float(np.degrees(BodyDevice._points_flexion(points))),
+                    ik_j4_deg=float(np.degrees(ik_targets[offset + 3])),
+                    last_sent_j4_deg=None if commanded is None else float(np.degrees(commanded[offset + 3])),
+                    feedback_j4_deg=float(np.degrees(feedback[offset + 3])),
+                    solver=getattr(self._ik, "_last_elbow_solve_diagnostics", {}).get(side),
+                    driver=getattr(self._driver, "elbow_command_diagnostics", None),
+                )
+            retarget_pipeline = None
+            retarget_reader = getattr(self._body, "arm_retarget_diagnostics", None)
+            if callable(retarget_reader):
+                candidate_pipeline = retarget_reader(side)
+                if isinstance(candidate_pipeline, dict):
+                    retarget_pipeline = candidate_pipeline
             message = {
                 "timestamp": time.time(),
                 "side": side,
                 "armed": bool(self._arm_armed),
                 "command_accepted": not self._command_rejected,
+                "command_skipped_duplicate_feedback": getattr(self._driver, "last_command_skip_reason", None) == "duplicate_feedback",
+                "command_skip_reason": getattr(self._driver, "last_command_skip_reason", None),
+                "elbow": elbow_diagnostic,
+                "retarget_pipeline": retarget_pipeline,
+                "ik_solver": dict(getattr(self._ik, "solution_diagnostics", {})),
+                "trajectory": getattr(self._driver, "trajectory_diagnostics", None),
+                # Full startup snapshots are already persisted once in the
+                # startup log.  Repeating them in every ~10 Hz arm diagnostic
+                # row made a short fault-latched session grow by tens of MB.
+                "startup_events": [
+                    {
+                        key: event[key]
+                        for key in ("timestamp", "phase", "event", "reason")
+                        if key in event
+                    }
+                    for event in getattr(self._driver, "startup_events", [])[-8:]
+                    if isinstance(event, dict)
+                ],
+                "timings": dict(getattr(self, "_cycle_timings", {})),
                 "frames": {
                     "retarget": target_frames,
                     "ik": frames_from(ik_poses),
@@ -1300,23 +2111,63 @@ class TeleopNode:
                     "command": None if commanded is None else np.degrees(commanded[offset:offset + 7]).tolist(),
                     "feedback": np.degrees(feedback[offset:offset + 7]).tolist(),
                 },
+                "errors": {
+                    "ik_vs_retarget": position_errors(reference_poses, ik_poses),
+                    "command_vs_retarget": position_errors(reference_poses, commanded_poses),
+                    "feedback_vs_retarget": position_errors(reference_poses, feedback_poses),
+                },
             }
-            payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
+            log_path = getattr(self, "_elbow_log_path", None)
+            if log_path is not None:
+                if getattr(self, "_diagnostic_writer", None) is None:
+                    self._diagnostic_writer = AsyncJsonLog(log_path)
+                    print(f"[teleop] arm diagnostic log: {log_path}", flush=True)
+                message["log_dropped"] = self._diagnostic_writer.dropped
+                self._diagnostic_writer.submit(message)
+            payload = json.dumps(message, separators=(",", ":"), allow_nan=False,
+                                 default=numpy_json_default).encode("utf-8")
             self._arm_diagnostics_socket.sendto(payload, ("127.0.0.1", 15060))
         except (KeyError, TypeError, ValueError, OSError):
             return
 
     def close(self) -> None:
         self._stop = True
+        worker = getattr(self, "_return_thread", None)
+        if worker is not None and worker.is_alive():
+            self._driver.cancel_return()
+            worker.join()  # Cancellation is polled by bounded planner/control loops.
+            self._manual_intervention_required = True
+        startup_writer = getattr(self, "_startup_writer", None)
+        if startup_writer is not None:
+            startup_writer.close()
+        writer = getattr(self, "_diagnostic_writer", None)
+        if writer is not None:
+            writer.close()
         if self._wrist_imu_side and self._driver is not None and self._motors_enabled:
             self._return_wrist_to_zero_and_disable("program exit")
         elif (
             getattr(self, "_arm_only", False)
             and self._driver is not None
             and self._motors_enabled
+            and not getattr(self, "_manual_intervention_required", False)
+            and not getattr(self._driver, "_return_inhibited", False)
         ):
-            self._return_full_arm_to_zero_and_disable("program exit")
-        if self._return_hand_open_on_close:
+            if sys.stdin.isatty():
+                old_key = getattr(self, "_key_thread", None)
+                if old_key is not None:
+                    old_key.join(timeout=.2)
+                self._stop = False
+                if old_key is None or not old_key.is_alive():
+                    self._key_thread = threading.Thread(target=self._key_loop, daemon=True)
+                    self._key_thread.start()
+                self._start_full_arm_return("program exit")
+                worker = getattr(self, "_return_thread", None)
+                if worker is not None:
+                    worker.join()
+                self._stop = True
+            else:
+                print("[teleop] Exit return skipped without interactive stop control; following locked.", flush=True)
+        if self._return_hand_open_on_close and not getattr(self, "_arm_only", False):
             self._return_hand_open_on_close = False
             try:
                 opened = self._hand is not None and self._hand.return_to_open()
@@ -1342,6 +2193,11 @@ class TeleopNode:
         except Exception:  # noqa: BLE001
             pass
         if self._driver is not None:
+            probe = getattr(self, "_arm_probe", None)
+            if probe is not None:
+                self._driver.probe_sink = None
+                probe.close()
+                self._arm_probe = None
             try:
                 self._driver.disconnect()
             except Exception:  # noqa: BLE001
@@ -1357,6 +2213,29 @@ def project_root() -> str:
     return os.path.dirname(os.path.dirname(here))
 
 
+def _run_until_safe_exit(node: TeleopNode) -> None:
+    """Keep Ctrl-C from disconnecting a fault-latched, still-enabled arm."""
+    while True:
+        try:
+            node.run()
+        except KeyboardInterrupt:
+            if getattr(node, "_startup_power_cycle_required", False) is True:
+                if node._exit_for_startup_power_cycle("Ctrl-C after startup feedback failure"):
+                    return
+                node._stop = False
+                continue
+            if node._enabled_fault_requires_explicit_disable():
+                node._stop = False
+                node._report_enabled_fault_exit_refusal("INTERRUPT EXIT")
+                continue
+            return
+        if node._enabled_fault_requires_explicit_disable():
+            node._stop = False
+            node._report_enabled_fault_exit_refusal("EXIT")
+            continue
+        return
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ESROBO real-machine teleoperation")
     parser.add_argument("--no-robot", action="store_true", help="run IK/hand without commanding arms")
@@ -1366,7 +2245,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--arm-only",
         action="store_true",
-        help="PICO full-arm teleoperation without initializing either LinkerHand",
+        help="single-side PICO full-arm teleoperation (optionally with --with-hand)",
     )
     parser.add_argument(
         "--arm-side",
@@ -1449,7 +2328,7 @@ def main(argv: list[str] | None = None) -> int:
             if node._hand is not None:
                 node._hand_enabled = node._hand.set_enabled(True)
             node._arm_armed = node._arm_robot()
-        node.run()
+        _run_until_safe_exit(node)
     except KeyboardInterrupt:
         pass
     except Exception as exc:  # noqa: BLE001
