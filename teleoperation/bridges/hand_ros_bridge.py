@@ -111,7 +111,10 @@ def main(argv=None) -> int:
     finally:
         node.close()
         node.destroy_node()
-        rclpy.shutdown()
+        # ROS signal handling may already have shut the default context down.
+        # Avoid an RCLError during otherwise clean launcher cleanup.
+        if rclpy.ok():
+            rclpy.shutdown()
     return 0
 
 

@@ -487,6 +487,7 @@ class TeleopNode:
                 "startup zero check failed: fresh LinkerHand joint feedback is unavailable"
             )
 
+        linked_uncalibrated: list[str] = []
         for side, error in hand_errors.items():
             command_target = (
                 self._cfg.hand.left_open if side == "left" else self._cfg.hand.right_open
@@ -501,12 +502,40 @@ class TeleopNode:
                 dtype=np.float64,
             )
             current = target + error
-            print(
-                f"[teleop ZERO] {side} hand current={np.rint(current).astype(int).tolist()} "
-                f"target(open-feedback-zero)={np.rint(target).astype(int).tolist()} "
-                f"max_error={float(np.max(np.abs(error))):.1f}/255.",
-                flush=True,
+            calibrated = (
+                not getattr(self, "_arm_with_hand", False)
+                or self._hand.open_feedback_calibrated(side)
             )
+            if calibrated:
+                print(
+                    f"[teleop ZERO] {side} hand current={np.rint(current).astype(int).tolist()} "
+                    f"target(open-feedback-zero)={np.rint(target).astype(int).tolist()} "
+                    f"max_error={float(np.max(np.abs(error))):.1f}/255.",
+                    flush=True,
+                )
+            else:
+                linked_uncalibrated.append(side)
+                print(
+                    f"[teleop ZERO] {side} hand current={np.rint(current).astype(int).tolist()} "
+                    "target(open-feedback-zero)=UNCONFIGURED; read-only measurement.",
+                    flush=True,
+                )
+
+        if getattr(self, "_arm_with_hand", False):
+            if linked_uncalibrated:
+                measured = {
+                    side: np.rint(
+                        self._hand.open_feedback_target(side) + hand_errors[side]
+                    ).astype(int).tolist()
+                    for side in linked_uncalibrated
+                }
+                raise RuntimeError(
+                    "linked startup refused before motion: independent natural-open "
+                    f"feedback zero is missing for {linked_uncalibrated}; measured={measured}. "
+                    "Record repeated supported natural-open feedback and configure the "
+                    "matching *_open_feedback value; command endpoints are not feedback "
+                    "calibration. No hand alignment, arm enable, or position command was sent."
+                )
 
         arm_ok = True
         arm_current: np.ndarray | None = None
@@ -698,6 +727,8 @@ class TeleopNode:
                     return
                 if ch == "q":
                     self._quit_after_return = True
+                    if getattr(self, "_arm_with_hand", False):
+                        self._open_hand_after_return = True
                     print(
                         "[teleop] Safe return or arming cancellation is still in progress; "
                         "q keeps the pending exit active. Use s to cancel, d to disable, "
@@ -720,6 +751,8 @@ class TeleopNode:
                 return
             if ch in ("s", "q", "z"):
                 if ch == "q" and not self._motors_enabled and not fault_latched:
+                    if getattr(self, "_arm_with_hand", False):
+                        self._return_linked_hand_to_open()
                     self._stop = True
                     return
                 recover = ch == "z" or (ch == "q" and fault_latched)
@@ -731,7 +764,14 @@ class TeleopNode:
                         flush=True,
                     )
                 self._start_full_arm_return(
-                    f"operator pressed '{ch}'", recover=recover, quit_after=ch == "q")
+                    f"operator pressed '{ch}'",
+                    recover=recover,
+                    quit_after=ch == "q",
+                    open_hand_after=(
+                        getattr(self, "_arm_with_hand", False)
+                        and ch in ("s", "q")
+                    ),
+                )
                 return
             if ch == "h" and not getattr(self, "_arm_with_hand", False):
                 print("[teleop] Hand feedback is read-only in arm-only mode.", flush=True)
@@ -1046,23 +1086,67 @@ class TeleopNode:
         )
         return True
 
-    def _start_full_arm_return(self, reason, *, recover=False, quit_after=False):
+    def _return_linked_hand_to_open(self) -> bool:
+        """Open the linked hand only after arm disable has been verified."""
+        if not getattr(self, "_arm_with_hand", False) or self._hand is None:
+            return True
+        self._hand.set_enabled(False)
+        self._hand_enabled = False
+        try:
+            opened = bool(self._hand.return_to_open())
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[teleop] LINKED HAND OPEN FAILED: {type(exc).__name__}: {exc}; "
+                "hand following remains disabled.",
+                flush=True,
+            )
+            return False
+        print(
+            "[teleop] LINKED HAND RETURNED TO NATURAL OPEN POSE."
+            if opened
+            else "[teleop] LINKED HAND OPEN SKIPPED: fresh hand feedback unavailable; "
+                 "hand following remains disabled.",
+            flush=True,
+        )
+        return opened
+
+    def _start_full_arm_return(
+        self,
+        reason,
+        *,
+        recover=False,
+        quit_after=False,
+        open_hand_after=False,
+    ):
         """Keep the keyboard responsive while planning/executing a return."""
         if self._driver is None:
             return
+        if getattr(self, "_arm_with_hand", False) and self._hand is not None:
+            # Freeze the fingers before the arm starts planning. Opening is
+            # deferred until arm zero and seven-joint disable are both verified.
+            self._hand.set_enabled(False)
+            self._hand_enabled = False
         if not recover and getattr(self, "_manual_intervention_required", False):
             print("[teleop] Return inhibited by fault; clear the fault before explicit z recovery.", flush=True)
             return
         if not recover and not getattr(self, "_motors_enabled", True):
             print("[teleop] Arm already disabled; no return motion requested.", flush=True)
+            if open_hand_after:
+                self._return_linked_hand_to_open()
+            if quit_after:
+                self._stop = True
             return
         worker = getattr(self, "_return_thread", None)
         if worker is not None and worker.is_alive():
             if quit_after:
                 self._quit_after_return = True
+            if open_hand_after:
+                self._open_hand_after_return = True
             return
         if quit_after:
             self._quit_after_return = True
+        if open_hand_after:
+            self._open_hand_after_return = True
         self._arm_armed = False
         self._manual_intervention_required = True
         self._hand_enabled = False
@@ -1080,7 +1164,10 @@ class TeleopNode:
                 pending_exit = bool(
                     quit_after or getattr(self, "_quit_after_return", False)
                 )
-                if pending_exit and result.returned and result.disabled:
+                completed = bool(result.returned and result.disabled)
+                if completed and getattr(self, "_open_hand_after_return", False):
+                    self._return_linked_hand_to_open()
+                if pending_exit and completed:
                     self._stop = True
                 print(f"[teleop] {reason}: {result.stage}: {result.reason or 'zero verified'}", flush=True)
             except Exception as exc:
@@ -1088,6 +1175,7 @@ class TeleopNode:
                 print(f"[teleop] Return failed: {exc}; following locked.", flush=True)
             finally:
                 self._quit_after_return = False
+                self._open_hand_after_return = False
         self._return_thread = threading.Thread(target=run, name="safe-arm-return", daemon=True)
         self._return_thread.start()
 
@@ -1183,8 +1271,19 @@ class TeleopNode:
         if geometry:
             print(f"[teleop] Startup geometry diagnostics: {geometry}", flush=True)
         if failure['stage'] == "geometry":
-            print("[teleop] Check fresh hand-state feedback and verified feedback-to-URDF calibration; "
-                  "do not bypass the collision guard. Power-cycling does not resolve this preflight rejection.", flush=True)
+            if (getattr(self, "_arm_with_hand", False)
+                    and geometry.get("calibrated_hand_joints") == 0):
+                print(
+                    "[teleop] LINKED ARMING BLOCKED: no verified hand-feedback-to-URDF "
+                    "calibration is configured, so collision checking used the complete "
+                    "finger motion envelope. Collect and verify the active hand calibration; "
+                    "do not substitute command endpoints or bypass the collision guard. "
+                    "Power-cycling does not resolve this preflight rejection.",
+                    flush=True,
+                )
+            else:
+                print("[teleop] Check fresh hand-state feedback and verified feedback-to-URDF calibration; "
+                      "do not bypass the collision guard. Power-cycling does not resolve this preflight rejection.", flush=True)
 
     def _arm_robot(self) -> bool:
         if getattr(self, "_startup_power_cycle_required", False):

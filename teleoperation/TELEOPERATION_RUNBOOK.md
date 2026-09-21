@@ -1,5 +1,16 @@
 # ESROBO 遥操作运行手册
 
+> **当前主机稳定性说明（2026-09-21）**：左手联合启动期间，Fast DDS 的
+> `libfastrtps.so.2.6.11` 已发生过进程级 general protection fault，随后同一次启动出现整机失联。
+> SenseGlove 联合入口因此默认统一使用 Cyclone DDS。首次运行前安装：
+>
+> ```bash
+> sudo apt-get install -y ros-humble-rmw-cyclonedds-cpp
+> ```
+>
+> 启动输出必须显示 `ROS 2 middleware: rmw_cyclonedds_cpp`。该切换绕开已观测到的 Fast DDS
+> 崩溃路径，但不能替代内存/主板稳定性检查；在硬件检查完成前只做有人托扶的小范围调试。
+
 > 最近整理：2026-09-21
 > 面向对象：第一次接触本项目、需要在机器人主机上启动现有遥操作模式的操作者
 
@@ -248,6 +259,36 @@ tmux new -s pico_left_arm_hand
 cd /home/esrobo/Projects/esrobo/teleoperation
 ./scripts/run_pico_left_arm_hand_teleop.sh --left-serial 00885
 ```
+
+联合模式默认沿用左灵巧手单独遥操作已经使用的自然张开零位
+`[255,255,255,255,255,255,128,128,128,128]`。程序会先限速回到该姿态并核验反馈，
+通过后才允许继续使能左臂。
+
+需要重新核对或替换该零位时，确认 `can_hand2` 已按第 4 节配置，然后在第一个终端启动
+`move_on_start=false` 的左手驱动：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/esrobo/Projects/esrobo/install/setup.bash
+ros2 run linker_hand_ros2_sdk linker_hand_sdk --ros-args \
+  -r __node:=linker_hand_sdk_left \
+  -p hand_type:=left -p hand_joint:=L10 -p is_touch:=false \
+  -p can:=can_hand2 -p move_on_start:=false -p modbus:=None
+```
+
+在第二个终端执行只读采集。该工具不会创建命令发布器，也不会驱动机械臂或灵巧手：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/esrobo/Projects/esrobo/install/setup.bash
+cd /home/esrobo/Projects/esrobo/teleoperation
+python3 scripts/capture_hand_open_feedback.py --side left
+```
+
+重新采集时让左手保持舒适自然张开。只有输出 `STABLE CANDIDATE` 才可把候选值人工核对后写入
+`config/teleop_config.yaml` 的 `left_open_feedback`；程序不会自动修改配置。这个数值只解决自然张开
+零位核对，不能替代活动手指的反馈到 URDF 几何标定。当前该几何标定尚未完成时，联合入口仍可能
+因完整手指包络与躯干相交而拒绝机械臂使能。
 
 ### 6.4 右臂＋右手
 

@@ -50,6 +50,9 @@ LEFT_ONLY=0; RIGHT_ONLY=0; LEFT_WRIST_IMU=0; RIGHT_WRIST_IMU=0
 PICO_ARM=0; PICO_ARM_HAND=0; PICO_ARM_SIDE=""
 IMU_CALIBRATION_MODE="${IMU_CALIBRATION_MODE:-static-orthogonal}"
 IMU_BRIDGE_ARGS=()
+# Fast DDS crashed inside libfastrtps while starting the SenseGlove ROS graph
+# on this host. Keep every ROS process launched here on one explicit RMW.
+SENSEGLOVE_RMW_IMPLEMENTATION="${SENSEGLOVE_RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -183,6 +186,14 @@ if [ -f "${ESROBO_WS}/install/setup.bash" ]; then source "${ESROBO_WS}/install/s
 if [ -f "${SENSEGLOVE_WS}/install/setup.bash" ]; then source "${SENSEGLOVE_WS}/install/setup.bash"; fi
 set -u
 
+if ! ros2 pkg prefix "${SENSEGLOVE_RMW_IMPLEMENTATION}" >/dev/null 2>&1; then
+  echo "ERROR: ROS 2 middleware ${SENSEGLOVE_RMW_IMPLEMENTATION} is not installed." >&2
+  echo "       Install ros-humble-rmw-cyclonedds-cpp before starting hardware." >&2
+  exit 2
+fi
+export RMW_IMPLEMENTATION="${SENSEGLOVE_RMW_IMPLEMENTATION}"
+echo "==> ROS 2 middleware: ${RMW_IMPLEMENTATION} (isolates the observed Fast DDS crash path)"
+
 start_bg() {  # name  cmd...
   local name="$1"; shift
   echo "==> 启动 [${name}]（日志: ${ROOT_DIR}/log/${name}.log）"
@@ -255,7 +266,7 @@ ensure_sensecom_headless() {
   fi
 
   echo "==> 以 SSH 无图形模式启动 SenseCom（避免 Unity/Xvfb 窗口崩溃）"
-  nohup setsid env DISPLAY="${display}" LIBGL_ALWAYS_SOFTWARE=1 \
+  nohup setsid nice -n 10 env DISPLAY="${display}" LIBGL_ALWAYS_SOFTWARE=1 \
     dbus-run-session -- "${SENSECOM_BIN}" -batchmode -nographics \
     -logFile "${ROOT_DIR}/log/sensecom.log" \
     > "${ROOT_DIR}/log/sensecom-launch.log" 2>&1 < /dev/null &
@@ -345,7 +356,11 @@ ensure_can() {  # interface  stable USB port path  device label
 
   echo "==> 配置${device_label} CAN：${iface} -> ${target}，1 Mbps"
   echo "    此步骤只初始化通信接口，不发送运动指令；如提示，请输入 sudo 密码。"
-  sudo modprobe can can_raw
+  # modprobe accepts one module name per invocation. Passing `can_raw` after
+  # `can` treats it as a parameter of the can module and produces
+  # "can: unknown parameter 'can_raw' ignored" in the kernel log.
+  sudo modprobe can
+  sudo modprobe can_raw
   sudo ip link set "${iface}" down
   if [ "${iface}" != "${target}" ]; then
     sudo ip link set "${iface}" name "${target}"
@@ -486,7 +501,10 @@ if [ "${NO_HW}" = "0" ] && \
         --release-leader-mode
     fi
     start_bg linker_hand_driver \
-      ros2 launch linker_hand_ros2_sdk linker_hand.launch.py
+      ros2 run linker_hand_ros2_sdk linker_hand_sdk --ros-args \
+        -r __node:=linker_hand_sdk_right \
+        -p hand_type:=right -p hand_joint:=L10 -p is_touch:=false \
+        -p can:=can_hand1 -p move_on_start:=false -p modbus:=None
   else
     start_bg linker_hand_driver \
       ros2 launch linker_hand_ros2_sdk linker_hand_double.launch.py

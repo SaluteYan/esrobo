@@ -335,6 +335,8 @@ class LinkerHandDriver:
 
     def open_feedback_target(self, side: str) -> np.ndarray:
         """Return measured feedback expected at the physical natural-open pose."""
+        if side not in self._active_sides:
+            raise ValueError(f"{side!r} is not an active LinkerHand side")
         command_target = self._cfg.left_open if side == "left" else self._cfg.right_open
         feedback_target = (
             self._cfg.left_open_feedback
@@ -343,6 +345,26 @@ class LinkerHandDriver:
         )
         values = feedback_target if len(feedback_target) == self._physical_count else command_target
         return np.asarray(values, dtype=np.float64)
+
+    def open_feedback_calibrated(self, side: str) -> bool:
+        """Whether *side* has an independent, complete open-feedback zero."""
+        if side not in self._active_sides:
+            raise ValueError(f"{side!r} is not an active LinkerHand side")
+        values = (
+            self._cfg.left_open_feedback
+            if side == "left"
+            else self._cfg.right_open_feedback
+        )
+        try:
+            target = np.asarray(values, dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            target.shape == (self._physical_count,)
+            and np.all(np.isfinite(target))
+            and np.all(target >= self._cfg.out_min)
+            and np.all(target <= self._cfg.out_max)
+        )
 
     def align_and_verify_open_pose(self) -> tuple[bool, dict[str, np.ndarray]]:
         """Smoothly command the configured open zero, then verify fresh feedback."""

@@ -1100,6 +1100,18 @@ class HandMappingTests(unittest.TestCase):
         finally:
             driver.close()
 
+    def test_left_only_feedback_gate_does_not_require_right_hand(self):
+        cfg = build_config().hand
+        cfg.feedback_udp_port = 0
+        driver = LinkerHandDriver(cfg, udp_port=9, active_sides=("left",))
+        try:
+            driver._feedback["left"] = np.full(10, 121.0)
+            driver._feedback_time["left"] = time.monotonic()
+            self.assertTrue(driver.set_enabled(True))
+            self.assertTrue(driver.is_enabled())
+        finally:
+            driver.close()
+
     def test_right_only_rejects_sdk_invalid_position_sentinel(self):
         cfg = build_config().hand
         cfg.feedback_udp_port = 0
@@ -1169,6 +1181,19 @@ class HandMappingTests(unittest.TestCase):
         self.assertTrue(aligned)
         np.testing.assert_array_equal(errors["right"], np.zeros(10))
         self.assertEqual(self.driver._cfg.right_open[0], 255)
+
+    def test_open_feedback_calibration_is_side_specific(self):
+        self.driver._cfg.left_open_feedback = []
+        self.driver._cfg.right_open_feedback = [
+            254, 210, 254, 254, 254, 254, 109, 109, 119, 33
+        ]
+
+        self.assertFalse(self.driver.open_feedback_calibrated("left"))
+        self.assertTrue(self.driver.open_feedback_calibrated("right"))
+
+    def test_open_feedback_calibration_rejects_invalid_values(self):
+        self.driver._cfg.left_open_feedback = [255] * 9 + [float("nan")]
+        self.assertFalse(self.driver.open_feedback_calibrated("left"))
 
     @staticmethod
     def _active_limits():
@@ -1578,7 +1603,29 @@ class TeleopQuitTests(unittest.TestCase):
         self.assertTrue(node._hand_enabled)
         self.assertIn("RIGHT ARM + RIGHT HAND LINKED FOLLOWING ENABLED", output.getvalue())
 
-    def test_right_linked_stop_pauses_hand_without_open_motion(self):
+    def test_left_linked_enable_reports_the_active_side(self):
+        node = TeleopNode.__new__(TeleopNode)
+        node._arm_with_hand = True
+        node._arm_side = "left"
+        node._arm_armed = False
+        node._hand_enabled = False
+        node._body = mock.Mock()
+        node._body.hand_joints.return_value = np.zeros(20)
+        node._hand = mock.Mock()
+        node._hand.feedback_ready.return_value = True
+        node._hand.set_enabled.return_value = True
+        node._arm_robot = mock.Mock(return_value=True)
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            node._handle_key("e")
+
+        self.assertTrue(node._arm_armed)
+        self.assertTrue(node._hand_enabled)
+        self.assertIn("LEFT ARM + LEFT HAND LINKED FOLLOWING ENABLED", output.getvalue())
+
+    def test_right_linked_stop_opens_hand_only_after_verified_arm_disable(self):
+        events = []
         node = TeleopNode.__new__(TeleopNode)
         node._arm_with_hand = True
         node._arm_only = True
@@ -1587,14 +1634,89 @@ class TeleopQuitTests(unittest.TestCase):
         node._arm_armed = True
         node._hand_enabled = True
         node._driver = mock.Mock()
-        node._driver.safe_return.return_value = ReturnResult(True, True, "disabling")
+        node._driver.safe_return.side_effect = (
+            lambda **_kwargs: events.append("arm_return_disabled")
+            or ReturnResult(True, True, "disabling")
+        )
         node._hand = mock.Mock()
+        node._hand.return_to_open.side_effect = lambda: events.append("hand_open") or True
         node._handle_key("s")
         node._return_thread.join(1.)
-        node._hand.set_enabled.assert_called_once_with(False)
+        self.assertEqual(events, ["arm_return_disabled", "hand_open"])
+        self.assertGreaterEqual(node._hand.set_enabled.call_count, 1)
         node._driver.safe_return.assert_called_once()
-        node._hand.return_to_open.assert_not_called()
+        node._hand.return_to_open.assert_called_once_with()
         self.assertFalse(node._hand_enabled)
+
+    def test_right_linked_return_failure_keeps_hand_frozen(self):
+        node = TeleopNode.__new__(TeleopNode)
+        node._stop = False
+        node._arm_armed = True
+        node._motors_enabled = True
+        node._manual_intervention_required = False
+        node._arm_with_hand = True
+        node._arm_only = True
+        node._arm_side = "right"
+        node._wrist_imu_side = None
+        node._driver = mock.Mock(safety_fault_reason=None)
+        node._driver.prepare_return.return_value = 7
+        node._driver.safe_return.return_value = ReturnResult(
+            False, False, "planning", "no path"
+        )
+        node._hand = mock.Mock()
+
+        node._handle_key("q")
+        node._return_thread.join(1.)
+
+        node._hand.set_enabled.assert_called_with(False)
+        node._hand.return_to_open.assert_not_called()
+        self.assertFalse(node._stop)
+        self.assertFalse(node._hand_enabled)
+
+    def test_right_linked_z_recovery_does_not_open_hand(self):
+        node = TeleopNode.__new__(TeleopNode)
+        node._stop = False
+        node._arm_armed = False
+        node._motors_enabled = True
+        node._manual_intervention_required = True
+        node._arm_with_hand = True
+        node._arm_only = True
+        node._arm_side = "right"
+        node._wrist_imu_side = None
+        node._driver = mock.Mock(safety_fault_reason="latched fault")
+        node._driver.prepare_return.return_value = 8
+        node._driver.safe_return.return_value = ReturnResult(
+            True, True, "disabling"
+        )
+        node._hand = mock.Mock()
+
+        node._handle_key("z")
+        node._return_thread.join(1.)
+
+        node._hand.set_enabled.assert_called_with(False)
+        node._hand.return_to_open.assert_not_called()
+        self.assertFalse(node._stop)
+        self.assertFalse(node._manual_intervention_required)
+
+    def test_right_linked_q_opens_hand_when_arm_is_already_disabled(self):
+        node = TeleopNode.__new__(TeleopNode)
+        node._stop = False
+        node._arm_armed = False
+        node._motors_enabled = False
+        node._manual_intervention_required = False
+        node._arm_with_hand = True
+        node._arm_only = True
+        node._arm_side = "right"
+        node._wrist_imu_side = None
+        node._driver = mock.Mock(safety_fault_reason=None)
+        node._hand = mock.Mock()
+        node._hand.return_to_open.return_value = True
+
+        node._handle_key("q")
+
+        node._hand.set_enabled.assert_called_with(False)
+        node._hand.return_to_open.assert_called_once_with()
+        self.assertTrue(node._stop)
 
     def test_full_arm_imu_compensation_removes_shoulder_rotation(self):
         node = TeleopNode.__new__(TeleopNode)
@@ -2047,6 +2169,32 @@ class TeleopQuitTests(unittest.TestCase):
         node._driver.enable.assert_not_called()
         node._driver.return_wrist_to_neutral.assert_not_called()
         node._hand.align_and_verify_open_pose.assert_not_called()
+
+    def test_left_linked_startup_refuses_uncalibrated_open_feedback_without_motion(self):
+        node = TeleopNode.__new__(TeleopNode)
+        node._cfg = build_config()
+        node._arm_only = False
+        node._arm_with_hand = True
+        node._wrist_imu_side = None
+        node._hand = mock.Mock()
+        node._hand.open_pose_status.return_value = (
+            False, {"left": np.full(10, -5.0)}
+        )
+        node._hand.open_feedback_calibrated.return_value = False
+        node._hand.open_feedback_target.return_value = np.asarray(
+            node._cfg.hand.left_open, dtype=np.float64
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            with self.assertRaisesRegex(
+                RuntimeError, "independent natural-open feedback zero"
+            ):
+                node._ensure_startup_zero_pose()
+
+        node._hand.align_and_verify_open_pose.assert_not_called()
+        node._hand.return_to_open.assert_not_called()
+        self.assertIn("target(open-feedback-zero)=UNCONFIGURED", output.getvalue())
 
     def test_startup_zero_gate_aligns_verifies_and_disables(self):
         node = TeleopNode.__new__(TeleopNode)

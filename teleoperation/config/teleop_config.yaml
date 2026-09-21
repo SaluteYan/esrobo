@@ -275,6 +275,11 @@ hand:
   # 6/7/8 finger spread, 9 thumb roll. Keep unverified spread/roll axes held.
   enabled_physical_joints: [0, 1, 2, 3, 4, 5, 9]
   left_open:   [255, 255, 255, 255, 255, 255, 128, 128, 128, 128]
+  # Compatibility zero from the established left-hand-only teleoperation path.
+  # That path uses left_open for startup/quit and treats it as the physical
+  # natural-open reference.  Keep a separate field so later measured feedback
+  # commissioning can replace it without changing the command endpoint.
+  left_open_feedback: [255, 255, 255, 255, 255, 255, 128, 128, 128, 128]
   left_closed: [0,   0,   0,   0,   0,   0,   128, 128, 128, 128]
   right_open:   [255, 210, 255, 255, 255, 255, 110, 110, 120, 33]
   # Measured right-hand feedback at the physical natural-open pose.  Keep this
