@@ -36,6 +36,7 @@ __pycache__/
 # Local environment and editor files
 .env
 .env.*
+.venv-robot-link/
 .vscode/
 .idea/
 .DS_Store

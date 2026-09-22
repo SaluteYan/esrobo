@@ -868,7 +868,7 @@ class NeroDualArmDriver:
             )
         return True
 
-    def _capture_arm_torque_baseline(self, arm: NeroArm, side: str) -> bool:
+    def _capture_arm_torque_baseline(self, arm: NeroArm, side: str, *, cancelled=None) -> bool:
         if not bool(self._cfg.torque_monitor_enabled):
             return True
         settle_s = max(0.0, float(self._cfg.torque_baseline_settle_s))
@@ -878,11 +878,20 @@ class NeroDualArmDriver:
                 "before torque baseline capture; PICO following has not started.",
                 flush=True,
             )
-            time.sleep(settle_s)
+            if cancelled is None:
+                time.sleep(settle_s)
+            else:
+                settle_deadline = time.monotonic() + settle_s
+                while time.monotonic() < settle_deadline:
+                    if cancelled():
+                        return False
+                    time.sleep(min(0.02, max(0.0, settle_deadline - time.monotonic())))
         required = max(3, int(self._cfg.torque_baseline_samples))
         deadline = time.monotonic() + max(0.5, float(self._cfg.torque_baseline_timeout_s))
         samples = []
         while len(samples) < required and time.monotonic() < deadline:
+            if cancelled is not None and cancelled():
+                return False
             value = arm.get_joint_torques()
             if value is not None:
                 samples.append(value)
@@ -1931,7 +1940,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
         self._command_velocity[self._side] = np.zeros(NERO_NUM_JOINTS, dtype=np.float64)
         return True
 
-    def enable(self) -> bool:
+    def enable(self, *, cancelled=None) -> bool:
         self.last_startup_failure = None
         if not self._return_active:
             self._return_cancel.clear()
@@ -1958,14 +1967,21 @@ class NeroSingleArmDriver(NeroDualArmDriver):
         self._safety_fault_reason = None
         if not self._configure_arm_collision_safety(self._arm, self._side):
             return False
+        if cancelled is not None and cancelled():
+            return False
         # Retain the measured-pose preload, but disabled-time commands may be
         # ignored. Confirm enable and reapply mode/hold below; the preload alone
         # is not proof that the controller replaced a previous session's target.
         self._arm.set_normal_mode()
         self._arm.set_motion_mode(self._cfg.command_mode)
+        if cancelled is not None and cancelled():
+            return False
         self._arm.move_j(joints.tolist())
         self.record_startup_event("position_preloaded", joints)
-        if not self._arm.enable():
+        enabled = self._arm.enable() if cancelled is None else self._arm.enable(cancelled=cancelled)
+        if not enabled:
+            return False
+        if cancelled is not None and cancelled():
             return False
         states = self._arm.get_joint_enable_states()
         if states is None or len(states) != NERO_NUM_JOINTS or not all(states):
@@ -1973,8 +1989,19 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             return False
         self._enabled = True
         self.record_startup_event("enable_confirmed", joints)
+        if cancelled is not None and cancelled():
+            return False
         self._arm.move_j(joints.tolist())
-        if self._capture_arm_torque_baseline(self._arm, self._side):
+        baseline_ok = (
+            self._capture_arm_torque_baseline(self._arm, self._side)
+            if cancelled is None else
+            self._capture_arm_torque_baseline(self._arm, self._side, cancelled=cancelled)
+        )
+        if cancelled is not None and cancelled():
+            # The gateway owns the stop policy; cancellation must not silently
+            # remove motor support or start a return.
+            return False
+        if baseline_ok:
             self.record_startup_event("torque_settled", joints)
             return True
         disabled = self._arm.disable()

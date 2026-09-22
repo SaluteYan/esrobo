@@ -495,6 +495,60 @@ class LinkerHandDriver:
         with self._feedback_lock:
             self._command_locked(hand_joints)
 
+    def feedback_snapshot(self, side: str) -> dict:
+        """Read-only copy for network telemetry; no invented feedback values."""
+        if side not in self._active_sides:
+            raise ValueError("inactive hand side")
+        with self._feedback_lock:
+            self._poll_feedback_locked()
+            value, stamp = self._feedback[side], self._feedback_time[side]
+            return {
+                "position_unit": None if value is None else value.tolist(),
+                "age_s": None if stamp is None else max(0.0, time.monotonic() - stamp),
+            }
+
+    def command_physical(self, side: str, values) -> bool:
+        """Already mapped L10 targets, still subject to local limits/feedback.
+
+        Used by the robot link: retargeting and radians-to-servo mapping live
+        on the laptop, while uncommissioned axes and rate limits remain local.
+        """
+        return self._command_physical_targets({side: values})
+
+    def command_physical_batch(self, targets: dict) -> bool:
+        """Validate and publish both hands once under the shared rate limiter."""
+        if set(targets) != set(self._active_sides):
+            raise ValueError("batch must contain every active hand")
+        return self._command_physical_targets(targets)
+
+    def _command_physical_targets(self, targets: dict) -> bool:
+        checked = {}
+        for side, values in targets.items():
+            if side not in self._active_sides or self._physical_count != 10:
+                raise ValueError("network physical command requires an active L10 hand")
+            target = np.asarray(values, dtype=float)
+            if (target.shape != (10,) or not np.all(np.isfinite(target))
+                    or np.any(target < self._cfg.out_min) or np.any(target > self._cfg.out_max)):
+                raise ValueError("invalid physical hand target")
+            checked[side] = target.copy()
+        with self._feedback_lock:
+            if not self._enabled or not self._feedback_is_fresh():
+                self._enabled = False
+                return False
+            now = time.monotonic()
+            if now - self._last_sent_time < 1.0 / max(1.0, self._cfg.publish_hz):
+                return True
+            allowed = set(self._cfg.enabled_physical_joints)
+            commands = {key: value.copy() for key, value in self._last_cmd.items()}
+            for side, target in checked.items():
+                for index in range(10):
+                    if index not in allowed:
+                        target[index] = self._feedback[side][index]
+                commands[side] = self._apply_safety(side, target)
+            self._send_physical(commands["left"], commands["right"])
+            self._last_sent_time = now
+            return True
+
     def _command_locked(self, hand_joints: np.ndarray) -> None:
         """Command both hands from the 20-value teleop packet (radians)."""
         if not self._enabled:
