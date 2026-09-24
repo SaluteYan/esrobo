@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "esrobo-laptop-teleop"
+version = "0.1.0"
+description = "PICO/SenseGlove acquisition and IK client for the ESROBO robot gateway"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26,<3", "scipy>=1.14,<2", "PyYAML>=6", "pin>=3,<5", "paramiko>=3.5,<5"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+esrobo-laptop = "esrobo_laptop.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -29,6 +29,7 @@ class ServoDriver : public rclcpp::Node {
   const std::array<int, 2> lower_{1000, 2000}, upper_{2700, 5000};
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pub_;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr enable_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr torque_;
   rclcpp::Service<servo_driver::srv::HeadJog>::SharedPtr jog_;
   rclcpp::TimerBase::SharedPtr timer_;
 
@@ -180,6 +181,41 @@ public:
           fault_.clear(); adjusting_ = true; res->success = true;
           res->message = "adjustment enabled at measured pose; one small jog at a time";
         } catch (const std::exception & e) { lock(e.what()); res->message = fault_; }
+      });
+    torque_ = create_service<std_srvs::srv::SetBool>("/head/torque_enable",
+      [this](std_srvs::srv::SetBool::Request::SharedPtr req,
+             std_srvs::srv::SetBool::Response::SharedPtr res) {
+        if (req->data) {
+          res->success = false;
+          res->message = "torque enable is only allowed through /head/adjust_enable preflight";
+          return;
+        }
+        adjusting_ = false;
+        std::vector<std::string> errors;
+        for (int i = 0; i < 2; ++i) {
+          try {
+            exchange(i + 1, 3, {40, 0}, 0);
+            state_[i].pending = false;
+          } catch (const std::exception & e) {
+            errors.push_back("ID " + std::to_string(i + 1) + ": " + e.what());
+          }
+        }
+        refresh();
+        for (int i = 0; i < 2; ++i) {
+          if (!state_[i].valid || state_[i].torque != 0)
+            errors.push_back("ID " + std::to_string(i + 1) + " disable readback not verified");
+        }
+        if (errors.empty()) {
+          fault_.clear();
+          res->success = true;
+          res->message = "both head servos torque disabled and verified";
+        } else {
+          std::string message;
+          for (const auto & error : errors) message += (message.empty() ? "" : "; ") + error;
+          lock(message);
+          res->success = false;
+          res->message = message;
+        }
       });
     jog_ = create_service<servo_driver::srv::HeadJog>("/head/jog",
       [this](servo_driver::srv::HeadJog::Request::SharedPtr req,

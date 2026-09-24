@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import socket
 import time
 from urllib.request import urlopen, Request
@@ -108,6 +109,10 @@ def test_head_proxy_requires_same_origin_and_forwards_only_allowed_paths(monkeyp
             assert json.load(response)['ok']
         assert calls[0].full_url == 'http://127.0.0.1:8766/api/head/enable'
         assert calls[0].data == b'{"session":"testuser"}'
+        with urlopen(Request(base + '/api/head/disable', data=b'{"session":"testuser"}', headers={
+                'Origin': base, 'X-Head-Control': '1', 'Content-Type': 'application/json'})) as response:
+            assert json.load(response)['ok']
+        assert calls[1].full_url == 'http://127.0.0.1:8766/api/head/disable'
         with pytest.raises(HTTPError) as error:
             urlopen(base + '/api/head/enable')
         assert error.value.code == 404
@@ -138,3 +143,16 @@ def test_viewer_receives_arm_diagnostics_udp(tmp_path):
     finally:
         sender.close()
         server.stop()
+
+
+def test_viewer_page_keeps_selected_diagnostic_layer_while_waiting():
+    script = (Path(__file__).resolve().parents[1] / 'web/pico_skeleton_viewer/app.js').read_text()
+    assert 'mode = "raw";' in script  # Initial mode only.
+    assert script.count('mode = "raw";') == 1
+    assert '所选控制层暂无数据；请启动预览并等待完整输入' in script
+
+
+def test_skeleton_page_has_no_nested_camera_navigation():
+    page = (Path(__file__).resolve().parents[1] / 'web/pico_skeleton_viewer/index.html').read_text()
+    assert 'head.html' not in page
+    assert '头部相机' not in page

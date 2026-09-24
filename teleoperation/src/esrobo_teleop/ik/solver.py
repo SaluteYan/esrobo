@@ -109,6 +109,14 @@ class IkSolver:
             raise ValueError("IK position envelope does not intersect URDF limits")
         self._position_lower[sl], self._position_upper[sl] = lo, hi
 
+    def position_envelope(self, side):
+        """Return a defensive copy of the commissioned seven-joint envelope."""
+        if side not in ("left", "right"):
+            raise ValueError("invalid arm side")
+        offset = 0 if side == "left" else 7
+        sl = slice(offset, offset + 7)
+        return self._position_lower[sl].copy(), self._position_upper[sl].copy()
+
     def _report_solve_failure(self) -> None:
         """Report one state transition without flooding the operator terminal."""
         if self._solve_failure_active:
@@ -565,8 +573,14 @@ class IkSolver:
         """Return measured-configuration elbow/wrist poses for startup rebasing."""
         from ..math_utils import matrix_to_quat_wxyz
 
-        config = self._make_config(np.asarray(arm_joint_pos, dtype=np.float64))
-        self._pin.forwardKinematics(self._model, self._data, config.q)
+        # FK and bounded position IK need only Pinocchio. Keep Pink optional
+        # until the task-velocity solve path is actually selected.
+        joints = np.asarray(arm_joint_pos, dtype=np.float64)
+        if joints.shape != (14,) or not np.all(np.isfinite(joints)):
+            raise ValueError("FK requires fourteen finite arm joints")
+        q = np.zeros(self._model.nq, dtype=np.float64)
+        q[self._arm_q_indices] = np.clip(joints, self._arm_lower, self._arm_upper)
+        self._pin.forwardKinematics(self._model, self._data, q)
         self._pin.updateFramePlacements(self._model, self._data)
         frames = {
             "left_shoulder": self._cfg.left_shoulder_frame,
@@ -651,8 +665,6 @@ class IkSolver:
         ``current_arm_joint_pos`` must be the current measured joint angles of
         the 14 arm joints in the same order as :attr:`ARM_JOINT_NAMES`.
         """
-        from pink import solve_ik
-
         self.last_solution_valid = False
         self.solution_diagnostics = {}
 
@@ -668,6 +680,8 @@ class IkSolver:
                 left_wrist_pose if partitioned_side == "left" else right_wrist_pose,
                 terminal_joint_targets,
             )
+        from pink import solve_ik
+
         solve_seed = measured.copy()
         max_lead = max(0.0, float(self._cfg.max_command_lead))
         # Full-arm geometry and executable trajectory are different objects.

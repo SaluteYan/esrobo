@@ -391,6 +391,44 @@ class DriverTrajectoryTests(unittest.TestCase):
             self.assertEqual(driver.trajectory_diagnostics["feedback_snapshot"]["stamp_s"], 10.02)
             self.assertIsNone(driver._cycle_feedback)
 
+    def test_first_robot_link_cycle_seeds_verified_startup_snapshot(self):
+        driver = self.driver()
+        snapshot = JointFeedbackSnapshot(
+            self.current.copy(), 10.02, time.monotonic(), "get_joint_angles"
+        )
+        driver._arm._runtime_feedback = None
+
+        def seed_startup():
+            driver._arm._runtime_feedback = snapshot
+            return self.current.copy()
+
+        driver._arm.get_joint_angles.side_effect = seed_startup
+        driver._arm.runtime_feedback.return_value = snapshot
+        driver._arm.get_joint_angles.reset_mock()
+        driver._arm.runtime_feedback.reset_mock()
+        measured = driver.read_control_cycle_joints()
+        self.assertIsNotNone(measured)
+        driver._arm.get_joint_angles.assert_called_once()
+        driver._arm.runtime_feedback.assert_called_once()
+
+    def test_first_robot_link_cycle_keeps_missing_feedback_closed(self):
+        driver = self.driver()
+        driver._arm._runtime_feedback = None
+        driver._arm.get_joint_angles.return_value = None
+        driver._arm.get_joint_angles.side_effect = None
+        driver._arm.runtime_feedback.reset_mock()
+        driver.startup_event_sink = mock.Mock()
+        self.assertIsNone(driver.read_control_cycle_joints())
+        driver._arm.runtime_feedback.assert_not_called()
+        self.assertEqual(
+            driver.feedback_failure_diagnostics["reason"],
+            "no verified startup joint feedback",
+        )
+        self.assertEqual(
+            driver.startup_event_sink.call_args.args[0]["phase"],
+            "runtime_feedback_rejected",
+        )
+
     def test_expired_cycle_snapshot_locks_without_send(self):
         driver = self.driver()
         driver._cycle_feedback = JointFeedbackSnapshot(self.current.copy(), 10.02, time.monotonic() - .2, "get_joint_angles")

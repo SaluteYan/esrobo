@@ -232,9 +232,51 @@ class LinkerHandDriver:
         with self._feedback_lock:
             self._poll_feedback_locked()
             names = L10_PHYSICAL_JOINT_NAMES if self._model == "L10" else PHYSICAL_JOINT_ORDER
+            # When software hand output is disabled no hand target can change,
+            # so only feedback age and calibration error enlarge the measured
+            # pose.  Active following retains the full future-motion horizon.
+            effective_horizon = horizon if self._enabled else 0.0
             return geometry_state(self._feedback.get(side), self._geometry_feedback_time.get(side),
-                side, self._cfg.geometry_feedback_calibration, names, horizon,
+                side, self._cfg.geometry_feedback_calibration, names, effective_horizon,
                 self._cfg.geometry_feedback_timeout_s)
+
+    def geometry_calibration_status(self, side: str) -> dict:
+        """Describe whether collision geometry can use every physical actuator.
+
+        Natural-open feedback is a startup pose check.  It is deliberately not
+        counted here: moving an arm while its fingers can move requires the
+        independently verified feedback-to-URDF mapping for all ten axes.
+        """
+        if side not in self._active_sides:
+            raise ValueError(f"{side!r} is not an active LinkerHand side")
+        names = L10_PHYSICAL_JOINT_NAMES if self._model == "L10" else PHYSICAL_JOINT_ORDER
+        root = self._cfg.geometry_feedback_calibration
+        records = root.get(side, {}) if isinstance(root, dict) else {}
+        calibrated, invalid = [], []
+        for name in names:
+            item = records.get(name) if isinstance(records, dict) else None
+            try:
+                raw0, raw1 = item["raw"]
+                rad0, rad1 = item["rad"]
+                values = [raw0, raw1, rad0, rad1,
+                          item["error_rad"], item["max_velocity_rad_s"]]
+                valid = (item.get("verified") is True and np.all(np.isfinite(values))
+                         and raw0 != raw1 and item["error_rad"] > 0
+                         and item["max_velocity_rad_s"] > 0)
+            except (KeyError, TypeError, ValueError):
+                valid = False
+            if valid:
+                calibrated.append(name)
+            elif item is not None:
+                invalid.append(name)
+        missing = [name for name in names if name not in calibrated]
+        return {
+            "ready": not missing,
+            "calibrated_joints": len(calibrated),
+            "total_joints": len(names),
+            "missing_joints": missing,
+            "invalid_joints": invalid,
+        }
 
     def _feedback_is_fresh(self) -> bool:
         self._poll_feedback()
@@ -278,12 +320,13 @@ class LinkerHandDriver:
         right = np.asarray(self._cfg.right_open, dtype=np.float64)
         self._send_physical(left, right)
 
-    def return_to_open(self) -> bool:
+    def return_to_open(self, cancelled=None) -> bool:
         """Move active hands from fresh feedback to their natural open poses."""
+        cancelled = cancelled or (lambda: False)
         if not self._cfg.return_open_on_quit:
             self._enabled = False
             return True
-        if not self._feedback_is_fresh():
+        if cancelled() or not self._feedback_is_fresh():
             self._enabled = False
             return False
 
@@ -309,6 +352,9 @@ class LinkerHandDriver:
         left = self._last_cmd["left"].copy()
         right = self._last_cmd["right"].copy()
         for step in range(1, steps + 1):
+            if cancelled() or not self._feedback_is_fresh():
+                self._enabled = False
+                return False
             phase = step / steps
             blend = phase * phase * (3.0 - 2.0 * phase)
             if "left" in starts:
@@ -366,15 +412,18 @@ class LinkerHandDriver:
             and np.all(target <= self._cfg.out_max)
         )
 
-    def align_and_verify_open_pose(self) -> tuple[bool, dict[str, np.ndarray]]:
+    def align_and_verify_open_pose(self, cancelled=None) -> tuple[bool, dict[str, np.ndarray]]:
         """Smoothly command the configured open zero, then verify fresh feedback."""
-        if not self.return_to_open():
+        cancelled = cancelled or (lambda: False)
+        if not self.return_to_open(cancelled):
             return False, {}
         deadline = time.monotonic() + max(
             0.1, float(self._cfg.startup_open_verify_timeout_s)
         )
         status: tuple[bool, dict[str, np.ndarray]] = (False, {})
         while time.monotonic() < deadline:
+            if cancelled():
+                return False, status[1]
             status = self.open_pose_status()
             if status[0]:
                 return status
@@ -396,7 +445,7 @@ class LinkerHandDriver:
             for index in np.flatnonzero(np.abs(error) > tolerance):
                 details.append(
                     f"{side} {names[int(index)]}[{int(index)}] "
-                    f"current={current[index]:.0f} target={target[index]:.0f} "
+                    f"position={current[index]:.0f} target={target[index]:.0f} "
                     f"error={error[index]:+.0f}/255"
                 )
         return "; ".join(details)
@@ -505,6 +554,7 @@ class LinkerHandDriver:
             return {
                 "position_unit": None if value is None else value.tolist(),
                 "age_s": None if stamp is None else max(0.0, time.monotonic() - stamp),
+                "geometry": self.geometry_calibration_status(side),
             }
 
     def command_physical(self, side: str, values) -> bool:

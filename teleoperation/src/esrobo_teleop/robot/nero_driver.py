@@ -1628,6 +1628,20 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             return True
 
     def read_control_cycle_joints(self):
+        # The strict runtime reader intentionally refuses to operate until
+        # get_joint_angles() has accepted two consistent startup frames.  A
+        # robot-link backend connects while disabled and has no earlier
+        # calibration read to establish that snapshot, so seed it here using
+        # the same read-only validation before entering the runtime path.
+        if getattr(self._arm, "_runtime_feedback", None) is None:
+            if self.read_joints() is None:
+                self.feedback_failure_diagnostics = {
+                    "reason": "no verified startup joint feedback",
+                    "previous": None,
+                    "transient": True,
+                }
+                self.record_startup_event("runtime_feedback_rejected")
+                return None
         self._cycle_feedback = self._arm.runtime_feedback(
             max_age_s=self._cfg.command_trajectory_max_dt_s,
             recovery_timeout_s=self._cfg.runtime_feedback_recovery_timeout_s,

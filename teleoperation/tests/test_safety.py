@@ -673,6 +673,7 @@ class BodyReferencePromptTests(unittest.TestCase):
         device._reference_locked = False
         device._reference_start_time = None
         device._reference_prompt_key = None
+        device._reference_sample_times = []
         device._signs = np.ones(3, dtype=np.float32)
         points = {
             "shoulder": np.asarray([0.0, 0.0, 0.0]),
@@ -702,7 +703,30 @@ class BodyReferencePromptTests(unittest.TestCase):
         self.assertIn("PICO 手臂参考姿态标定", text)
         self.assertIn("秒后进入稳定缓冲", text)
         self.assertIn("正在采集参考姿态", text)
-        self.assertIn("自然下垂参考零点已锁定", text)
+        self.assertIn("胸前抬臂参考已锁定", text)
+
+    def test_reference_rejects_arms_hanging_at_sides(self):
+        device = self._device()
+        device._cfg.reference_min_upper_raise_deg = 35.0
+        device._cfg.reference_min_elbow_flexion_deg = 25.0
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            device._update_auto_reference(10.0)
+        self.assertFalse(device._reference_locked)
+        self.assertIsNone(device._reference_start_time)
+        self.assertIn("手臂仍接近身体侧面", output.getvalue())
+
+    def test_reference_accepts_raised_bent_arm_pose(self):
+        device = self._device()
+        device._cfg.reference_min_upper_raise_deg = 35.0
+        device._cfg.reference_min_elbow_flexion_deg = 25.0
+        device._cfg.reference_max_elbow_flexion_deg = 125.0
+        points = {
+            "shoulder": np.asarray([0.0, 0.0, 0.0]),
+            "elbow": np.asarray([0.3, 0.0, -0.3]),
+            "wrist": np.asarray([0.6, 0.0, -0.3]),
+        }
+        self.assertIsNone(device._reference_pose_rejection({"left": points}))
 
     def test_unstable_reference_restarts_full_countdown(self):
         device = self._device()
@@ -1164,7 +1188,7 @@ class HandMappingTests(unittest.TestCase):
         errors["right"][0] = -114.0
         detail = self.driver.describe_open_pose_errors(errors)
         self.assertIn("right thumb_cmc_pitch[0]", detail)
-        self.assertIn("current=141", detail)
+        self.assertIn("position=141", detail)
         self.assertIn("target=255", detail)
         self.assertNotIn("thumb_cmc_yaw", detail)
 

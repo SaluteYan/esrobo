@@ -16,19 +16,18 @@
       <div class="status-cluster">
         <span id="status-dot" class="status-dot waiting"></span>
         <strong id="status-text">等待骨架数据</strong>
-        <span id="freshness">-- ms</span>
         <span id="rate">-- Hz</span>
       </div>
       <div class="toolbar">
-        <a class="command" href="./head.html">头部相机</a>
         <select id="view-mode" aria-label="骨架数据层">
           <option value="raw">PICO 原始</option>
           <option value="robot">固定映射</option>
           <option value="retarget">重定向目标</option>
           <option value="ik">IK 结果</option>
-          <option value="command">限速命令</option>
+          <option value="command">计算输出</option>
           <option value="feedback">实际反馈</option>
         </select>
+        <span id="layer-status">原始采集层</span>
         <button id="pause" class="command" type="button">暂停</button>
         <button id="reset-camera" class="command" type="button">重置视角</button>
       </div>
@@ -78,9 +77,9 @@
       </section>
 
       <section>
-        <div class="section-heading"><h2>左臂关节角</h2><span>deg</span></div>
+        <div class="section-heading"><h2 id="joint-side-title">关节角</h2><span>deg</span></div>
         <table>
-          <thead><tr><th>关节</th><th>IK</th><th>命令</th><th>反馈</th></tr></thead>
+          <thead><tr><th>关节</th><th>IK</th><th>输出</th><th>反馈</th></tr></thead>
           <tbody id="joint-rows"></tbody>
         </table>
       </section>

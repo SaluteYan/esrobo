@@ -176,22 +176,19 @@ function updateDiagnostics(state) {
   const diagnosticFrames = latestDiagnostics?.frames?.[mode];
   const diagnosticsFresh = Number.isFinite(state.diagnostics_age_ms)
     && state.diagnostics_age_ms <= 500;
-  let layerFallback = false;
-  if (diagnosticModes.includes(mode) && (!diagnosticsFresh || !diagnosticFrames)) {
-    mode = "raw";
-    document.querySelector("#view-mode").value = mode;
-    resetCamera();
-    layerFallback = true;
-  }
+  const layerUnavailable = diagnosticModes.includes(mode) && (!diagnosticsFresh || !diagnosticFrames);
   const statusDot = document.querySelector("#status-dot");
   statusDot.className = `status-dot ${state.connected ? "live" : state.packet ? "stale" : "waiting"}`;
-  document.querySelector("#status-text").textContent = layerFallback
-    ? "控制诊断层尚未启动，已显示 PICO 原始骨架"
+  document.querySelector("#status-text").textContent = layerUnavailable
+    ? "所选控制层暂无数据；请启动预览并等待完整输入"
     : state.connected ? "实时数据正常" : state.packet ? "数据已停止" : "等待骨架数据";
-  document.querySelector("#freshness").textContent = state.age_ms == null ? "-- ms" : `${Math.round(state.age_ms)} ms`;
+  const layerLabels = {raw:"原始采集层", robot:"固定坐标映射", retarget:"人体重定向目标",
+    ik:"IK 正解结果", command:"本机计算输出", feedback:"机器人实测反馈"};
+  document.querySelector("#layer-status").textContent = layerUnavailable
+    ? `${layerLabels[mode]} · 等待数据` : layerLabels[mode];
   document.querySelector("#rate").textContent = `${Number(state.source_update_hz || 0).toFixed(1)} Hz`;
   document.querySelector("#sequence").textContent = packet.sequence == null ? "序列 --" : `序列 ${packet.sequence}`;
-  const visibleJointCount = jointNames.filter((name) => latestFrames[name]).length;
+  const visibleJointCount = jointNames.filter((name) => framePosition(name, state)).length;
   document.querySelector("#valid-count").textContent = `${visibleJointCount} / ${jointNames.length}`;
 
   for (const side of ["left", "right"]) {
@@ -219,6 +216,9 @@ function updateDiagnostics(state) {
     .join("\n");
 
   const jointData = latestDiagnostics?.joints_deg || {};
+  const diagnosticSide = latestDiagnostics?.side;
+  document.querySelector("#joint-side-title").textContent = diagnosticSide === "left"
+    ? "左臂关节角" : diagnosticSide === "right" ? "右臂关节角" : "关节角";
   const jointValue = (layer, index) => {
     const values = jointData[layer];
     return Array.isArray(values) && Number.isFinite(values[index]) ? values[index].toFixed(1) : "--";

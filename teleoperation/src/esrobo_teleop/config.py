@@ -211,10 +211,16 @@ class RetargetConfig:
     max_packet_bytes: int = 65535
     max_stale_time_s: float = 0.5
     retargeting_mode: str = "arm_vector"          # arm_vector | wrist_delta
-    # Natural-down calibration applies only the minimum rotation needed to
-    # align the upper-arm zero direction; it must not redefine transverse axes.
+    # The operator reference is captured with the arms raised into the headset's
+    # reliable hand-tracking volume.  These bounds reject a stable but occluded
+    # arms-at-the-sides pose before it can become the session reference.
+    reference_min_upper_raise_deg: float = 0.0
+    reference_min_elbow_flexion_deg: float = 0.0
+    reference_max_elbow_flexion_deg: float = 180.0
+    # Reference calibration applies only the minimum rotation needed to align
+    # the upper-arm zero direction; it must not redefine transverse axes.
     arm_vector_position_mode: str = "segment_direction_relative"
-    # Preserve the live PICO elbow angle.  The natural-down reference aligns
+    # Preserve the live PICO elbow angle.  The raised operator reference aligns
     # coordinate frames; it must not be subtracted from elbow flexion.
     elbow_angle_mapping: str = "direct_absolute"  # direct_absolute | responsive_absolute | smooth_absolute | relative
     elbow_absolute_start_delta_deg: float = 5.0
@@ -511,4 +517,13 @@ def load_config(path: str) -> TeleopConfig:
         for key, value in payload.items():
             if key in fields:
                 setattr(target, key, value)
+    pose_bounds = (
+        cfg.retarget.reference_min_upper_raise_deg,
+        cfg.retarget.reference_min_elbow_flexion_deg,
+        cfg.retarget.reference_max_elbow_flexion_deg,
+    )
+    if (any(type(value) not in (int, float) for value in pose_bounds)
+            or not 0 <= pose_bounds[0] <= 180
+            or not 0 <= pose_bounds[1] < pose_bounds[2] <= 180):
+        raise ValueError("invalid PICO raised-arm reference angle bounds")
     return cfg

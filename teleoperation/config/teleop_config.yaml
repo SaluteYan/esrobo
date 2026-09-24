@@ -133,16 +133,22 @@ retarget:
   host: 0.0.0.0
   port: 15050
   retargeting_mode: arm_vector
-  # Align only the natural-down upper-arm direction with a minimum rotation.
+  # Capture the operator reference with both forearms held in front of the
+  # headset.  Reject arms hanging at the sides, where PICO hand tracking is
+  # easily occluded.  A comfortable bent-elbow pose is sufficient.
+  reference_min_upper_raise_deg: 35.0
+  reference_min_elbow_flexion_deg: 25.0
+  reference_max_elbow_flexion_deg: 125.0
+  # Align the raised reference upper-arm direction with a minimum rotation.
   # H1/H2 transverse axes remain fixed by source_to_robot_rotation.
   arm_vector_position_mode: segment_direction_relative
   position_delta_signs: [1.0, 1.0, 1.0]
   swap_left_right_targets: false
   enable_elbow_ik_targets: true
   auto_start_reference: true
-  auto_start_reference_prepare_s: 5.0       # complete-pose detection -> preparation countdown
-  auto_start_reference_delay_s: 4.0         # stabilization + sample phase duration
-  auto_start_reference_sample_start_s: 1.0  # first second of this phase is not sampled
+  auto_start_reference_prepare_s: 1.5       # time to settle into the prompted raised pose
+  auto_start_reference_delay_s: 1.5         # stabilization + sample phase duration
+  auto_start_reference_sample_start_s: 0.5  # initial half-second is not sampled
   auto_start_reference_max_position_std_m: 0.05
   # At 'e', require a stable recent multi-frame target. The angular fields below
   # remain as diagnostic compatibility values; target-to-calibration deviation
@@ -247,9 +253,23 @@ hand:
   udp_port: 15051
   feedback_udp_port: 15052
   geometry_feedback_timeout_s: 0.1
-  # Independently measured feedback->URDF calibration, per side/joint.
-  # Empty means unknown finger pose (full URDF envelope), NOT zero fingers.
-  geometry_feedback_calibration: {}
+  # L20Lite is the L10 ten-actuator interface. These mappings use the vendor
+  # L10 feedback direction and the vendor L20Lite URDF active-joint limits.
+  # error_rad remains in every collision envelope; max speed is derived from
+  # the local 400 unit/s output cap and each 0..255 joint span.
+  geometry_feedback_calibration:
+    left: &l20lite_l10_geometry
+      thumb_cmc_pitch: {raw: [255, 0], rad: [0.0, 0.52], error_rad: 0.05, max_velocity_rad_s: 1.0, verified: true}
+      thumb_cmc_yaw: {raw: [255, 0], rad: [0.0, 1.40], error_rad: 0.05, max_velocity_rad_s: 2.196078, verified: true}
+      index_mcp_pitch: {raw: [255, 0], rad: [0.0, 1.36], error_rad: 0.05, max_velocity_rad_s: 2.133333, verified: true}
+      middle_mcp_pitch: {raw: [255, 0], rad: [0.0, 1.36], error_rad: 0.05, max_velocity_rad_s: 2.133333, verified: true}
+      ring_mcp_pitch: {raw: [255, 0], rad: [0.0, 1.36], error_rad: 0.05, max_velocity_rad_s: 2.133333, verified: true}
+      pinky_mcp_pitch: {raw: [255, 0], rad: [0.0, 1.36], error_rad: 0.05, max_velocity_rad_s: 2.133333, verified: true}
+      index_mcp_roll: {raw: [0, 255], rad: [0.0, 0.19], error_rad: 0.05, max_velocity_rad_s: 1.0, verified: true}
+      ring_mcp_roll: {raw: [0, 255], rad: [0.0, 0.20], error_rad: 0.05, max_velocity_rad_s: 1.0, verified: true}
+      pinky_mcp_roll: {raw: [0, 255], rad: [0.0, 0.30], error_rad: 0.05, max_velocity_rad_s: 1.0, verified: true}
+      thumb_cmc_roll: {raw: [0, 255], rad: [0.0, 1.03], error_rad: 0.05, max_velocity_rad_s: 1.615686, verified: true}
+    right: *l20lite_l10_geometry
   left_topic: /cb_left_hand_control_cmd
   right_topic: /cb_right_hand_control_cmd
   publish_hz: 50.0

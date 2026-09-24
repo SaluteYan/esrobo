@@ -1,0 +1,22 @@
+# Paths are relative to this file; robot configuration must match the gateway.
+# Input is PICO only: Body shoulder/elbow/wrist + independent 26-joint Hand samples.
+# SenseGlove UDP is ignored. with_hand also selects PICO wrist orientation (J5-J7).
+robot_host: 192.168.10.100
+robot_port: 16000
+side: both
+with_hand: true
+hand_only: false
+key_file: ~/.config/esrobo/robot-link.key
+teleop_config: ../../teleoperation/config/teleop_config.yaml
+input_host: 127.0.0.1
+input_port: 15050
+input_max_age_s: 0.10
+feedback_max_age_s: 0.15
+# The ROS driver and nonblocking bridge forward measured hand state near 60 Hz.
+hand_feedback_max_age_s: 0.15
+network_margin_s: 0.02
+rate_hz: 50
+minimum_control_rate_hz: 40
+# Hand-only mode checks a two-second average; 40 - 5 = 35 Hz stop threshold.
+hand_only_rate_tolerance_hz: 5
+control_gap_timeout_s: 0.08

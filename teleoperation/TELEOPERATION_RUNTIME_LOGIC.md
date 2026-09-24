@@ -133,7 +133,7 @@ cd /home/esrobo/Projects/esrobo/teleoperation
 
 `s` 和 `q` 先冻结右手目标，再规划并执行右臂避碰回零。只有右臂零位和七轴失能都确认后，程序才允许右手按速度限制慢慢回到自然张开位置。`q` 随后退出，`s` 保持程序运行；`z` 只做故障恢复回零，不自动张手。右臂回零失败、被取消或失能未确认时，右手保持冻结，不在未知臂姿态下自动张开。右臂已经确认失能时按 `q`，可以直接尝试右手张开；若手反馈过期则跳过运动并退出。
 
-截至 2026-09-21，`hand.geometry_feedback_calibration` 仍为空。程序因此不能把 LinkerHand 的 0–255 反馈直接当作 URDF 角度，而是为每根手指保留完整运动包络。用当前模型离线检查时，左右零位的完整拇指包络都会与 `waist_link1` 相交，右侧诊断约为：
+旧配置中的 `hand.geometry_feedback_calibration` 为空，程序只能为每根手指保留完整运动包络；这会让零位的完整拇指包络与 `waist_link1` 相交，典型旧诊断为：
 
 ```text
 pair = right_thumb_distal_finger_envelope / waist_link1_0
@@ -142,7 +142,7 @@ required = 30 mm
 calibrated_hand_joints = 0
 ```
 
-因此当前联合入口可能在按 `e` 后明确报告 `LINKED ARMING BLOCKED`。这不是关节限位或 PICO IK 错误，也不能通过扩大范围、降低间隙或重新上电解决。继续实机联合运动前，需要独立采集并核验右手 10 个反馈通道到 URDF 主动关节的映射、误差和最大速度，再写入 `geometry_feedback_calibration`；当前命令开合端点不能代替这项反馈标定。
+当前配置明确采用 L20Lite 的 L10 十轴接口：前六个弯曲轴按 `255→0 rad`、`0→URDF 上限` 映射，后三个侧摆轴和拇指旋转按 `0→0 rad`、`255→URDF 上限` 映射，并在碰撞包络中加入 `0.05 rad` 模型误差以及由 `400 unit/s` 输出上限换算的最大速度。机器人端离线复核右侧当前姿态、自然张开零位和规划回零路径后，十轴状态为 `10/10`。若网页仍显示 `0/10`，说明机器人仍在使用旧配置或网关尚未重启；不要通过降低间隙或关闭碰撞检查绕过门禁。
 
 ### 1.5 左机械臂＋左灵巧手联合入口
 
@@ -161,7 +161,7 @@ cd /home/esrobo/Projects/esrobo/teleoperation
    `[255,255,255,255,255,255,128,128,128,128]` 零位记录。联合入口会先限速回到同一姿态，
    再用 `startup_open_tolerance=12` 核验十轴反馈；超过容差仍拒绝机械臂使能。以后完成独立多帧
    反馈标定时，只替换 `left_open_feedback`，不改变原有控制端 `left_open`。
-2. `hand.geometry_feedback_calibration` 当前仍为空。完成开位反馈核对只解决启动零位门禁；还要独立核对左手反馈到 URDF 主动关节的映射，才能把活动手指纳入左臂回零碰撞检查。
+2. 左手与右手使用相同的 L20Lite/L10 十轴反馈映射；启动时仍需用左侧 `left_open_feedback` 单独核对自然张开姿态，不能拿右手反馈零位替代。
 
 左侧腕部方向使用独立的 `left_hand_imu_local_rotvec_to_robot_hand` 和 `left_hand_imu_xyz_decomposition`。当前配置的手套解剖轴映射为 X→J5、Y→J6、Z→+J7；运行时必须先做小幅单轴只读核对，不能因右侧方向正确就假定左侧正确。
 

@@ -275,7 +275,9 @@ class LinkerHand(Node):
 
     def pub_state(self):
         while True:
-            if self.hand_state_pub.get_subscription_count() > 0:
+            freshness_check = getattr(self.api.hand, 'position_feedback_fresh', None)
+            physical_feedback_fresh = freshness_check is None or freshness_check()
+            if self.hand_state_pub.get_subscription_count() > 0 and physical_feedback_fresh:
                 msg = self.joint_state_msg(self.last_hand_state, self.last_hand_vel)
                 self.hand_state_pub.publish(msg)
             if self.is_touch == True and self.touch_type == 1 and self.modbus == "None" and self.touch_pub.get_subscription_count() > 0:
@@ -372,8 +374,20 @@ class LinkerHand(Node):
 
     def hand_setting_cb(self,msg):
         '''控制命令回调'''
-        data = json.loads(msg.data)
-        print(f"Received setting command: {data['setting_cmd']}",flush=True)
+        try:
+            data = json.loads(msg.data)
+            requested_side = data["params"]["hand_type"]
+            setting_cmd = data["setting_cmd"]
+        except (ValueError, KeyError, TypeError):
+            print("Invalid hand setting message", flush=True)
+            return
+        # Both nodes subscribe to this shared topic. Only the addressed node
+        # may apply settings; a right-hand command must never alter the left.
+        if requested_side not in ("left", "right") or requested_side != self.hand_type:
+            return
+        hand_left = requested_side == "left"
+        hand_right = requested_side == "right"
+        print(f"Received setting command: {setting_cmd}",flush=True)
         try:
             if data["params"]["hand_type"] == "left":
                 hand = self.api

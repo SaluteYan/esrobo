@@ -570,6 +570,25 @@ class BodyDevice:
         self._reference_prompt_key = key
         print(f"[PICO 标定] {message}", flush=True)
 
+    def _reference_pose_rejection(self, points_by_side) -> Optional[str]:
+        """Reject stable poses that keep the hands outside PICO's useful view."""
+        minimum_raise = float(getattr(self._cfg, "reference_min_upper_raise_deg", 0.0))
+        minimum_bend = float(getattr(self._cfg, "reference_min_elbow_flexion_deg", 0.0))
+        maximum_bend = float(getattr(self._cfg, "reference_max_elbow_flexion_deg", 180.0))
+        down = np.asarray([0.0, 0.0, -1.0])
+        for side, points in points_by_side.items():
+            upper = mu.normalize_vector(points["elbow"] - points["shoulder"])
+            if upper is None:
+                return f"{side} 上臂数据无效"
+            raise_deg = float(np.degrees(np.arccos(np.clip(np.dot(upper, down), -1.0, 1.0))))
+            bend_deg = float(np.degrees(self._points_flexion(points)))
+            if raise_deg < minimum_raise:
+                return f"{side} 手臂仍接近身体侧面（抬臂 {raise_deg:.0f}°，需至少 {minimum_raise:.0f}°）"
+            if not minimum_bend <= bend_deg <= maximum_bend:
+                return (f"{side} 肘部弯曲 {bend_deg:.0f}°，需保持在 "
+                        f"{minimum_bend:.0f}°–{maximum_bend:.0f}°")
+        return None
+
     def _update_auto_reference(self, now: float) -> None:
         if self._reference_locked:
             return
@@ -589,6 +608,17 @@ class BodyDevice:
             self._reference_start_time = None
             self._reference_sample_times = []
             return
+        pose_rejection = self._reference_pose_rejection(points)
+        if pose_rejection:
+            self._reference_samples_left.clear()
+            self._reference_samples_right.clear()
+            self._reference_sample_times.clear()
+            self._reference_start_time = None
+            self._print_reference_prompt(
+                "pose", 0,
+                f"{pose_rejection}；请把前臂抬到胸前、肘部自然弯曲，让双手持续处于头显视野内。",
+            )
+            return
         if self._reference_start_time is None:
             self._reference_start_time = now
             self._reference_prompt_key = None
@@ -596,7 +626,7 @@ class BodyDevice:
             print(
                 "\n============================================================\n"
                 " PICO 手臂参考姿态标定\n"
-                f" 动作：站直，{side_label}在身体侧面自然放松下垂，肘部不必伸直、不要用力锁直，手腕放松。\n"
+                f" 动作：站直，将{side_label}抬到胸前，肘部自然弯曲，手腕放松，双手保持在头显视野内。\n"
                 " 要求：保持肩、肘、手腕不动；此阶段机械臂不会运动。\n"
                 "============================================================",
                 flush=True,
@@ -607,7 +637,7 @@ class BodyDevice:
             self._print_reference_prompt(
                 "prepare",
                 prepare_s - elapsed,
-                f"请摆好自然下垂姿态，{int(np.ceil(prepare_s - elapsed))} 秒后进入稳定缓冲。",
+                f"请保持胸前抬臂准备姿态，{int(np.ceil(prepare_s - elapsed))} 秒后进入稳定缓冲。",
             )
             return
 
@@ -652,7 +682,7 @@ class BodyDevice:
             self._reference_prompt_key = None
             print(
                 f"[PICO 标定] 本次姿态晃动过大（最大标准差 {max_std:.3f} m），"
-                "未保存参考零点；请重新摆好自然下垂姿态，倒计时将重新开始。",
+                "未保存参考零点；请重新摆好胸前抬臂姿态，倒计时将重新开始。",
                 flush=True,
             )
             return
@@ -672,8 +702,8 @@ class BodyDevice:
                 self._reference_wrist_rotations[side] = wrist_matrix[:3, :3].copy()
         self._reference_locked = True
         print(
-            "[PICO 标定] 完成：自然下垂参考零点已锁定。机械臂仍未运动；"
-            "请继续托稳机械臂，确认安全后按 e 开始遥操作。",
+            "[PICO 标定] 完成：胸前抬臂参考已锁定。请保持双手自然张开；"
+            "系统将在机器人零位与人手准备姿态均验证后自动开始跟随。",
             flush=True,
         )
 

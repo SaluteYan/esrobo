@@ -40,19 +40,31 @@ async function poll() {
 async function images() {
   while (running) {
     const requested = stream;
+    let delay = 100;
     try {
       const response = await fetch(`/api/head/${requested}.jpg`, {cache:'no-store', signal:AbortSignal.timeout(2000)});
       if (!response.ok) throw new Error('等待图像或图像已过期');
       const blob = await response.blob();
       if (requested === stream) {
-        const next = URL.createObjectURL(blob); $('preview').src = next;
+        const next = URL.createObjectURL(blob);
+        // Decode before replacing the visible frame: assigning an undecoded URL
+        // can briefly clear the previous image at every refresh.
+        const decoded = new Image(); decoded.src = next;
+        try { await decoded.decode(); } catch (error) { URL.revokeObjectURL(next); throw error; }
+        if (requested !== stream || !running) { URL.revokeObjectURL(next); continue; }
+        $('preview').src = next;
         if (imageURL) URL.revokeObjectURL(imageURL); imageURL = next;
         $('preview').hidden = false; $('image-empty').hidden = true;
         const age = state?.images[stream]?.age_s;
         $('image-age').textContent = age === undefined ? '' : `${Math.round(age * 1000)} ms`;
       }
-    } catch (_) { $('preview').hidden = true; $('image-empty').hidden = false; $('image-age').textContent = '图像不可用'; }
-    await new Promise(resolve => setTimeout(resolve, 100));
+    } catch (_) {
+      $('preview').hidden = true; $('image-empty').hidden = false; $('image-age').textContent = '图像不可用';
+      // A stopped camera previously opened ten failing SSH channels per
+      // second, which could make the whole control page appear frozen.
+      delay = 1000;
+    }
+    await new Promise(resolve => setTimeout(resolve, delay));
   }
 }
 $('enable').onclick = async () => {
@@ -60,6 +72,14 @@ $('enable').onclick = async () => {
   try {await post('enable');} catch (error) {report(error);}
 };
 $('lock').onclick = async () => {try {await post('lock');} catch (error) {report(error);}};
+$('disable').onclick = async () => {
+  if (!confirm('确认关闭头部俯仰和左右两轴舵机力矩？头部可能因重力移动。')) return;
+  try {
+    await post('disable');
+    errorMessage = ''; errorUntil = 0;
+    $('message').textContent = '两轴失能已由驱动回读确认';
+  } catch (error) {report(error);}
+};
 document.querySelectorAll('.move,.jog').forEach(button => button.onclick = async () => {
   const id = Number(button.dataset.id);
   const target = button.classList.contains('jog') ? Number(state.axes[id].position_ticks) + Number(button.dataset.delta) : Number($(`target-${id}`).value);

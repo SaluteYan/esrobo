@@ -106,6 +106,16 @@ class DualTests(unittest.TestCase):
         self.backend.step(self.target, lambda: False)
         hand.command_physical_batch.assert_called_once_with({'left': [128]*10, 'right': [128]*10})
 
+    def test_shared_hands_disable_verifies_disabled_state(self):
+        hand = Mock()
+        hand.is_enabled.return_value = False
+        self.backend.hand = hand
+        self.assertTrue(self.backend.disable_hands())
+        hand.set_enabled.assert_called_once_with(False)
+        hand.is_enabled.assert_called_once_with()
+        self.assertEqual(self.backend.operation_results,
+                         {'operation': 'disable_hands', 'hands': True})
+
     def test_expired_hand_feedback_prevents_arm_send(self):
         self.backend.hand = Mock()
         self.backend.hand.feedback_ready.return_value = False
@@ -124,6 +134,17 @@ class DualTests(unittest.TestCase):
             self.assertEqual(gw.mode, 'IDLE')
             self.assertIsNone(gw.pending)
             self.assertTrue(all(m.stops == 0 for m in self.backend.members.values()))
+        finally:
+            gw.socket.close()
+
+    def test_dual_recovery_refused_without_return_checker(self):
+        gw = Gateway(self.backend, KEY, port=0)
+        try:
+            gw.mode = 'FAULT'
+            with self.assertRaisesRegex(RuntimeError, 'supervised inter-arm'):
+                gw.request('r')
+            self.assertEqual(gw.mode, 'FAULT')
+            self.assertIsNone(gw.pending)
         finally:
             gw.socket.close()
 

@@ -4,6 +4,10 @@
 
 本文档根据当前代码和现场调试记录整理，重点服务于真机逐部件调试。第一次上电调试时不要直接启动整机总 launch，建议按本文档顺序逐项验证。
 
+笔记本/本机计算端入口见 [`laptop_teleop/README.md`](laptop_teleop/README.md)：在本机采集 PICO、SenseGlove，执行重定向与 IK，通过 UDP 16000 向 `192.168.10.100` 上的 [`robot_link`](robot_link/README.md) 网关发送目标。首次安装、SSH 配置和每日启动指令见 [`laptop_teleop/docs/`](laptop_teleop/docs/README.md)。SSH 用于机器人端操作，CAN/ROS 底层驱动继续运行在机器人主机。
+
+本机统一网页入口：在仓库根目录运行 `./laptop_teleop/scripts/run_dashboard.sh`，打开 `http://127.0.0.1:8080`。页面集中管理机器人/本机程序、模式与标定，可在相机和 PICO 骨架间切换，并提供运动停止及左臂、右臂、双手、头部的独立失能。具体步骤见 [网页操作文档](laptop_teleop/docs/05_WEB_CONSOLE.md)。
+
 ## 硬件组成
 
 | 部件 | 型号/说明 | ROS 包 |
@@ -510,7 +514,10 @@ ros2 launch servo_driver start_servo.py
 查看实时图像、开启调整、设置目标和锁定姿态。成功到位后可以连续调整，无需逐次调用 ROS 命令。
 ID1 俯仰范围 1000～2700，ID2 左右范围 2000～5000，单位为原始计数；
 单步最多 20，速度参数 1～5。正负物理方向需要现场小步确认。
-关闭调整不卸力，退出不自动回零；采集期间保持头部固定，只运行彩色＋深度 20 Hz 图像采集。
+“锁定调整”只关闭新目标，不卸力；需要释放头部时先托稳，再使用网页“舵机失能”或调用
+`ros2 service call /head/torque_enable std_srvs/srv/SetBool "{data: false}"`。服务会对 ID1、ID2
+分别写入并回读扭矩关闭状态；任一侧无法确认时返回失败。该服务拒绝 `data: true`，重新启用必须走
+`/head/adjust_enable` 的反馈、限位和心跳门禁。退出不自动回零；采集期间保持头部固定，只运行彩色＋深度 20 Hz 图像采集。
 
 ## 灵巧手
 

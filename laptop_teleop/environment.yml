@@ -1,0 +1,17 @@
+name: esrobo_laptop
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy>=1.26,<3
+  # 1.15.2's current conda-forge py310 build imports a missing HiGHS submodule.
+  - scipy=1.14.1
+  - pyyaml>=6
+  - pinocchio>=3,<5
+  - pytest>=7
+  - paramiko>=3.5,<5
+  - pybind11
+  - cmake
+  - ninja
+  - libstdcxx-ng

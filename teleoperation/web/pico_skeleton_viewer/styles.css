@@ -41,6 +41,7 @@ button, select { font: inherit; letter-spacing: 0; }
 .status-dot.live { background: #55d68b; box-shadow: 0 0 0 3px rgba(85,214,139,.12); }
 .status-dot.stale { background: #ffb44a; }
 .toolbar { justify-content: flex-end; gap: 8px; min-width: 0; }
+#layer-status { color: #9ca9ad; font-size: 12px; white-space: nowrap; }
 
 button {
   height: 32px;

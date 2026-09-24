@@ -39,9 +39,15 @@ class HandBridge(Node):
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if not feedback_only:
             self._sock.bind((udp_host, udp_port))
-        self._sock.settimeout(0.05)
+        # Never block ROS feedback handling while waiting for an optional hand
+        # command.  The old 50 ms recv timeout meant one ROS callback followed
+        # by 50 ms asleep; with left/right callbacks alternating, each hand's
+        # nominal 60 Hz state stream reached the gateway at only about 10 Hz.
+        self._sock.setblocking(False)
         self._feedback_addr = (feedback_host, feedback_port)
         self._active_sides = ("left", "right") if side == "both" else (side,)
+        self._feedback_counts = {side: 0 for side in self._active_sides}
+        self._feedback_rate_started = time.monotonic()
         if "left" in self._active_sides:
             self.create_subscription(
                 JointState, left_state_topic, lambda msg: self._send_feedback("left", msg), 1
@@ -53,7 +59,9 @@ class HandBridge(Node):
         self.get_logger().info(f"listening on {udp_host}:{udp_port}")
 
     def spin_once(self) -> None:
-        rclpy.spin_once(self, timeout_sec=0.02 if self._feedback_only else 0.0)
+        # A short ROS wait prevents busy-spinning yet services both 60 Hz state
+        # topics with ample headroom.  UDP command receive below is nonblocking.
+        rclpy.spin_once(self, timeout_sec=0.002)
         if self._feedback_only:
             return
         try:
@@ -76,8 +84,19 @@ class HandBridge(Node):
             (self._pub_left if side == "left" else self._pub_right).publish(js)
 
     def _send_feedback(self, side: str, msg: JointState) -> None:
-        payload = json.dumps({"side": side, "position": list(msg.position), "sample_monotonic_s": time.monotonic()}).encode("utf-8")
+        now = time.monotonic()
+        payload = json.dumps({"side": side, "position": list(msg.position), "sample_monotonic_s": now}).encode("utf-8")
         self._sock.sendto(payload, self._feedback_addr)
+        self._feedback_counts[side] += 1
+        elapsed = now - self._feedback_rate_started
+        if elapsed >= 5.0:
+            rates = ", ".join(
+                f"{name}={self._feedback_counts[name] / elapsed:.1f} Hz"
+                for name in self._active_sides
+            )
+            self.get_logger().info(f"feedback forward rate: {rates}")
+            self._feedback_counts = {name: 0 for name in self._active_sides}
+            self._feedback_rate_started = now
 
     def close(self) -> None:
         self._sock.close()

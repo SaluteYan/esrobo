@@ -6,11 +6,11 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from esrobo_link.protocol import ProtocolError, pack, unpack, validate_target
 from esrobo_link.session import SessionGate
-from esrobo_link.backends import MockBackend
+from esrobo_link.backends import HardwareBackend, MockBackend, MockDualBackend
 from esrobo_link.gateway import Gateway
 from esrobo_link.client import RobotClient
 from esrobo_link.camera import LatestImage, handler_for
@@ -60,6 +60,14 @@ class ProtocolTests(Fixture):
         for change in cases:
             with self.subTest(change=change), self.assertRaises(ProtocolError):
                 validate_target(dict(self.msg, **change), self.backend.contract)
+
+    def test_hand_only_target_has_no_arm_field(self):
+        contract = MockBackend('right', True, True).contract
+        message = dict(contract_id=contract['id'], side='right', hand_unit=[128]*10)
+        self.assertEqual(validate_target(message, contract),
+                         {'arm_urdf_rad': None, 'hand_unit': [128]*10})
+        with self.assertRaises(ProtocolError):
+            validate_target(dict(message, arm_urdf_rad=None), contract)
 
 
 class SessionTests(Fixture):
@@ -123,6 +131,9 @@ class GatewayTests(unittest.TestCase):
         self.target()
         self.gw.request('e')
         self.gw.tick()
+        self.assertEqual(self.gw.mode, 'CALIBRATING')
+        self.target()
+        self.gw.tick()
         self.assertEqual(self.gw.mode, 'ACTIVE')
 
     def test_no_automatic_enable(self):
@@ -149,14 +160,54 @@ class GatewayTests(unittest.TestCase):
         self.assertFalse(self.backend.enabled)
         self.assertIsNone(self.gw.gate.target)
 
+    def test_hand_only_recovery_verifies_disable_without_motion_or_auto_enable(self):
+        backend = MockBackend('right', True, True)
+        gateway = Gateway(backend, KEY, port=0)
+        self.addCleanup(gateway.socket.close)
+        backend.hand_enabled = True
+        gateway.mode = 'ACTIVE'
+        gateway.request('s')
+        with self.assertRaisesRegex(RuntimeError, 'stopped FAULT'):
+            gateway.request('r')
+        gateway.tick()
+        self.assertEqual(gateway.mode, 'FAULT')
+        gateway.request('r')
+        self.assertEqual(gateway.mode, 'RECOVERING')
+        gateway.tick()
+        self.assertEqual(gateway.mode, 'IDLE')
+        self.assertFalse(backend.enabled)
+        self.assertFalse(backend.hand_enabled)
+        self.assertEqual(backend.q, [0.] * 7)
+        self.assertIsNone(gateway.gate.target)
+
+    def test_hand_only_recovery_failure_keeps_fault_latched(self):
+        backend = MockBackend('right', True, True)
+        gateway = Gateway(backend, KEY, port=0)
+        self.addCleanup(gateway.socket.close)
+        gateway.mode = 'FAULT'
+        backend.recover_idle = Mock(side_effect=RuntimeError('disable feedback stale'))
+        gateway.request('r')
+        gateway.tick()
+        self.assertEqual(gateway.mode, 'FAULT')
+        self.assertIn('disable feedback stale', gateway.reason)
+
+    def test_single_arm_recovery_reuses_checked_return(self):
+        self.gw.mode = 'FAULT'
+        self.gw.request('r')
+        self.assertEqual(self.gw.mode, 'RETURNING')
+        self.gw.tick()
+        self.assertEqual(self.gw.mode, 'IDLE')
+        self.assertEqual(self.gw.last_return['returned'], True)
+
     def test_q_stops_without_return(self):
         self.start()
         q = list(self.backend.q)
+        preparation = self.gw.last_return
         self.gw.request('q')
         self.gw.tick()
         self.assertTrue(self.gw.shutdown.is_set())
         self.assertEqual(self.backend.q, q)
-        self.assertIsNone(self.gw.last_return)
+        self.assertEqual(self.gw.last_return, preparation)
 
     def test_partial_enable_failure_stops(self):
         def fail(target, cancelled):
@@ -165,6 +216,8 @@ class GatewayTests(unittest.TestCase):
         self.backend.enable = fail
         self.target()
         self.gw.request('e')
+        self.gw.tick()
+        self.target()
         self.gw.tick()
         self.assertEqual(self.gw.mode, 'FAULT')
         self.gw.tick()
@@ -178,6 +231,8 @@ class GatewayTests(unittest.TestCase):
         self.backend.enable = enable
         self.target()
         self.gw.request('e')
+        self.gw.tick()
+        self.target()
         self.gw.tick()
         self.assertEqual(self.gw.mode, 'FAULT')
         self.assertEqual(self.backend.q, [0.]*7)
@@ -199,6 +254,75 @@ class GatewayTests(unittest.TestCase):
         self.assertNotIn(self.gw.gate.session, text)
         self.assertNotIn(KEY.decode(), text)
         self.assertIn('feedback', entry)
+
+    def test_owned_arm_can_be_disabled_independently(self):
+        self.start()
+        self.gw.request('dl')
+        self.gw.tick()
+        self.assertEqual(self.gw.mode, 'FAULT')
+        self.assertFalse(self.backend.enabled)
+        self.assertIn('left_disable_verified=True', self.gw.reason)
+
+    def test_unowned_arm_disable_fails_closed(self):
+        self.gw.request('dr')
+        self.gw.tick()
+        self.assertEqual(self.gw.mode, 'FAULT')
+        self.assertIn('does not own right arm', self.gw.reason)
+
+    def test_dual_backend_disables_only_requested_arm_after_stop(self):
+        backend = MockDualBackend()
+        gateway = Gateway(backend, KEY, port=0)
+        self.addCleanup(gateway.socket.close)
+        backend.members['left'].enabled = True
+        backend.members['right'].enabled = True
+        gateway.request('dl')
+        gateway.tick()
+        self.assertFalse(backend.members['left'].enabled)
+        self.assertTrue(backend.members['right'].enabled)
+        self.assertEqual(backend.operation_results['operation'], 'disable_left')
+
+    def test_dual_hands_disable_is_recorded(self):
+        backend = MockDualBackend()
+        gateway = Gateway(backend, KEY, port=0)
+        self.addCleanup(gateway.socket.close)
+        gateway.request('dh')
+        gateway.tick()
+        self.assertIn('hands_disable_verified=True', gateway.reason)
+        self.assertEqual(backend.operation_results['operation'], 'disable_hands')
+
+    def test_hand_only_gateway_never_enables_or_commands_arm(self):
+        backend = MockBackend('right', True, True)
+        gateway = Gateway(backend, KEY, port=0)
+        self.addCleanup(gateway.socket.close)
+        gateway.gate.hello(dict(client_nonce='b'*32), PEER, self.now, False)
+        state = gateway.gate.state(self.now, {})
+        gateway.gate.accept(dict(type='target', seq=1, session=state['session'],
+            lease=state['lease'], side='right', contract_id=backend.contract['id'],
+            hand_unit=[140]*10), PEER, self.now)
+        gateway.request('e')
+        gateway.tick()
+        self.assertEqual(gateway.mode, 'CALIBRATING')
+        state = gateway.gate.state(self.now, {})
+        gateway.gate.accept(dict(type='target', seq=2, session=state['session'],
+            lease=state['lease'], side='right', contract_id=backend.contract['id'],
+            hand_unit=[140]*10), PEER, self.now)
+        gateway.tick()
+        self.assertEqual(gateway.mode, 'ACTIVE')
+        self.assertFalse(backend.enabled)
+        self.assertTrue(backend.hand_enabled)
+        self.assertEqual(backend.q, [0.]*7)
+        self.assertEqual(backend.hand, [140]*10)
+
+    def test_hand_only_hardware_asserts_stop_if_arm_becomes_enabled(self):
+        backend = HardwareBackend.__new__(HardwareBackend)
+        backend.hand_only = True
+        backend.arm = Mock()
+        backend.snapshot = Mock(return_value=dict(
+            enable_states=[False, False, True, False, False, False, False],
+            controller_fault=None, driver_fault=None))
+        with self.assertRaisesRegex(RuntimeError, 'arm enable detected'):
+            backend.prepare_step(lambda: False)
+        backend.arm.emergency_stop.assert_called_once_with()
 
 
 class NetworkTests(unittest.TestCase):

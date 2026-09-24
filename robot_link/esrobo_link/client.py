@@ -80,6 +80,17 @@ class RobotClient:
         validate_target(payload, c)
         self._command("target", **payload)
 
+    def send_hand_target(self, hand_unit):
+        """Send one single-side hand target without any arm command field."""
+        if self.latest is None:
+            raise RuntimeError("connect first")
+        c = self.latest["contract"]
+        if c["side"] == "both" or not c.get("hand_only", False):
+            raise ProtocolError("send_hand_target requires a single-side hand-only endpoint")
+        payload = dict(side=c["side"], contract_id=c["id"], hand_unit=list(hand_unit))
+        validate_target(payload, c)
+        self._command("target", **payload)
+
     def send_dual_target(self, *, left_arm_urdf_rad, right_arm_urdf_rad,
                          left_hand_unit, right_hand_unit):
         """One frame for both arms and hands; never send a partial side update."""

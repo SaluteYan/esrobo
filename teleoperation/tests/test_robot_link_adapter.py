@@ -62,6 +62,34 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(driver._capture_arm_torque_baseline(arm, 'left', cancelled=lambda: True))
         arm.get_joint_torques.assert_not_called()
 
+    def test_session_preparation_opens_hand_before_arm_return(self):
+        backend = self.backend()
+        backend.hand_only = False
+        events = []
+        backend.hand = Mock()
+        backend.hand.geometry_calibration_status.return_value = dict(
+            ready=True, calibrated_joints=10, total_joints=10)
+        backend.hand.open_feedback_calibrated.return_value = True
+        backend.hand.align_and_verify_open_pose.side_effect = (
+            lambda cancelled: events.append('hand_open') or (True, {}))
+        backend.return_zero = Mock(side_effect=lambda cancelled: events.append('arm_return') or {
+            'returned': True, 'disabled': True, 'stage': 'disabling', 'reason': ''})
+        result = backend.prepare_session(lambda: False)
+        self.assertEqual(events, ['hand_open', 'arm_return'])
+        self.assertTrue(result['hands_open'])
+
+    def test_session_preparation_rejects_incomplete_hand_geometry_without_motion(self):
+        backend = self.backend()
+        backend.hand_only = False
+        backend.hand = Mock()
+        backend.hand.geometry_calibration_status.return_value = dict(
+            ready=False, calibrated_joints=0, total_joints=10)
+        backend.return_zero = Mock()
+        with self.assertRaisesRegex(RuntimeError, '0/10'):
+            backend.prepare_session(lambda: False)
+        backend.hand.align_and_verify_open_pose.assert_not_called()
+        backend.return_zero.assert_not_called()
+
 
 class PhysicalHandTests(unittest.TestCase):
     def setUp(self):
@@ -95,11 +123,44 @@ class PhysicalHandTests(unittest.TestCase):
         self.socket.sendto.assert_not_called()
         self.assertFalse(self.driver.is_enabled())
 
+    def test_open_return_stops_when_feedback_disappears_mid_ramp(self):
+        with patch.object(self.driver, '_feedback_is_fresh', side_effect=[True, True, False]), \
+                patch('esrobo_teleop.robot.linker_hand_driver.time.sleep'):
+            self.assertFalse(self.driver.return_to_open())
+        self.assertEqual(self.socket.sendto.call_count, 1)
+        self.assertFalse(self.driver.is_enabled())
+
+    def test_thumb_axes_map_to_distinct_physical_channels(self):
+        from esrobo_teleop.robot.linker_hand_driver import ACTIVE_HAND_JOINTS, ACTIVE_JOINT_LIMITS_RAD
+        baseline = self.driver._rad_to_servo(np.zeros(10), 'right')
+        for name, physical_index in [('thumb_cmc_pitch', 0), ('thumb_cmc_yaw', 1), ('thumb_cmc_roll', 9)]:
+            angles = np.zeros(10)
+            angles[ACTIVE_HAND_JOINTS.index(name)] = ACTIVE_JOINT_LIMITS_RAD[name][1]
+            result = self.driver._rad_to_servo(angles, 'right')
+            self.assertEqual(np.flatnonzero(result != baseline).tolist(), [physical_index])
+
     def test_feedback_is_read_only_copy(self):
         state = self.driver.feedback_snapshot('left')
         state['position_unit'][0] = 0
         self.assertEqual(self.driver._feedback['left'][0], 120)
         self.socket.sendto.assert_not_called()
+
+    def test_feedback_reports_incomplete_collision_geometry_calibration(self):
+        geometry = self.driver.feedback_snapshot('left')['geometry']
+        self.assertFalse(geometry['ready'])
+        self.assertEqual(geometry['calibrated_joints'], 0)
+        self.assertEqual(geometry['total_joints'], 10)
+        self.assertEqual(len(geometry['missing_joints']), 10)
+
+        names = list(geometry['missing_joints'])
+        self.driver._cfg.geometry_feedback_calibration = {'left': {
+            name: dict(raw=[0, 255], rad=[0, 1], error_rad=.02,
+                       max_velocity_rad_s=1., verified=True)
+            for name in names
+        }}
+        geometry = self.driver.feedback_snapshot('left')['geometry']
+        self.assertTrue(geometry['ready'])
+        self.assertEqual(geometry['calibrated_joints'], 10)
 
     def test_invalid_target_sends_nothing(self):
         for target in ([0]*9, [float('nan')]*10, [256]*10):

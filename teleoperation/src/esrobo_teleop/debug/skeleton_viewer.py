@@ -134,7 +134,7 @@ class SkeletonViewerServer:
         class Handler(BaseHTTPRequestHandler):
             def head_proxy(self, post=False):
                 path = urlsplit(self.path).path
-                allowed = ('state', 'color.jpg', 'depth.jpg') if not post else ('enable', 'move', 'lock', 'heartbeat')
+                allowed = ('state', 'color.jpg', 'depth.jpg') if not post else ('enable', 'move', 'lock', 'disable', 'heartbeat')
                 if path not in tuple('/api/head/' + name for name in allowed):
                     self.send_error(404)
                     return

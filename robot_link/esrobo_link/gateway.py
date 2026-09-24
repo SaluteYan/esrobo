@@ -29,6 +29,7 @@ class Gateway:
         self.pending = None
         self.stop_pending = False
         self.stop_send_returned = None
+        self.disable_verified = None
         self.feedback = {}
         self.feedback_time = None
         self.rejected_packets = 0
@@ -44,7 +45,7 @@ class Gateway:
             return
         now = time.monotonic()
         with self.lock:
-            identity = (self.mode, self.reason, self.stop_send_returned)
+            identity = (self.mode, self.reason, self.stop_send_returned, self.disable_verified)
             if identity == self._last_record and now - self._record_time < .2:
                 return
             entry = dict(unix_ns=time.time_ns(), monotonic_s=now, mode=self.mode,
@@ -52,6 +53,7 @@ class Gateway:
                          accepted_seq=self.gate.sequence, target=self.gate.target,
                          target_remaining_s=max(0.0, self.gate.deadline-now),
                          feedback=self.feedback, stop_send_returned=self.stop_send_returned,
+                         disable_verified=self.disable_verified, recovery_supported=True,
                          feedback_cache_age_s=None if self.feedback_time is None else now-self.feedback_time,
                          rejected_packets=self.rejected_packets, last_rejection=self.last_rejection,
                          last_return=self.last_return)
@@ -65,8 +67,9 @@ class Gateway:
             if self.mode != "FAULT":
                 self.stop_pending = self.mode in ("ACTIVE", "ARMING", "RETURNING")
                 self.stop_send_returned = None
+                self.disable_verified = None
             self.mode, self.reason = "FAULT", reason
-            if self.pending not in ("d",):
+            if self.pending not in ("d", "dl", "dr", "dh"):
                 self.pending = None
         self.backend.cancel()  # Only sets an Event; never performs network/CAN I/O.
 
@@ -76,7 +79,7 @@ class Gateway:
                 self.trip("joint target lease expired; explicit local recovery required")
 
     def request(self, action):
-        """Only the robot operator calls e/d/z/q; the wire supports STOP only."""
+        """Only the robot operator calls enable/disable/return; the wire supports STOP only."""
         if action in ("x", "s", "q"):
             self.trip("operator requested stop")
             # Even idle x must send a stop (controller may have external state).
@@ -88,21 +91,42 @@ class Gateway:
         with self.lock:
             if action == "d":
                 self.trip("operator requested disable")
+                self.disable_verified = None
                 self.pending = "d"
+            elif action in ("dl", "dr", "dh"):
+                label = {"dl": "left arm", "dr": "right arm", "dh": "hands"}[action]
+                self.trip(f"operator requested {label} disable")
+                self.pending = action
             elif action == "e":
+                if not getattr(self.backend, "supports_prepare", True):
+                    raise RuntimeError("automatic session preparation is unavailable without an inter-arm return checker")
                 if self.mode != "IDLE" or self.pending or not self.gate.fresh(time.monotonic()):
-                    raise RuntimeError("e requires IDLE and a fresh matching-pose target stream")
+                    raise RuntimeError("e requires IDLE and a fresh input/feedback stream")
                 self.cancelled.clear()
-                self.pending, self.mode = "e", "ARMING"
+                self.pending, self.mode = "p", "RETURNING"
+                self.reason = "returning robot arm and hand to verified zero"
             elif action == "z":
                 if not getattr(self.backend, "supports_return", True):
-                    raise RuntimeError("dual z unavailable: no inter-arm return-path checker; no motion sent")
+                    raise RuntimeError("z unavailable in hand-only mode or without an inter-arm return checker; no motion sent")
                 if self.mode not in ("IDLE", "FAULT") or self.pending or self.stop_pending:
                     raise RuntimeError("stop first and wait for stop handling before z")
                 self.cancelled.clear()
                 self.pending, self.mode = "z", "RETURNING"
+            elif action == "r":
+                if self.mode != "FAULT" or self.pending or self.stop_pending or self.stop_send_returned is False:
+                    raise RuntimeError("recovery requires a stopped FAULT gateway")
+                if getattr(self.backend, "hand_only", False):
+                    self.cancelled.clear()
+                    self.pending, self.mode = "r", "RECOVERING"
+                    self.reason = "verifying disabled arm and hand feedback without motion"
+                elif getattr(self.backend, "supports_return", True):
+                    self.cancelled.clear()
+                    self.pending, self.mode = "z", "RETURNING"
+                    self.reason = "explicit single-arm recovery; verified return to zero"
+                else:
+                    raise RuntimeError("dual-arm recovery requires the supervised inter-arm procedure; no motion sent")
             else:
-                raise ValueError("keys: e enable, s/x stop, d disable, z return, q stop+exit")
+                raise ValueError("keys: e prepare+enable, s/x stop, d all, dl left, dr right, dh hands, r recover, z return, q exit")
 
     def network_loop(self):
         next_state = 0.0
@@ -116,7 +140,8 @@ class Gateway:
                         self.watchdog()  # A late packet cannot revive an expired stream.
                         now = time.monotonic()
                         if message.get("type") == "hello":
-                            self.gate.hello(message, peer, now, self.mode in ("ACTIVE", "ARMING", "RETURNING"))
+                            self.gate.hello(message, peer, now,
+                                            self.mode in ("ACTIVE", "ARMING", "RETURNING", "RECOVERING", "CALIBRATING"))
                         else:
                             kind = self.gate.accept(message, peer, now)
                             if kind == "stop":
@@ -131,7 +156,13 @@ class Gateway:
                 self.watchdog()
                 now = time.monotonic()
                 if now >= next_state:
-                    next_state = now + .02
+                    # Keep the 50 Hz state stream on its original clock. Reset
+                    # only after a full missed period; rebasing on every send
+                    # accumulates socket/scheduler latency and slows the laptop
+                    # control loop, which waits for each fresh state packet.
+                    next_state += .02
+                    if next_state <= now:
+                        next_state = now + .02
                     with self.lock:
                         if self.gate.peer is None:
                             continue
@@ -139,6 +170,7 @@ class Gateway:
                                       feedback=self.feedback,
                                       feedback_cache_age_s=None if self.feedback_time is None else now - self.feedback_time,
                                       stop_send_returned=self.stop_send_returned,
+                                      disable_verified=self.disable_verified, recovery_supported=True,
                                       rejected_packets=self.rejected_packets, last_rejection=self.last_rejection,
                                       last_return=self.last_return)
                         packet = pack(self.gate.state(now, status), self.key)
@@ -159,6 +191,10 @@ class Gateway:
         """Single executor: all hardware operations are serialized here."""
         self.watchdog()
         with self.lock:
+            if (self.mode == "CALIBRATING" and self.pending is None
+                    and self.gate.target is not None and self.gate.fresh(time.monotonic())):
+                self.pending, self.mode = "e", "ARMING"
+                self.reason = "PICO preparation verified; enabling from matching zero target"
             stop, self.stop_pending = self.stop_pending, False
             operation, self.pending = self.pending, None
             target = self.gate.target
@@ -175,7 +211,29 @@ class Gateway:
             if operation == "d":
                 disabled = self.backend.disable()
                 with self.lock:
+                    self.disable_verified = bool(disabled)
                     self.reason = f"disable_verified={disabled}; z required before following"
+            elif operation in ("dl", "dr"):
+                side = "left" if operation == "dl" else "right"
+                disabled = self.backend.disable_side(side)
+                with self.lock:
+                    self.reason = f"{side}_disable_verified={disabled}; restart session before following"
+            elif operation == "dh":
+                disabled = self.backend.disable_hands()
+                with self.lock:
+                    self.reason = f"hands_disable_verified={disabled}; restart session before following"
+            elif operation == "p":
+                result = self.backend.prepare_session(self.motion_cancelled)
+                with self.lock:
+                    self.last_return = result
+                    if (not self.motion_cancelled() and result.get("returned")
+                            and result.get("disabled") and result.get("hands_open")):
+                        self.mode = "CALIBRATING"
+                        self.reason = ("robot_zero_verified=True; waiting for raised-arm "
+                                       "and natural-open PICO pose")
+                        self.gate.target, self.gate.deadline = None, 0.0
+                    else:
+                        raise RuntimeError(f"session preparation failed/cancelled: {result}")
             elif operation == "e":
                 self.backend.enable(target, self.motion_cancelled)
                 with self.lock:
@@ -191,6 +249,15 @@ class Gateway:
                         self.gate.target, self.gate.deadline = None, 0.0
                     else:
                         raise RuntimeError(f"return failed/cancelled: {result}")
+            elif operation == "r":
+                result = self.backend.recover_idle()
+                with self.lock:
+                    self.last_return = result
+                    if not self.cancelled.is_set() and result.get("disabled") and result.get("hands_ready"):
+                        self.mode, self.reason = "IDLE", "hand-only disable/feedback verified; local e required"
+                        self.gate.target, self.gate.deadline = None, 0.0
+                    else:
+                        raise RuntimeError(f"hand-only recovery failed/cancelled: {result}")
             with self.lock:
                 active, target = self.mode == "ACTIVE", self.gate.target
             if active:
@@ -204,7 +271,7 @@ class Gateway:
             self.trip(f"executor: {type(exc).__name__}: {exc}")
             # enable can fail after partially enabling hardware; stop even if
             # an asynchronous watchdog has already changed the state to FAULT.
-            if operation == "e":
+            if operation in ("e", "p"):
                 with self.lock:
                     self.stop_pending = True
 
@@ -238,10 +305,14 @@ def main():
     ap.add_argument("--side", choices=("left", "right", "both"), default="left",
                     help="both selects both arms AND both hands")
     ap.add_argument("--with-hand", action="store_true")
+    ap.add_argument("--hand-only", action="store_true",
+                    help="single-side LinkerHand control while the arm remains disabled")
     ap.add_argument("--hardware", action="store_true")
     ap.add_argument("--config")
     ap.add_argument("--log-file", help="JSONL diagnostics; default robot_link/log/gateway_<time>.jsonl")
     args = ap.parse_args()
+    if args.hand_only and (not args.with_hand or args.side == "both"):
+        ap.error("--hand-only requires --with-hand and a single side")
     key = key_from_file(args.key_file)
     # Whole robot execution is exclusive; prevent two endpoints or an old local
     # teleop from silently sharing CAN. Old programs do not honor this lock, so
@@ -256,9 +327,10 @@ def main():
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         from .backends import HardwareBackend, DualHardwareBackend
         backend = (DualHardwareBackend(args.config) if args.side == "both" else
-                   HardwareBackend(args.config, args.side, args.with_hand))
+                   HardwareBackend(args.config, args.side, args.with_hand, hand_only=args.hand_only))
     else:
-        backend = MockDualBackend() if args.side == "both" else MockBackend(args.side, args.with_hand)
+        backend = (MockDualBackend() if args.side == "both" else
+                   MockBackend(args.side, args.with_hand, args.hand_only))
     try:
         gateway = Gateway(backend, key, args.bind, args.port)
     except BaseException:
@@ -266,7 +338,7 @@ def main():
         raise
     print(json.dumps(dict(listening=gateway.address, hardware=args.hardware,
                           contract=backend.contract), ensure_ascii=False), flush=True)
-    print("Robot terminal: e enable, s/x stop, d disable, z checked return, q stop+exit (Enter required)", flush=True)
+    print("Robot terminal: e zero+PICO prepare+enable, s/x stop, d all disable, dl/dr arm disable, dh hands disable, r recover, z return, q exit (Enter required)", flush=True)
     from pathlib import Path
     log_path = Path(args.log_file) if args.log_file else Path(__file__).resolve().parents[1] / "log" / f"gateway_{time.time_ns()}.jsonl"
     try:

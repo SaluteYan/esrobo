@@ -38,6 +38,7 @@ class RosHead:
             self.subs.append(self.node.create_subscription(
                 Image, f'/camera/{kind}/image_raw', lambda m, k=kind: self.on_image(k, m), 1))
         self.enable = self.node.create_client(SetBool, '/head/adjust_enable')
+        self.torque = self.node.create_client(SetBool, '/head/torque_enable')
         self.move = self.node.create_client(HeadJog, '/head/jog')
 
     def on_state(self, message):
@@ -70,6 +71,9 @@ class RosHead:
 
     def gate(self, enabled):
         self.call(self.enable, SetBool.Request(data=enabled))
+
+    def disable_torque(self):
+        self.call(self.torque, SetBool.Request(data=False))
 
     def jog(self, sid, delta, speed):
         self.call(self.move, HeadJog.Request(servo_id=sid, delta_ticks=delta, speed=speed))
@@ -162,6 +166,9 @@ def main():
                 if action == 'heartbeat':
                     control.heartbeat(data.get('session'))
                 elif action == 'lock':
+                    control.lock()
+                elif action == 'disable':
+                    adapter.disable_torque()
                     control.lock()
                 else:
                     control.submit(action, data.get('session'), data.get('id'), data.get('target'))

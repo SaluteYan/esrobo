@@ -80,6 +80,13 @@ def validate_target(msg, contract):
             member = contract["sides"][side]
             checked[side] = validate_target(dict(target, side=side, contract_id=member["id"]), member)
         return {"targets": checked}
+    if contract.get("hand_only", False):
+        if not contract.get("with_hand") or "arm_urdf_rad" in msg:
+            raise ProtocolError("hand-only target cannot contain an arm command")
+        hand = vector(msg.get("hand_unit"), 10, "hand_unit")
+        if any(type(x) is not int or not 0 <= x <= 255 for x in hand):
+            raise ProtocolError("hand_unit requires ten integers in [0,255]")
+        return {"arm_urdf_rad": None, "hand_unit": hand}
     arm = vector(msg.get("arm_urdf_rad"), 7, "arm_urdf_rad")
     if any(q < lo or q > hi for q, lo, hi in zip(arm, contract["lower_rad"], contract["upper_rad"])):
         raise ProtocolError("target outside commissioned arm limits")

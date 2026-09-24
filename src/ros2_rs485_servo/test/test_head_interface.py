@@ -33,6 +33,7 @@ class HeadInterfaceTest(unittest.TestCase):
         self.latest = None
         self.sub = self.node.create_subscription(DiagnosticArray, '/head/state', self.state, 10)
         self.enable = self.node.create_client(SetBool, '/head/adjust_enable')
+        self.torque_control = self.node.create_client(SetBool, '/head/torque_enable')
         self.jog = self.node.create_client(HeadJog, '/head/jog')
         self.process = None
 
@@ -98,6 +99,9 @@ class HeadInterfaceTest(unittest.TestCase):
     def move(self, sid=1, delta=10, speed=5):
         return self.call(self.jog, HeadJog.Request(servo_id=sid, delta_ticks=delta, speed=speed))
 
+    def set_torque(self, value):
+        return self.call(self.torque_control, SetBool.Request(data=value))
+
     def test_read_only(self):
         self.start(False)
         self.assertFalse(self.gate(True).success)
@@ -126,6 +130,16 @@ class HeadInterfaceTest(unittest.TestCase):
         self.assertFalse(self.move().success)
         self.assertEqual(len([p for p in self.commands if p[4] == 3]), count)
         self.assertEqual(self.torque, {1: 1, 2: 1})
+
+    def test_explicit_torque_disable_is_verified_and_enable_is_refused(self):
+        self.start(True)
+        self.assertTrue(self.gate(True).success)
+        self.assertEqual(self.torque, {1: 1, 2: 1})
+        result = self.set_torque(False)
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(self.torque, {1: 0, 2: 0})
+        self.assertFalse(self.set_torque(True).success)
+        self.assertEqual(self.torque, {1: 0, 2: 0})
 
     def test_timeout_and_no_queue(self):
         self.start(True)

@@ -225,19 +225,29 @@ class LinkerHandL10Can:
 
     def process_response(self, msg):
         """Process received CAN messages."""
+        # SocketCAN delivers writes made by other local sockets as TX echoes.
+        # A diagnostic sender must not overwrite measured state with its target.
+        if (not msg.is_rx or msg.is_error_frame or msg.is_remote_frame
+                or msg.is_extended_id or not msg.data):
+            return
         if msg.arbitration_id == self.can_id:
             frame_type = msg.data[0]
             response_data = msg.data[1:]
+            expected_length = {0x01: 6, 0x04: 4}.get(frame_type)
+            if expected_length is not None and len(response_data) != expected_length:
+                return
             if len(list(response_data)) == 0:
                     return
             if frame_type == FrameProperty.JOINT_POSITION_RCO.value:   # 0x01
                 self.x01 = list(response_data)  
+                self._position_01_received_at = time.monotonic()
             elif frame_type == FrameProperty.MAX_PRESS_RCO.value:    # 0x02
                 self.x02 = list(response_data)
             elif frame_type == FrameProperty.MAX_PRESS_RCO2.value:    # 0x03
                 self.x03 = list(response_data)
             elif frame_type == FrameProperty.JOINT_POSITION2_RCO.value:    # 0x04
                 self.x04 = list(response_data)
+                self._position_04_received_at = time.monotonic()
             elif frame_type == 0x05:
                 self.x05 = list(response_data)
             elif frame_type == 0x06:
@@ -340,6 +350,13 @@ class LinkerHandL10Can:
             self.send_frame(0x03,torque[5:])
 
     
+    def position_feedback_fresh(self, max_age_s=0.15):
+        """Both position halves must come from recent physical CAN replies."""
+        now = time.monotonic()
+        stamps = (getattr(self, '_position_01_received_at', None),
+                  getattr(self, '_position_04_received_at', None))
+        return all(stamp is not None and 0 <= now - stamp < max_age_s for stamp in stamps)
+
     def get_current_status(self):
         '''Get current joint status'''
         if self.is_cmd == False:
