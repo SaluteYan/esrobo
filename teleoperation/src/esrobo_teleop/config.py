@@ -77,6 +77,7 @@ class RobotConfig:
     teleop_torso_collision_enabled: bool = False
     collision_package_dirs: tuple = ()
     torso_collision_margin_m: float = 0.03
+    right_torso_collision_margin_m: Optional[float] = None
     shoulder_collision_margin_m: float = 0.005
     # physical = direction * URDF + offset. The J2 +pi/2 offset follows the
     # pyAgxArm NERO limits and this project's URDF limits exactly.
@@ -200,6 +201,13 @@ class RobotConfig:
 
         name = self.right_nero_firmware if side == "right" else self.nero_firmware
         return getattr(NeroFW, name, NeroFW.DEFAULT)
+
+    def torso_collision_margin_for(self, side: str) -> float:
+        if side not in ("left", "right"):
+            raise ValueError("invalid arm side")
+        if side == "right" and self.right_torso_collision_margin_m is not None:
+            return float(self.right_torso_collision_margin_m)
+        return float(self.torso_collision_margin_m)
 
 
 @dataclass

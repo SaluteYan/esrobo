@@ -197,6 +197,7 @@ q_urdf     = (q_physical - offset) / direction
 当前 `torso_collision_enabled=true`，`teleop_torso_collision_enabled=false`：
 
 - 启动姿态检查和单侧安全回零使用躯干几何保护。
+- 配置的普通臂／躯干包络间隙为左臂 30 mm、右臂 29 mm；右臂仅比原配置降低 1 mm。右臂调整来自现场确认无实际接触后的模型预检与离线路径验证，回零时仍逐段检查完整路径。安装处 `link2/waist3` 保留独立的 5 mm 结构间隙配置。
 - 实时跟随没有逐周期躯干几何检查；关节范围、力矩、反馈跟随差、FK 端点速度等限制继续执行。
 - FK 速度限制不等于碰撞检测；双臂之间没有完整互撞保护。
 
