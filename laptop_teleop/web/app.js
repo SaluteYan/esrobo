@@ -308,7 +308,11 @@ function render() {
   $('connection-dot').classList.toggle('online', state.connected);
   $('robot-mode').textContent = fresh ? robot.mode : '反馈离线';
   $('robot-mode').className = 'tag ' + (fresh && robot.mode === 'ACTIVE' ? 'active' : fresh && robot.mode === 'FAULT' ? 'fault' : '');
-  $('robot-reason').textContent = state.remote_error || robot.reason || '等待网关反馈';
+  const returnFailure = fresh && robot.mode === 'FAULT' && robot.last_return?.returned === false
+    ? robot.last_return.reason : '';
+  $('robot-reason').textContent = state.remote_error
+    || (returnFailure ? `回零失败：${returnFailure}` : robot.reason)
+    || '等待网关反馈';
   $('feedback-age').textContent = fresh ? `${Math.round((robot.age_s + (robot.feedback_cache_age_s || 0)) * 1000)} ms` : '—';
   $('compute-rate').textContent = Number.isFinite(telemetry.rates?.compute_hz) ? `${telemetry.rates.compute_hz.toFixed(1)} Hz` : '—';
   const loopHz = telemetry.rates?.loop_hz;

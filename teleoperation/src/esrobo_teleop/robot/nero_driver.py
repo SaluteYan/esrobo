@@ -2432,6 +2432,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
         from .return_planner import ReturnPlanner, ReturnResult
         if not self._return_lock.acquire(blocking=False):
             return ReturnResult(False, False, "busy", "return already running")
+        self._return_execution_failure = None
         if request_id is None:
             request_id = self.prepare_return()
         stage = "preflight"
@@ -2661,9 +2662,11 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                     self._return_start_state = replace(initial, stamp=float(self._arm.last_feedback_timestamp))
                 target = np.zeros(14)
                 target[sl] = (waypoint-zero)/directions
+                self._return_execution_failure = None
                 if not self._return_group_to_zero(target, indices, waypoint, tolerance,
                         timeout, f"waypoint {number}/{len(plan.path)-1}"):
-                    return finish(reason="waypoint execution failed/cancelled")
+                    return finish(reason=(self._return_execution_failure
+                                          or "waypoint execution failed/cancelled"))
             stage = "disabling"
             if self._return_cancel.is_set():
                 return finish(reason="cancelled before disable")
@@ -2792,14 +2795,30 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                     )
                     return False
                 hold_elapsed = now - lead_hold_started
+                catch_tolerance = np.minimum(
+                    0.5 * return_trajectory.lead,
+                    np.full(NERO_NUM_JOINTS, tolerance, dtype=np.float64),
+                )
                 if hold_elapsed >= return_trajectory.lead_timeout:
                     self._return_inhibited = True
+                    lagging = np.flatnonzero(np.abs(lead_error) > catch_tolerance)
+                    lag_summary = ", ".join(
+                        f"J{i+1} {np.degrees(lead_error[i]):+.2f}deg"
+                        for i in lagging
+                    ) or "all joints inside catch tolerance but not stationary"
+                    self._return_execution_failure = (
+                        f"feedback did not catch held command within "
+                        f"{return_trajectory.lead_timeout:.1f}s; "
+                        f"remaining command-feedback error: {lag_summary}; "
+                        "no newer command sent"
+                    )
                     self._emit_probe(dict(
                         event="return_fault",
                         fault="return feedback did not catch the held command",
                         phase=phase_label,
                         trigger=lead_hold_reason,
                         hold_elapsed_s=hold_elapsed,
+                        lagging_joints=(lagging + 1).tolist(),
                         held_command_physical_rad=lead_hold_target.tolist(),
                         feedback_physical_rad=current.tolist(),
                         lead_rad=lead_error.tolist(),
@@ -2812,10 +2831,6 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                         flush=True,
                     )
                     return False
-                catch_tolerance = np.minimum(
-                    0.5 * return_trajectory.lead,
-                    np.full(NERO_NUM_JOINTS, tolerance, dtype=np.float64),
-                )
                 if stationary and np.all(np.abs(lead_error) <= catch_tolerance):
                     return_trajectory.reset(lead_hold_target, stamp)
                     previous_stamp = float(stamp)

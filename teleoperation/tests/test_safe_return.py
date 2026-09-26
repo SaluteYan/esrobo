@@ -295,6 +295,20 @@ def test_execution_never_retries_or_disables_after_failure():
     d._arm.disable.assert_not_called()
 
 
+def test_return_exposes_specific_waypoint_failure_without_retry_or_disable():
+    d, _, _ = make_driver()
+    def fail(*_args, **_kwargs):
+        d._return_execution_failure = 'feedback did not catch held command within 2.0s; J7 +1.60deg'
+        return False
+    d._return_group_to_zero = mock.Mock(side_effect=fail)
+    with mock.patch('esrobo_teleop.robot.nero_driver.time.sleep'):
+        result = d.safe_return()
+    assert result.stage == 'executing'
+    assert 'J7 +1.60deg' in result.reason
+    d._return_group_to_zero.assert_called_once()
+    d._arm.disable.assert_not_called()
+
+
 def test_disabled_return_replans_once_from_new_stationary_start():
     d, feedback, zero = make_driver(initial=np.ones(7) * .03)
     enabled = {'value': False}

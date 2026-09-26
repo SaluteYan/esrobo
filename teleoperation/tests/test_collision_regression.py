@@ -342,6 +342,8 @@ class ReturnTrajectoryTests(unittest.TestCase):
         hold = next(item for item in events if item[0]['event'] == 'return_lead_hold')
         fault = next(item for item in events if item[0]['event'] == 'return_fault')
         self.assertEqual(fault[0]['fault'], 'return feedback did not catch the held command')
+        self.assertIn(7, fault[0]['lagging_joints'])
+        self.assertIn('J7', d._return_execution_failure)
         self.assertEqual(hold[1], fault[1])
         self.assertTrue(d._return_inhibited)
 
