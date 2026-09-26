@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from esrobo_link.protocol import ProtocolError, pack, unpack, validate_target
+from esrobo_link.protocol import ProtocolError, pack, unpack, validate_hold, validate_target
 from esrobo_link.session import SessionGate
 from esrobo_link.backends import HardwareBackend, MockBackend, MockDualBackend
 from esrobo_link.gateway import Gateway
@@ -69,8 +69,30 @@ class ProtocolTests(Fixture):
         with self.assertRaises(ProtocolError):
             validate_target(dict(message, arm_urdf_rad=None), contract)
 
+    def test_hold_is_only_for_one_arm_without_hand_and_has_no_position(self):
+        contract = MockBackend('right', False).contract
+        hold = dict(side='right', contract_id=contract['id'])
+        self.assertEqual(validate_hold(hold, contract), {'hold': True})
+        for invalid in (dict(side='left'), dict(arm_urdf_rad=[0.] * 7),
+                        dict(hand_unit=None)):
+            with self.subTest(invalid=invalid), self.assertRaises(ProtocolError):
+                validate_hold(dict(hold, **invalid), contract)
+        with self.assertRaises(ProtocolError):
+            validate_hold(hold, MockBackend('right', True).contract)
+
 
 class SessionTests(Fixture):
+    def test_fresh_hold_renews_lease_but_never_carries_a_position(self):
+        gate = SessionGate(MockBackend('right', False).contract)
+        gate.hello(dict(client_nonce='h'*32), PEER, 10., False)
+        state = gate.state(10., {})
+        hold = dict(type='hold', session=gate.session, seq=1,
+                    lease=state['lease'], contract_id=gate.contract['id'], side='right')
+        self.assertEqual(gate.accept(hold, PEER, 10.01), 'hold')
+        self.assertEqual(gate.target, {'hold': True})
+        self.assertTrue(gate.fresh(10.19))
+        self.assertFalse(gate.fresh(10.21))
+
     def test_delay_consumes_original_lease(self):
         self.gate.accept(self.msg, PEER, 10.19)
         self.assertAlmostEqual(self.gate.deadline, 10.2)
@@ -141,6 +163,19 @@ class GatewayTests(unittest.TestCase):
         self.gw.tick()
         self.assertFalse(self.backend.enabled)
         self.assertEqual(self.backend.q, [0.]*7)
+
+    def test_active_hold_keeps_mock_pose_without_reusing_previous_target(self):
+        self.start()
+        before = list(self.backend.q)
+        self.seq += 1
+        state = self.gw.gate.state(self.now, {})
+        self.gw.gate.accept(dict(type='hold', seq=self.seq, session=state['session'],
+            lease=state['lease'], side='left', contract_id=self.backend.contract['id']),
+            PEER, self.now)
+        self.assertEqual(self.gw.gate.target, {'hold': True})
+        self.gw.tick()
+        self.assertEqual(self.gw.mode, 'ACTIVE')
+        self.assertEqual(self.backend.q, before)
 
     def test_timeout_latches_and_requires_explicit_recovery(self):
         self.start()
@@ -324,8 +359,64 @@ class GatewayTests(unittest.TestCase):
             backend.prepare_step(lambda: False)
         backend.arm.emergency_stop.assert_called_once_with()
 
+    def test_arm_only_hardware_hold_uses_checked_braking_without_position_target(self):
+        backend = HardwareBackend.__new__(HardwareBackend)
+        backend.hand_only = False
+        backend.hand = None
+        backend.arm = Mock()
+        backend.arm.hold_command_trajectory.return_value = True
+        backend.prepare_step = Mock()
+        backend.send_arm = Mock()
+        backend.step({'hold': True}, lambda: False)
+        backend.prepare_step.assert_called_once()
+        backend.arm.hold_command_trajectory.assert_called_once_with()
+        backend.send_arm.assert_not_called()
+
 
 class NetworkTests(unittest.TestCase):
+    def test_udp_hold_requires_active_session_and_keeps_watchdog(self):
+        gw = Gateway(MockBackend('right', False), KEY, port=0)
+        worker = threading.Thread(target=gw.run)
+        worker.start()
+        with tempfile.TemporaryDirectory() as directory:
+            keyfile = Path(directory) / 'key'
+            keyfile.write_bytes(KEY)
+            client = RobotClient(*gw.address, keyfile)
+            try:
+                client.connect()
+                client.send_hold()
+                deadline = time.monotonic() + 1.
+                while time.monotonic() < deadline and gw.rejected_packets == 0:
+                    client.receive()
+                self.assertGreater(gw.rejected_packets, 0)
+                self.assertIsNone(gw.gate.target)
+                client.receive()
+                client.send_target([0.] * 7)
+                deadline = time.monotonic() + 1.
+                while time.monotonic() < deadline and gw.gate.target is None:
+                    client.receive()
+                self.assertIsNotNone(gw.gate.target)
+                gw.request('e')
+                deadline = time.monotonic() + 1.
+                while time.monotonic() < deadline and gw.mode != 'ACTIVE':
+                    client.receive()
+                    client.send_target([0.] * 7)
+                self.assertEqual(gw.mode, 'ACTIVE')
+                client.receive()
+                client.send_hold()
+                deadline = time.monotonic() + 1.
+                while time.monotonic() < deadline and gw.gate.target != {'hold': True}:
+                    client.receive()
+                self.assertEqual(gw.gate.target, {'hold': True})
+                self.assertEqual(gw.mode, 'ACTIVE')
+                time.sleep(.26)
+                self.assertEqual(gw.mode, 'FAULT')
+            finally:
+                client.socket.close()
+                gw.request('q')
+                worker.join(2.)
+                self.assertFalse(worker.is_alive())
+
     def test_real_udp_client_gateway_and_timeout(self):
         gw = Gateway(MockBackend(), KEY, port=0)
         worker = threading.Thread(target=gw.run)

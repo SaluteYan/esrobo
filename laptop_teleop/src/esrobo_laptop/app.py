@@ -114,7 +114,12 @@ def send_targets(client, targets, settings):
             left_hand_unit=targets["left"]["hand_unit"],
             right_hand_unit=targets["right"]["hand_unit"])
     else:
-        client.send_target(**targets[settings.side])
+        target = targets[settings.side]
+        if target.get("hold"):
+            client.send_hold()
+        else:
+            client.send_target(arm_urdf_rad=target["arm_urdf_rad"],
+                               hand_unit=target["hand_unit"])
 
 
 class Controller:
@@ -173,7 +178,10 @@ class Controller:
         if frame is None:
             return None
         if mode in ("CALIBRATING", "ACTIVE") or self.preview:
-            targets = self.pipeline.solve(frame, measured, feedback)
+            targets = self.pipeline.solve(
+                frame, measured, feedback,
+                allow_limit_hold=(mode == "ACTIVE" and not self.preview),
+            )
         else:
             targets = measured_targets(feedback, self.settings)
         # Recheck original sample/feedback ages AFTER potentially slow IK. Never
@@ -320,7 +328,12 @@ def main(argv=None):
                 if targets is not None:
                     compute_times.append(time.monotonic())
                     compute_durations_ms.append((time.perf_counter()-step_started)*1000.)
-                status = state["mode"] if targets is not None else "waiting for next complete source frame"
+                if targets is None:
+                    status = "waiting for next complete source frame"
+                elif any(target.get("hold") for target in targets.values()):
+                    status = "ACTIVE: joint position limit; arm braking/holding, move PICO arm back"
+                else:
+                    status = state["mode"]
             except (InputUnavailable, TimeoutError) as exc:
                 status = str(exc)
                 if isinstance(exc, InputUnavailable) and "_hand" in status:
@@ -346,6 +359,8 @@ def main(argv=None):
                 control_monitor.observe(now, state["mode"], targets is not None)
             record = dict(unix_ns=time.time_ns(), monotonic_s=now, mode=state["mode"], status=status,
                           sent=controller.sent, preview=args.preview, targets=targets,
+                          position_limit_hold=bool(targets and any(
+                              target.get("hold") for target in targets.values())),
                           feedback=state.get("feedback"), feedback_cache_age_s=state.get("feedback_cache_age_s"),
                           input_rejection=pipeline.body.last_rejection)
             if state["mode"] in ("RETURNING", "CALIBRATING"):

@@ -143,6 +143,8 @@ class Gateway:
                             self.gate.hello(message, peer, now,
                                             self.mode in ("ACTIVE", "ARMING", "RETURNING", "RECOVERING", "CALIBRATING"))
                         else:
+                            if message.get("type") == "hold" and self.mode != "ACTIVE":
+                                raise ProtocolError("hold requires an active arm session")
                             kind = self.gate.accept(message, peer, now)
                             if kind == "stop":
                                 self.trip("laptop requested stop")

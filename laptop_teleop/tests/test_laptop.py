@@ -17,7 +17,7 @@ from esrobo_teleop.ik.solver import IkSolver
 from esrobo_teleop.robot.linker_hand_driver import LinkerHandDriver, L10_PHYSICAL_JOINT_NAMES
 
 from esrobo_laptop.acquisition import AnnotatedSocket, annotate, senseglove
-from esrobo_laptop.app import Controller, ControlRateMonitor, feedback_for, main
+from esrobo_laptop.app import Controller, ControlRateMonitor, feedback_for, main, send_targets
 from esrobo_laptop.config import ROOT, Settings, read_settings, read_robot_config
 from esrobo_laptop.contract import local_id, verify_contract
 from esrobo_laptop.demo import run_demo
@@ -313,6 +313,58 @@ def test_controller_hold_never_sends_solved_target_before_active():
     with pytest.raises(InputUnavailable):
         controller.step(state)
     client.send_target.assert_not_called()
+
+
+def test_recoverable_position_limit_brakes_then_resumes_after_three_good_frames(config):
+    pipeline = Pipeline.__new__(Pipeline)
+    pipeline.cfg = config
+    pipeline.settings = Settings(side="right", with_hand=False)
+    solver = Mock()
+    solver._prev_targets = np.zeros(14)
+    solver.solve.return_value = np.zeros(14)
+    solver.last_solution_valid = False
+    solver.solution_diagnostics = dict(recoverable_position_limit=True,
+                                       active_position_bounds=[dict(joint=2, bound="upper",
+                                                                    limit_rad=.122173)])
+    pipeline.solvers = {"right": solver}
+    pipeline.wrists = {}
+    pipeline.position_solutions = {}
+    pipeline.position_limit_holds = {"right": False}
+    pipeline.position_limit_recovery = {"right": 0}
+    pipeline.check_ticket = Mock()
+    frame = ({"right_arm": time.monotonic()}, dict(left_wrist=None, right_wrist=None,
+                                                   left_elbow=None, right_elbow=None), None)
+    measured = np.zeros(14)
+    targets = pipeline.solve(frame, measured, {}, allow_limit_hold=True)
+    assert targets["right"]["hold"] is True
+    client = Mock()
+    send_targets(client, targets, pipeline.settings)
+    client.send_hold.assert_called_once_with()
+    client.send_target.assert_not_called()
+
+    solver.last_solution_valid = True
+    solver.solution_diagnostics = dict(elbow_error_m=.02, wrist_error_m=.01)
+    for _ in range(config.ik.position_limit_recovery_frames - 1):
+        assert pipeline.solve(frame, measured, {}, allow_limit_hold=True)["right"]["hold"] is True
+    assert pipeline.solve(frame, measured, {}, allow_limit_hold=True)["right"]["hold"] is False
+
+
+def test_nonrecoverable_ik_rejection_still_stops_following(config):
+    pipeline = Pipeline.__new__(Pipeline)
+    pipeline.cfg = config
+    pipeline.settings = Settings(side="right", with_hand=False)
+    solver = Mock(_prev_targets=np.zeros(14), last_solution_valid=False,
+                  solution_diagnostics=dict(recoverable_position_limit=False))
+    solver.solve.return_value = np.zeros(14)
+    pipeline.solvers = {"right": solver}
+    pipeline.wrists = {}
+    pipeline.position_solutions = {}
+    pipeline.position_limit_holds = {"right": False}
+    pipeline.position_limit_recovery = {"right": 0}
+    with pytest.raises(InputUnavailable, match="right IK rejected"):
+        pipeline.solve(({}, dict(left_wrist=None, right_wrist=None,
+                                 left_elbow=None, right_elbow=None), None),
+                       np.zeros(14), {}, allow_limit_hold=True)
 
 
 def test_pico_open_reference_maps_first_hand_target_to_robot_open(config):

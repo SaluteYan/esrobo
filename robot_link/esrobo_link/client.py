@@ -3,7 +3,7 @@ import secrets
 import socket
 import time
 
-from .protocol import MAX_PACKET, ProtocolError, key_from_file, pack, unpack, validate_target
+from .protocol import MAX_PACKET, ProtocolError, key_from_file, pack, unpack, validate_hold, validate_target
 
 
 class RobotClient:
@@ -79,6 +79,15 @@ class RobotClient:
                        hand_unit=None if hand_unit is None else list(hand_unit))
         validate_target(payload, c)
         self._command("target", **payload)
+
+    def send_hold(self):
+        """Renew a fresh arm-only lease and ask the robot to brake/hold."""
+        if self.latest is None:
+            raise RuntimeError("connect first")
+        c = self.latest["contract"]
+        payload = dict(side=c["side"], contract_id=c["id"])
+        validate_hold(payload, c)
+        self._command("hold", **payload)
 
     def send_hand_target(self, hand_unit):
         """Send one single-side hand target without any arm command field."""

@@ -2,7 +2,7 @@
 from collections import OrderedDict
 import secrets
 
-from .protocol import ProtocolError, validate_target
+from .protocol import ProtocolError, validate_hold, validate_target
 
 
 class SessionGate:
@@ -60,10 +60,12 @@ class SessionGate:
         kind = msg.get("type")
         if kind == "target":
             target = validate_target(msg, self.contract)
+        elif kind == "hold":
+            target = validate_hold(msg, self.contract)
         elif kind == "stop":
             target = None
         else:
-            raise ProtocolError("only target and stop accepted; enable/return are local")
+            raise ProtocolError("only target, hold and stop accepted; enable/return are local")
         self.sequence, self.last_seen = seq, now
         self.target = target
         # A packet delayed in flight gets only its remaining lease, NOT a new TTL.

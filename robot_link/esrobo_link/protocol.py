@@ -98,3 +98,15 @@ def validate_target(msg, contract):
     elif hand is not None:
         raise ProtocolError("hand not enabled on this endpoint")
     return {"arm_urdf_rad": arm, "hand_unit": hand}
+
+
+def validate_hold(msg, contract):
+    """A fresh single arm request to brake/hold without a position target."""
+    if (contract["side"] == "both" or contract.get("with_hand")
+            or contract.get("hand_only")):
+        raise ProtocolError("hold is commissioned only for one arm without a hand")
+    if msg.get("contract_id") != contract["id"] or msg.get("side") != contract["side"]:
+        raise ProtocolError("side/configuration contract mismatch")
+    if any(name in msg for name in ("arm_urdf_rad", "hand_unit", "targets")):
+        raise ProtocolError("hold cannot contain a position or hand command")
+    return {"hold": True}

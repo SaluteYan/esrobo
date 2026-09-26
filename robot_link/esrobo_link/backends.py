@@ -44,6 +44,10 @@ class MockBackend:
     def step(self, target, cancelled):
         if cancelled() or (self.hand_only and not self.hand_enabled) or (not self.hand_only and not self.enabled):
             raise RuntimeError("not enabled/cancelled")
+        if target.get("hold"):
+            if self.hand is not None or self.hand_only:
+                raise RuntimeError("hold is available only for one arm without a hand")
+            return
         if not self.hand_only:
             self.q = [q + max(-.005, min(.005, t - q)) for q, t in zip(self.q, target["arm_urdf_rad"])]
         if self.hand is not None:
@@ -321,6 +325,12 @@ class HardwareBackend:
 
     def step(self, target, cancelled):
         self.prepare_step(cancelled)
+        if target.get("hold"):
+            if self.hand is not None or self.hand_only:
+                raise RuntimeError("hold is available only for one arm without a hand")
+            if not self.arm.hold_command_trajectory():
+                raise RuntimeError(self.arm.safety_fault_reason or "arm hold rejected")
+            return
         if self.hand_only:
             if self.hand is None or not self.hand.command_physical(self.side, target["hand_unit"]):
                 raise RuntimeError("hand command rejected/feedback expired")

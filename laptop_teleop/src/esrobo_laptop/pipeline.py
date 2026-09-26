@@ -36,6 +36,8 @@ class Pipeline:
         self.hand_references = {}
         self.preparation_status = "等待使能准备"
         self.position_solutions = {}
+        self.position_limit_holds = {side: False for side in settings.sides}
+        self.position_limit_recovery = {side: 0 for side in settings.sides}
         self.initialized = False
         self._diagnostics_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._last_diagnostics_time = 0.0
@@ -45,6 +47,8 @@ class Pipeline:
         self.hand_references.clear()
         self.wrists.clear()
         self.position_solutions.clear()
+        self.position_limit_holds = {side: False for side in self.settings.sides}
+        self.position_limit_recovery = {side: 0 for side in self.settings.sides}
         self.initialized = False
         if self.settings.hand_only:
             self.preparation_status = "请自然张开所选侧人手并保持稳定"
@@ -104,7 +108,7 @@ class Pipeline:
                 raise InputUnavailable("PICO finger tracking missing")
             return ticket, poses, hand
 
-    def solve(self, frame, measured, feedback):
+    def solve(self, frame, measured, feedback, *, allow_limit_hold=False):
         ticket, poses, hands = frame
         if self.settings.hand_only:
             result = {}
@@ -136,19 +140,54 @@ class Pipeline:
                     poses["left_wrist"], poses["right_wrist"], measured,
                     poses["left_elbow"], poses["right_elbow"],
                     partitioned_side=side, terminal_joint_targets=terminal_target)
-                if not solver.last_solution_valid or not np.all(np.isfinite(q)):
+                if np.shape(q) != (14,) or not np.all(np.isfinite(q)):
                     raise InputUnavailable(f"{side} IK rejected: {solver.solution_diagnostics}")
-                return q
+                recoverable = bool(
+                    allow_limit_hold and len(self.settings.sides) == 1
+                    and not self.settings.with_hand
+                    and solver.solution_diagnostics.get("recoverable_position_limit")
+                    and solver._prev_targets is not None
+                )
+                if not solver.last_solution_valid and not recoverable:
+                    raise InputUnavailable(f"{side} IK rejected: {solver.solution_diagnostics}")
+                hold = not solver.last_solution_valid
+                if self.position_limit_holds[side] and solver.last_solution_valid:
+                    error = max(
+                        float(solver.solution_diagnostics.get("elbow_error_m", float("inf"))),
+                        float(solver.solution_diagnostics.get("wrist_error_m", float("inf"))),
+                    )
+                    self.position_limit_recovery[side] = (
+                        self.position_limit_recovery[side] + 1
+                        if error <= self.cfg.ik.position_limit_recovery_error_m else 0
+                    )
+                    hold = self.position_limit_recovery[side] < self.cfg.ik.position_limit_recovery_frames
+                elif hold:
+                    self.position_limit_recovery[side] = 0
+                if hold != self.position_limit_holds[side]:
+                    self.position_limit_holds[side] = hold
+                    if hold:
+                        bounds = solver.solution_diagnostics.get("active_position_bounds", [])
+                        label = ", ".join(
+                            f"J{item['joint']} {item['bound']} "
+                            f"({np.degrees(item['limit_rad']):.1f}deg)"
+                            for item in bounds
+                        ) or "joint bound"
+                        print(f"[laptop] {side.upper()} TARGET PAUSED at {label}; "
+                              "robot braking/hold active. Move PICO arm back into reachable range.", flush=True)
+                    else:
+                        print(f"[laptop] {side.upper()} target reachable; following resumed.", flush=True)
+                return q, hold
 
-            q = solve_once(terminal)
-            if wrist:
+            q, hold = solve_once(terminal)
+            if wrist and not hold:
                 self.position_solutions[side] = q.copy()
             hand = None
             if self.settings.with_hand:
                 start = 0 if side == "left" else 10
                 hand = hand_units(hands[start:start+10], feedback[side]["hand"]["position_unit"],
                                   self.cfg.hand, side, self.hand_references.get(side))
-            result[side] = dict(arm_urdf_rad=q[offset:offset+7].tolist(), hand_unit=hand)
+            result[side] = dict(arm_urdf_rad=q[offset:offset+7].tolist(), hand_unit=hand,
+                                hold=hold)
         self.check_ticket(ticket)
         return result
 
