@@ -462,12 +462,15 @@ class NeroArm:
                 return None
             time.sleep(0.01)
 
-    def runtime_feedback(self, max_age_s=0.1, recovery_timeout_s=0.3):
+    def runtime_feedback(self, max_age_s=0.1, recovery_timeout_s=0.3,
+                         *, allow_long_gap_recovery=False):
         """Read the pinned source, requiring two fresh frames after a short gap.
 
         A gap never returns stale feedback and therefore cannot produce a new
         command.  It remains transient only for ``recovery_timeout_s``; malformed
         data, reversed timestamps and excessive position jumps fail immediately.
+        A verified disabled arm may revalidate two frames after a longer gap;
+        this never applies while motors are enabled.
         """
         previous = getattr(self, "_runtime_feedback", None)
         self.runtime_feedback_failure = None
@@ -519,7 +522,7 @@ class NeroArm:
             return previous
 
         if gap_detected:
-            if accepted_age > recovery_timeout_s:
+            if accepted_age > recovery_timeout_s and not allow_long_gap_recovery:
                 return reject(
                     f"no accepted complete feedback for over {recovery_timeout_s * 1000:.0f} ms",
                     feedback_gap_s=accepted_age,
@@ -1642,9 +1645,15 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 }
                 self.record_startup_event("runtime_feedback_rejected")
                 return None
+        disabled_feedback_recovery = (
+            not self._enabled
+            and self._arm.get_joint_enable_states() == [False] * NERO_NUM_JOINTS
+            and self._arm.controller_fault(allow_disabled=True) is None
+        )
         self._cycle_feedback = self._arm.runtime_feedback(
             max_age_s=self._cfg.command_trajectory_max_dt_s,
             recovery_timeout_s=self._cfg.runtime_feedback_recovery_timeout_s,
+            allow_long_gap_recovery=disabled_feedback_recovery,
         )
         if self._cycle_feedback is None:
             failure = getattr(self._arm, "runtime_feedback_failure", None)

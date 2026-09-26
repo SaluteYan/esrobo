@@ -411,6 +411,22 @@ class DriverTrajectoryTests(unittest.TestCase):
         driver._arm.get_joint_angles.assert_called_once()
         driver._arm.runtime_feedback.assert_called_once()
 
+    def test_long_gap_revalidation_is_limited_to_verified_disabled_arm(self):
+        driver = self.driver()
+        snapshot = JointFeedbackSnapshot(
+            self.current.copy(), 10.02, time.monotonic(), "get_joint_angles"
+        )
+        driver._arm.runtime_feedback.return_value = snapshot
+        driver._arm.get_joint_enable_states.return_value = [False] * 7
+        driver._enabled = False
+        self.assertIsNotNone(driver.read_control_cycle_joints())
+        self.assertTrue(driver._arm.runtime_feedback.call_args.kwargs["allow_long_gap_recovery"])
+        driver._arm.move_j.assert_not_called()
+        driver._arm.runtime_feedback.reset_mock()
+        driver._enabled = True
+        self.assertIsNotNone(driver.read_control_cycle_joints())
+        self.assertFalse(driver._arm.runtime_feedback.call_args.kwargs["allow_long_gap_recovery"])
+
     def test_first_robot_link_cycle_keeps_missing_feedback_closed(self):
         driver = self.driver()
         driver._arm._runtime_feedback = None

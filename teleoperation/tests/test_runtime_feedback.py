@@ -96,6 +96,34 @@ class RuntimeFeedbackTests(unittest.TestCase):
         self.assertFalse(arm.runtime_feedback_failure["transient"])
         self.assertIn("300 ms", arm.runtime_feedback_failure["reason"])
 
+    @mock.patch("esrobo_teleop.robot.nero_driver.time.monotonic", return_value=21.0)
+    def test_verified_disabled_gap_requires_two_new_frames(self, clock):
+        arm = self.arm()
+        arm._robot.get_joint_angles.return_value = SimpleNamespace(
+            msg=np.ones(7) * .01, timestamp=101.0
+        )
+        self.assertIsNone(arm.runtime_feedback(allow_long_gap_recovery=True))
+        self.assertEqual(arm.runtime_feedback_failure["recovery_samples"], 1)
+        self.assertEqual(arm.last_feedback_timestamp, 100.)
+        clock.return_value = 21.02
+        arm._robot.get_joint_angles.return_value = SimpleNamespace(
+            msg=np.ones(7) * .012, timestamp=101.02
+        )
+        recovered = arm.runtime_feedback(allow_long_gap_recovery=True)
+        self.assertIsNotNone(recovered)
+        self.assertTrue(arm.runtime_feedback_recovered)
+        self.assertEqual(recovered.stamp, 101.02)
+
+    @mock.patch("esrobo_teleop.robot.nero_driver.time.monotonic", return_value=21.0)
+    def test_long_gap_recovery_rejects_position_jump(self, clock):
+        arm = self.arm()
+        arm._robot.get_joint_angles.return_value = SimpleNamespace(
+            msg=np.ones(7) * .1, timestamp=101.0
+        )
+        self.assertIsNone(arm.runtime_feedback(allow_long_gap_recovery=True))
+        self.assertIn("jump", arm.runtime_feedback_failure["reason"])
+        self.assertEqual(arm.last_feedback_timestamp, 100.)
+
     @mock.patch("esrobo_teleop.robot.nero_driver.time.sleep")
     def test_startup_requires_two_samples_of_same_source(self, sleep):
         arm = NeroArm.__new__(NeroArm)
