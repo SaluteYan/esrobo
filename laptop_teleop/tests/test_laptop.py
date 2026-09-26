@@ -47,8 +47,7 @@ def test_contract_rejects_config_or_model_difference(config):
         verify_contract(contract, config, settings)
 
 
-@pytest.mark.parametrize("side", ["left", "right"])
-def test_fingerprint_matches_actual_robot_backend_construction(config, side):
+def test_fingerprint_matches_actual_robot_backend_construction(config):
     # Construct the real backend contract while replacing every hardware/mesh
     # dependency. This detects fingerprint drift against the actual gateway.
     arm = Mock()
@@ -58,18 +57,12 @@ def test_fingerprint_matches_actual_robot_backend_construction(config, side):
     arm.command_trajectory_enabled = True
     path = ROOT.parent / "teleoperation/config/teleop_config.yaml"
     with patch("esrobo_teleop.robot.nero_driver.NeroSingleArmDriver", return_value=arm), \
-         patch("esrobo_teleop.robot.torso_collision.TorsoCollisionGuard") as guard_factory, \
+         patch("esrobo_teleop.robot.torso_collision.TorsoCollisionGuard"), \
          patch("esrobo_link.backends.ForwardModel"):
-        backend = HardwareBackend(path, side, False)
-        assert backend.contract["id"] == local_id(config, side, False)
-        verify_contract(backend.contract, config, Settings(side=side, with_hand=False))
-        assert guard_factory.call_args.args[3] == config.robot.torso_collision_margin_for(side)
+        backend = HardwareBackend(path, "left", False)
+        assert backend.contract["id"] == local_id(config, "left", False)
+        verify_contract(backend.contract, config, Settings(side="left", with_hand=False))
         backend.close()
-
-
-def test_right_torso_margin_is_locally_reduced_without_changing_left(config):
-    assert config.robot.torso_collision_margin_for("left") == .03
-    assert config.robot.torso_collision_margin_for("right") == .029
 
 
 def test_mock_does_not_accept_real_or_wrong_side_contract(config):

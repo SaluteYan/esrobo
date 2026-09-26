@@ -99,7 +99,7 @@ class TeleopNode:
                     # Fail closed before connect/enable if geometry is missing.
                     self._driver.configure_collision_guard(TorsoCollisionGuard(
                         self._ik, arm_side, cfg.robot.collision_package_dirs,
-                        cfg.robot.torso_collision_margin_for(arm_side),
+                        cfg.robot.torso_collision_margin_m,
                         cfg.robot.shoulder_collision_margin_m,
                         include_fingers=self._arm_with_hand))
 

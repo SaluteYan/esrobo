@@ -55,7 +55,6 @@ robot:
   teleop_torso_collision_enabled: false
   collision_package_dirs: []  # also search model/urdf beside the workspace
   torso_collision_margin_m: 0.03
-  right_torso_collision_margin_m: 0.029  # commissioned right arm/torso clearance; left remains 0.03
   shoulder_collision_margin_m: 0.005  # installed link2/waist3 attachment clearance
   # Initial full-arm J1..J7 commissioning limits. Velocity is rad/s,
   # acceleration is rad/s^2, and step is rad per accepted feedback update.

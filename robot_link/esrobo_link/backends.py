@@ -193,7 +193,7 @@ class HardwareBackend:
         model = ForwardModel(cfg.ik)
         self.arm.configure_command_trajectory(model.fk(side), cfg.retarget.max_endpoint_translation_velocity_m_s)
         guard = TorsoCollisionGuard(model, side, cfg.robot.collision_package_dirs,
-                                   cfg.robot.torso_collision_margin_for(side),
+                                   cfg.robot.torso_collision_margin_m,
                                    cfg.robot.shoulder_collision_margin_m, include_fingers=with_hand)
         self.arm.configure_collision_guard(guard)
         try:
