@@ -6,6 +6,8 @@ PICO Body 的 24 关节提供肩、肘和手腕整体姿态；五指来自同一
 
 详细安装和每日操作命令集中在 [`docs/`](docs/README.md)。首次部署按文档 01→02→03 的顺序执行。
 
+代码结构、具体实现与遥操作计算链路见 [`docs/08_CODE_AND_COMPUTATION.md`](docs/08_CODE_AND_COMPUTATION.md)。
+
 统一网页控制台负责本机与机器人程序管理、模式选择、标定交互、使能/停止、反馈与日志展示，并通过 SSH 接入现有相机和头部调整页面。网页操作见 [`docs/05_WEB_CONSOLE.md`](docs/05_WEB_CONSOLE.md)。
 
 ## 系统边界
