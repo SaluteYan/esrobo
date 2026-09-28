@@ -132,7 +132,7 @@ tail -n 20 "$(ls -1t laptop_teleop/log/session_*.jsonl | head -1)"
 
 不要先放宽超时来掩盖掉线。先确认采样率、CPU 负载、网络和机器人反馈链路。
 
-若显示 `control rate … Hz below required 40.0 Hz`，表示 `ARMING`/`ACTIVE` 中目标生成平均频率低于门槛，本机会停止发送并请求网关停止。仅灵巧手模式采用最近两秒、35 Hz 的停止线（40 Hz 配置值减去 `hand_only_rate_tolerance_hz: 5`），以容纳 PICO 的短时采样波动；配置校验不允许将该停止线降到 35 Hz 以下。其他模式仍采用最近一秒、0.5 Hz 容差。80 ms 无目标间隔门禁、100 ms 输入新鲜度和机器人网关目标租约不变。先看最新 `session_*.jsonl` 中的 `rates.loop_hz`、`rates.compute_hz`、`rates.deadline_misses`、`source_hz` 和 `sent` 增量。`source_hz` 正常而 `sent` 掉速时，继续核对网关状态回包节拍；本机每轮须先收到新的网关状态才会计算和发送目标。网关状态发送使用固定 20 ms 节拍的修复需要在机器人上更新并重启网关进程，刷新网页不会更新已运行的网关。若更新后再次停止，应分别记录故障前两秒的目标数、PICO 输入率、网关日志和两端 CPU 负载。
+若显示 `control rate … Hz below required 40.0 Hz`，表示 `ARMING`/`ACTIVE` 中目标生成平均频率低于门槛，本机会停止发送并请求网关停止。机械臂与仅灵巧手模式均采用最近两秒、35 Hz 的停止线（40 Hz 配置值分别减去 `arm_rate_tolerance_hz: 5` 或 `hand_only_rate_tolerance_hz: 5`），容纳短时采样与调度波动；配置校验不允许将停止线降到 35 Hz 以下。80 ms 无目标间隔门禁、100 ms 输入新鲜度和机器人网关目标租约不变。先看最新 `session_*.jsonl` 中的 `rates.loop_hz`、`rates.compute_hz`、`rates.deadline_misses`、`source_hz` 和 `sent` 增量。`source_hz` 正常而 `sent` 掉速时，继续核对网关状态回包节拍；本机每轮须先收到新的网关状态才会计算和发送目标。网关状态发送使用固定 20 ms 节拍的修复需要在机器人上更新并重启网关进程，刷新网页不会更新已运行的网关。若更新后再次停止，应分别记录故障前两秒的目标数、PICO 输入率、网关日志和两端 CPU 负载。
 
 灵巧手反馈应在机器人端保持约 59 Hz：
 

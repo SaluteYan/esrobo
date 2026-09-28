@@ -8,12 +8,15 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from esrobo_laptop.dashboard import Console, Process, make_handler, validate_mode
+from esrobo_laptop.dashboard import (Console, Process, REMOTE_STATUS,
+                                     WaistCommandNotSent, make_handler, validate_mode)
 from http.server import ThreadingHTTPServer
 
 
 @pytest.fixture
-def console():
+def console(tmp_path, monkeypatch):
+    from esrobo_laptop import dashboard
+    monkeypatch.setattr(dashboard, 'WAIST_MOVED_FILE', tmp_path / 'waist_marker.json')
     c = Console.__new__(Console)
     c.ssh = None
     c.processes = {}
@@ -28,6 +31,9 @@ def console():
     c.closed = threading.Event()
     c.events = deque(maxlen=80)
     c.mode = dict(side='both', with_hand=True, hand_only=False, preview=False)
+    c.waist_pending = None
+    c.waist_pending_hits = 0
+    c.waist_enable_requested = False
     c.refresh = Mock()
     c.key = Mock()
     return c
@@ -67,7 +73,11 @@ def test_cross_origin_and_rebinding_requests_are_rejected():
 
 def ready(c):
     c.owner = 'test-browser-session'
+    c.remote = {'sessions': ['esrobo_waist']}
     c.running = Mock(return_value=True)
+    c.waist_command = Mock(return_value=dict(axes={
+        str(axis): dict(position_deg=position, velocity=0.0, error=0)
+        for axis, position in ((31, 139.0), (32, 215.0), (33, 144.0))}))
     c.telemetry = Mock(return_value=dict(age_s=.05, targets={'left':{}}, sent=3))
     c.robot_state = Mock(return_value=dict(mode='IDLE', age_s=.05, feedback={'sides':{
         'left':dict(controller_fault=None, hand=dict(geometry=dict(
@@ -97,6 +107,33 @@ def test_enable_uses_existing_operator_channel(console):
     ready(console)
     request(console, 'gateway_key', key='e')
     console.key.assert_called_once_with('e')
+    console.waist_command.assert_called_once_with('status')
+
+
+def test_enable_rejects_waist_away_from_urdf_pose(console):
+    ready(console)
+    console.waist_command.return_value['axes']['32']['position_deg'] = 214.7
+    with pytest.raises(RuntimeError, match='腰部 32 号未停在 URDF 竖直基准'):
+        request(console, 'gateway_key', key='e')
+    console.key.assert_not_called()
+
+
+def test_enable_rejects_missing_waist_feedback(console):
+    ready(console)
+    console.waist_command.return_value['axes'].pop('33')
+    with pytest.raises(RuntimeError, match='腰部三轴反馈不完整'):
+        request(console, 'gateway_key', key='e')
+    console.key.assert_not_called()
+
+
+@pytest.mark.parametrize('field,value', [('velocity', 1.1), ('error', 7),
+                                         ('position_deg', float('nan'))])
+def test_enable_rejects_unstable_or_faulted_waist(console, field, value):
+    ready(console)
+    console.waist_command.return_value['axes']['31'][field] = value
+    with pytest.raises(RuntimeError, match='腰部 31 号未停在 URDF 竖直基准'):
+        request(console, 'gateway_key', key='e')
+    console.key.assert_not_called()
 
 
 def test_enable_rejects_missing_hand_geometry_before_robot_command(console):
@@ -160,9 +197,253 @@ def test_fault_recovery_rejects_old_robot_gateway(console):
     console.key.assert_not_called()
 
 
+def test_waist_jog_requires_disabled_arm_and_blocks_next_arm_enable(console, tmp_path):
+    from esrobo_laptop import dashboard
+    console.remote = {'sessions': ['esrobo_gateway', 'esrobo_waist'],
+                      'waist_control_available': True}
+    console.robot_state = Mock(return_value=dict(
+        mode='FAULT', age_s=.05, feedback={'enable_states': [False] * 7}))
+    console.running = Mock(return_value=False)
+    console.waist_enable_requested = True
+    console.waist_command = Mock(return_value=dict(
+        axis=33, from_deg=170.0, target_deg=171.0, message='sent'))
+    with patch.object(dashboard, 'WAIST_MOVED_FILE', tmp_path / 'waist.json'):
+        request(console, 'waist', command='jog', axis=33, direction=1)
+        assert dashboard.WAIST_MOVED_FILE.exists()
+        console.waist_command.assert_called_once_with('jog', 33, 1)
+        with pytest.raises(RuntimeError, match='腰部曾通过页面离开竖直基准'):
+            request(console, 'gateway_key', key='e')
+        console.key.assert_not_called()
+
+
+def test_waist_jog_rejects_enabled_arm_before_ros_command(console, tmp_path):
+    from esrobo_laptop import dashboard
+    console.remote = {'sessions': ['esrobo_gateway', 'esrobo_waist'],
+                      'waist_control_available': True}
+    console.robot_state = Mock(return_value=dict(
+        mode='FAULT', age_s=.05, feedback={'enable_states': [True] * 7}))
+    console.running = Mock(return_value=False)
+    console.waist_command = Mock()
+    with patch.object(dashboard, 'WAIST_MOVED_FILE', tmp_path / 'waist.json'):
+        with pytest.raises(RuntimeError, match='七轴全部失能'):
+            request(console, 'waist', command='jog', axis=33, direction=1)
+        console.waist_command.assert_not_called()
+
+
+def test_waist_requires_enable_request_before_motion(console):
+    console.remote = {'sessions': ['esrobo_gateway', 'esrobo_waist'],
+                      'waist_control_available': True}
+    console.robot_state = Mock(return_value=dict(
+        mode='IDLE', age_s=.05, feedback={'enable_states': [False] * 7}))
+    console.running = Mock(return_value=False)
+    console.waist_command = Mock(return_value=dict(message='enable sent'))
+    with pytest.raises(RuntimeError, match='尚未请求使能'):
+        request(console, 'waist', command='jog', axis=33, direction=1)
+    console.waist_command.assert_not_called()
+    request(console, 'waist', command='enable')
+    assert console.waist_enable_requested is True
+
+
+def test_waist_driver_restart_requires_new_enable_request(console):
+    from esrobo_laptop.dashboard import Console
+    console.remote = {'waist_session_id': '$2:123'}
+    console.waist_enable_requested = True
+    console.command = Mock(return_value=json.dumps({'sessions': ['esrobo_waist'],
+                                                    'waist_session_id': '$3:456'}))
+    Console.refresh(console)
+    assert console.waist_enable_requested is False
+
+
+def test_waist_feedback_read_does_not_wait_for_gateway_refresh(console):
+    console.waist_command = Mock(return_value=dict(axes={
+        str(axis): dict(position_deg=position, error=0)
+        for axis, position in ((31, 120.0), (32, 260.0), (33, 170.0))}))
+    result = request(console, 'waist', command='status')
+    assert result['motion_pending'] is False
+    console.refresh.assert_not_called()
+    console.waist_command.assert_called_once_with('status', None, None)
+
+
+def test_waist_jog_waits_for_measured_target_then_accepts_next_step(console, tmp_path):
+    from esrobo_laptop import dashboard
+    console.remote = {'sessions': ['esrobo_gateway', 'esrobo_waist'],
+                      'waist_control_available': True}
+    console.robot_state = Mock(return_value=dict(
+        mode='IDLE', age_s=.05, feedback={'enable_states': [False] * 7}))
+    console.running = Mock(return_value=False)
+    console.waist_enable_requested = True
+    positions = {31: 139.0, 32: 215.0, 33: 144.0}
+
+    def command(action, axis=None, direction=None):
+        if action == 'jog':
+            return dict(axis=axis, from_deg=positions[axis],
+                        target_deg=positions[axis] + direction, message='sent')
+        return dict(axes={str(key): dict(position_deg=value, error=0)
+                          for key, value in positions.items()}, message='read')
+
+    console.waist_command = Mock(side_effect=command)
+    with patch.object(dashboard, 'WAIST_MOVED_FILE', tmp_path / 'waist.json'):
+        request(console, 'waist', command='jog', axis=33, direction=1)
+        with pytest.raises(RuntimeError, match='尚未确认到位'):
+            request(console, 'waist', command='jog', axis=33, direction=1)
+        assert request(console, 'waist', command='status')['motion_pending'] is True
+        positions[33] = 145.0
+        assert request(console, 'waist', command='status')['motion_pending'] is True
+        assert request(console, 'waist', command='status')['motion_pending'] is False
+        request(console, 'waist', command='jog', axis=33, direction=1)
+        assert json.loads(dashboard.WAIST_MOVED_FILE.read_text())['pending']['target'] == 146.0
+
+
+def test_waist_single_turn_battery_warning_confirms_target_and_reference(console):
+    from esrobo_laptop import dashboard
+    console.remote = {'sessions': ['esrobo_gateway', 'esrobo_waist'],
+                      'waist_control_available': True}
+    console.robot_state = Mock(return_value=dict(
+        mode='IDLE', age_s=.05, feedback={'enable_states': [False] * 7}))
+    console.running = Mock(return_value=False)
+    console.waist_enable_requested = True
+    positions = {31: 139.0, 32: 215.0, 33: 144.0}
+
+    def command(action, axis=None, direction=None):
+        if action == 'jog':
+            return dict(axis=axis, from_deg=positions[axis], target_deg=145.0, message='sent')
+        return dict(axes={str(key): dict(position_deg=value, error=0x0C26)
+                          for key, value in positions.items()})
+
+    console.waist_command = Mock(side_effect=command)
+    request(console, 'waist', command='jog', axis=33, direction=1)
+    positions[33] = 145.0
+    assert request(console, 'waist', command='status')['motion_pending'] is True
+    assert request(console, 'waist', command='status')['motion_pending'] is False
+    assert dashboard.WAIST_MOVED_FILE.exists()
+    positions[33] = 144.0
+    marker = json.loads(dashboard.WAIST_MOVED_FILE.read_text())
+    marker['at'] -= 4
+    dashboard.WAIST_MOVED_FILE.write_text(json.dumps(marker))
+    request(console, 'waist', command='status')
+    assert not dashboard.WAIST_MOVED_FILE.exists()
+
+
+def test_waist_command_preserves_ros_python_path(console):
+    console.remote = {'waist_control_available': True}
+    console.command = Mock(return_value='{"ok": true, "axes": {}}\n')
+    result = console.waist_command('status')
+    assert result == {'axes': {}}
+    argv = console.command.call_args.args[0]
+    assert argv[:2] == ['bash', '-lc']
+    assert 'source /opt/ros/humble/setup.bash' in argv[2]
+    assert '"${PYTHONPATH:-}"' in argv[2]
+    assert 'esrobo_link.waist_control status' in argv[2]
+
+
+def test_waist_direct_target_validates_range_and_uses_existing_interlock(console):
+    from esrobo_laptop import dashboard
+    console.remote = {'sessions': ['esrobo_gateway', 'esrobo_waist'],
+                      'waist_control_available': True}
+    console.robot_state = Mock(return_value=dict(
+        mode='IDLE', age_s=.05, feedback={'enable_states': [False] * 7}))
+    console.running = Mock(return_value=False)
+    console.waist_enable_requested = True
+    console.waist_command = Mock(return_value=dict(
+        axis=31, from_deg=120.0, target_deg=124.5, message='sent'))
+    for target in (-0.1, 360.1, float('nan'), True):
+        with pytest.raises(ValueError, match='目标角度无效'):
+            request(console, 'waist', command='target', axis=31, target_deg=target)
+    assert not dashboard.WAIST_MOVED_FILE.exists()
+    request(console, 'waist', command='target', axis=31, target_deg=124.5)
+    console.waist_command.assert_called_once_with('target', 31, target_deg=124.5)
+    assert json.loads(dashboard.WAIST_MOVED_FILE.read_text())['pending']['target'] == 124.5
+    with pytest.raises(RuntimeError, match='尚未确认到位'):
+        request(console, 'waist', command='jog', axis=31, direction=-1)
+
+
+def test_waist_target_accepts_next_window_outside_original_reference(console):
+    console.remote = {'sessions': ['esrobo_gateway', 'esrobo_waist'],
+                      'waist_control_available': True}
+    console.robot_state = Mock(return_value=dict(
+        mode='IDLE', age_s=.05, feedback={'enable_states': [False] * 7}))
+    console.running = Mock(return_value=False)
+    console.waist_enable_requested = True
+    console.waist_command = Mock(return_value=dict(
+        axis=32, from_deg=255.0, target_deg=250.0, message='sent'))
+    request(console, 'waist', command='target', axis=32, target_deg=250.0)
+    console.waist_command.assert_called_once_with('target', 32, target_deg=250.0)
+
+
+def test_waist_direct_target_cli_is_fixed_and_bounded(console):
+    console.remote = {'waist_control_available': True}
+    console.command = Mock(return_value='{"ok": true, "axis": 31, "target_deg": 124.5}\n')
+    assert console.waist_command('target', 31, target_deg=124.5)['target_deg'] == 124.5
+    assert 'esrobo_link.waist_control target --axis 31 --target-deg 124.5' in console.command.call_args.args[0][2]
+    with pytest.raises(ValueError, match='目标角度无效'):
+        console.waist_command('target', 31, target_deg=1000)
+    assert console.command.call_count == 1
+
+
+def test_waist_prepublication_rejection_does_not_latch_pending(console):
+    from esrobo_laptop import dashboard
+    console.remote = {'sessions': ['esrobo_gateway', 'esrobo_waist'],
+                      'waist_control_available': True}
+    console.robot_state = Mock(return_value=dict(
+        mode='IDLE', age_s=.05, feedback={'enable_states': [False] * 7}))
+    console.running = Mock(return_value=False)
+    console.waist_enable_requested = True
+    previous = b'{"axis": 32, "at": 1}'
+    dashboard.WAIST_MOVED_FILE.write_bytes(previous)
+    console.waist_command = Mock(side_effect=WaistCommandNotSent('目标超出当前反馈 ±5° 操作范围'))
+    with pytest.raises(WaistCommandNotSent, match='超出当前反馈'):
+        request(console, 'waist', command='target', axis=33, target_deg=161.97)
+    assert console.waist_pending is None
+    assert dashboard.WAIST_MOVED_FILE.read_bytes() == previous
+
+
+def test_uncertain_waist_reply_keeps_motion_locked(console):
+    from esrobo_laptop import dashboard
+    console.remote = {'sessions': ['esrobo_gateway', 'esrobo_waist'],
+                      'waist_control_available': True}
+    console.robot_state = Mock(return_value=dict(
+        mode='IDLE', age_s=.05, feedback={'enable_states': [False] * 7}))
+    console.running = Mock(return_value=False)
+    console.waist_enable_requested = True
+    console.waist_command = Mock(side_effect=RuntimeError('SSH reply lost'))
+    with pytest.raises(RuntimeError, match='SSH reply lost'):
+        request(console, 'waist', command='target', axis=33, target_deg=165.0)
+    assert console.waist_pending == (33, None)
+    assert json.loads(dashboard.WAIST_MOVED_FILE.read_text())['pending']['target'] is None
+
+
+def test_waist_cli_reports_explicit_prepublication_rejection(console):
+    console.remote = {'waist_control_available': True}
+    console.command = Mock(side_effect=RuntimeError(json.dumps(dict(
+        ok=False, command_sent=False, error='目标超出当前反馈 ±5° 操作范围'))))
+    with pytest.raises(WaistCommandNotSent, match='超出当前反馈'):
+        console.waist_command('target', 33, target_deg=161.97)
+
+
+def test_waist_disable_is_not_an_api_command(console):
+    console.remote = {'waist_control_available': True}
+    console.command = Mock()
+    with pytest.raises(ValueError, match='未知腰部命令'):
+        console.waist_command('disable')
+    with pytest.raises(ValueError, match='未知腰部操作'):
+        request(console, 'waist', command='disable')
+    console.command.assert_not_called()
+
+
+def test_stopping_waist_driver_does_not_send_disable(console):
+    console.remote = {'sessions': ['esrobo_waist']}
+    console.running = Mock(return_value=False)
+    console.waist_interlock = Mock()
+    console.waist_command = Mock(return_value={'message': 'stopped'})
+    console.command = Mock()
+    request(console, 'remote_stop', name='waist')
+    console.waist_command.assert_called_once_with('stop')
+    console.command.assert_called_once()
+
+
 def test_can_initialization_stops_and_verifies_all_bus_owners_first(console):
     order = []
-    sessions = {'esrobo_gateway', 'esrobo_hand_bridge', 'esrobo_hands'}
+    sessions = {'esrobo_gateway', 'esrobo_waist', 'esrobo_hand_bridge', 'esrobo_hands'}
     console.remote = {'sessions': list(sessions), 'gateway_args': ['--side', 'right']}
     console.running = Mock(return_value=True)
     console.stop_following = Mock(side_effect=lambda: order.append('local_stop'))
@@ -197,9 +478,40 @@ def test_can_initialization_stops_and_verifies_all_bus_owners_first(console):
     console.refresh = Mock(side_effect=refresh)
     console.key = Mock(side_effect=key)
     console.command = Mock(side_effect=command)
+    console.waist_command = Mock(side_effect=lambda action: order.append('waist_stop'))
+    console.wait_waist_stopped = Mock(side_effect=lambda: order.append('waist_settled'))
     response = request(console, 'can', password='test-password')
     assert response['log'] == 'CAN ready'
-    assert order == ['local_stop', 'd', 'q', 'esrobo_hand_bridge', 'esrobo_hands', 'sudo']
+    assert order == ['local_stop', 'd', 'waist_stop', 'waist_settled', 'esrobo_waist',
+                     'q', 'esrobo_hand_bridge', 'esrobo_hands', 'sudo']
+    console.waist_command.assert_called_once_with('stop')
+
+
+def test_can_waist_stop_requires_stable_feedback_before_driver_exit(console):
+    positions = [120.0, 120.2, 120.201, 120.202]
+    readings = [dict(axes={str(axis): dict(position_deg=(position if axis == 31 else reference),
+                                          velocity=0.1)
+                           for axis, reference in ((31, 120.0), (32, 260.0), (33, 170.0))})
+                for position in positions]
+    console.waist_command = Mock(side_effect=readings)
+    with patch('esrobo_laptop.dashboard.time.sleep'):
+        console.wait_waist_stopped()
+    assert console.waist_command.call_count == 4
+
+
+def test_can_keeps_waist_driver_if_motion_cannot_be_verified_stopped(console):
+    sessions = ['esrobo_gateway', 'esrobo_waist']
+    console.remote = {'sessions': sessions, 'gateway_args': ['--side', 'right']}
+    console.running = Mock(return_value=False)
+    console.wait_gateway_disabled = Mock()
+    console.waist_command = Mock()
+    console.wait_waist_stopped = Mock(side_effect=RuntimeError('腰部未停稳'))
+    console.command = Mock()
+    with pytest.raises(RuntimeError, match='腰部未停稳'):
+        request(console, 'can', password='test-password')
+    console.key.assert_called_once_with('d')
+    console.waist_command.assert_called_once_with('stop')
+    console.command.assert_not_called()
 
 
 def test_can_initialization_aborts_if_disable_cannot_be_verified(console):
@@ -277,14 +589,26 @@ def test_mode_and_command_input_are_allowlisted(console):
 
 def test_no_typing_into_shell_after_gateway_exit(console):
     console.key=Console.key.__get__(console)
-    console.command=Mock(return_value='bash\n')
+    console.command=Mock(return_value='esrobo_gateway|bash\n')
     with pytest.raises(RuntimeError): console.key('e')
     assert console.command.call_count == 1
+
+
+def test_status_does_not_query_missing_waist_session_by_target():
+    assert "'#{session_name}|#{session_id}:#{session_created}'" in REMOTE_STATUS
+    assert 'display-message' not in REMOTE_STATUS
 
 
 def test_gateway_startup_output_is_preserved_after_pane_exits(console):
     console.command = Mock(return_value='')
     console.remote = {'sessions': []}
+    refresh_count = 0
+    def refresh():
+        nonlocal refresh_count
+        refresh_count += 1
+        if refresh_count == 2:
+            console.remote['sessions'] = ['esrobo_gateway']
+    console.refresh = Mock(side_effect=refresh)
     console.remote_start('gateway', dict(side='both', with_hand=True, hand_only=False))
     launch = console.command.call_args.args[0]
     assert launch[:5] == ['tmux', 'new-session', '-d', '-s', 'esrobo_gateway']
@@ -293,6 +617,14 @@ def test_gateway_startup_output_is_preserved_after_pane_exits(console):
 
     console.remote['gateway_startup_log'] = 'Traceback: startup failed\n'
     assert request(console, 'remote_log', name='gateway')['log'] == 'Traceback: startup failed\n'
+
+
+def test_gateway_immediate_exit_reports_startup_log(console):
+    console.command = Mock(return_value='')
+    console.remote = {'sessions': [], 'gateway_startup_log': 'Traceback: startup failed\n'}
+    with pytest.raises(RuntimeError, match='startup failed'):
+        console.remote_start('gateway', dict(side='right', with_hand=False, hand_only=False))
+    assert not any('会话已建立' in event for event in console.events)
 
 
 def test_pty_calibration_prompt_and_enter():

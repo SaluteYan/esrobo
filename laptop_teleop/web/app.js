@@ -6,13 +6,25 @@ let pollRunning = true;
 let logRequest = false;
 let modeInitialized = false;
 let canBusy = false;
+let waistAxes = null;
+let waistReadAt = 0;
+let waistReference = null;
+let waistLimit = null;
+let waistSingleTurnMin = null;
+let waistSingleTurnMax = null;
+let waistMoving = false;
+let waistMotionToken = 0;
+let waistAutoReading = false;
+let waistAutoRetryAt = 0;
+let waistServerPending = false;
 
 const remoteServices = {
-  gateway: {label: '双臂遥操作网关', session: 'esrobo_gateway', disable: '全部失能'},
+  gateway: {label: '双臂遥操作网关', session: 'esrobo_gateway', disable: '双臂双手失能'},
   left_arm: {label: '左臂驱动', virtual: true, disable: '单独失能'},
   right_arm: {label: '右臂驱动', virtual: true, disable: '单独失能'},
   hands: {label: '双手 ROS 驱动', session: 'esrobo_hands', disable: '双手命令失能'},
   hand_bridge: {label: '双手通信桥', session: 'esrobo_hand_bridge'},
+  waist: {label: '腰部三轴驱动', session: 'esrobo_waist'},
   head: {label: '头部两轴驱动', session: 'esrobo_head', disable: '舵机失能'},
   camera: {label: 'RGB / 深度相机', session: 'esrobo_camera'},
   head_web: {label: '相机网页服务', session: 'esrobo_head_web'},
@@ -95,7 +107,10 @@ function buildRemoteServices() {
       const start = element('button', '启动');
       start.onclick = async () => { await perform('remote_start', {name}, start); selectLog(`r:${name}`); };
       const stop = element('button', '停止');
-      stop.onclick = async () => { await perform('remote_stop', {name}, stop); selectLog(`r:${name}`); };
+      stop.onclick = async () => {
+        if (name === 'waist' && !confirm('将先请求腰部减速停止，再退出腰部驱动；不会发送电机失能命令。确认停止驱动？')) return;
+        await perform('remote_stop', {name}, stop); selectLog(`r:${name}`);
+      };
       actions.append(start, stop);
     }
     if (spec.disable) {
@@ -185,6 +200,165 @@ $('run').onclick = async () => { await perform('local_start', {name: 'teleop', p
 $('stop').onclick = () => perform('stop');
 $('motion-stop').onclick = () => perform('stop');
 $('stop-compute').onclick = () => perform('local_stop', {name: 'teleop'});
+const WAIST_SINGLE_TURN_BATTERY_WARNING = 0x0C26;
+const waistErrorAllowsMotion = code => code === 0 || code === WAIST_SINGLE_TURN_BATTERY_WARNING;
+function waistTargetRange(position) {
+  if (!Number.isFinite(position) || !Number.isFinite(waistLimit)
+      || !Number.isFinite(waistSingleTurnMin) || !Number.isFinite(waistSingleTurnMax)
+      || position < waistSingleTurnMin || position > waistSingleTurnMax) return null;
+  const displayedPosition = Math.round(position * 100) / 100;
+  return {
+    min: Number(Math.max(waistSingleTurnMin, displayedPosition - waistLimit).toFixed(2)),
+    max: Number(Math.min(waistSingleTurnMax, displayedPosition + waistLimit).toFixed(2)),
+  };
+}
+function showWaistFeedback(result) {
+  waistAxes = result.axes;
+  waistReference = result.reference_deg;
+  waistLimit = result.limit_offset_deg;
+  waistSingleTurnMin = result.single_turn_min_deg;
+  waistSingleTurnMax = result.single_turn_max_deg;
+  waistServerPending = Boolean(result.motion_pending);
+  waistReadAt = performance.now();
+  waistAutoRetryAt = 0;
+  for (const axis of [31, 32, 33]) {
+    const feedback = result.axes?.[axis];
+    $(`waist-value-${axis}`).textContent = feedback
+      ? `${feedback.position_deg.toFixed(2)}° · 错误码 0x${feedback.error.toString(16).toUpperCase().padStart(4, '0')}` : '反馈缺失';
+  }
+  const outside = [31, 32, 33].filter(axis =>
+    !waistTargetRange(result.axes?.[axis]?.position_deg));
+  const blocking = [31, 32, 33].filter(axis => !waistErrorAllowsMotion(result.axes?.[axis]?.error));
+  const singleTurnWarning = [31, 32, 33].some(axis => result.axes?.[axis]?.error === WAIST_SINGLE_TURN_BATTERY_WARNING);
+  if (outside.length || blocking.length) {
+    $('waist-detail').textContent = `反馈已读取；${outside.length ? `关节 ${outside.join('、')} 反馈超出单圈范围。` : ''}${blocking.length ? `关节 ${blocking.join('、')} 有不允许运动的错误码。` : ''}已锁定使能及调整。`;
+  } else if (!waistMoving) {
+    $('waist-detail').textContent = (singleTurnWarning ? '0x0C26 为多圈编码器电池报码；按单圈范围使用，每次上电须核对腰部实际姿态。' : '') + (waistServerPending
+      ? '上一腰部目标尚未确认到位；请等待反馈，必要时停止腰部运动。'
+      : state && !state.waist_enable_requested
+        ? '反馈已读取；请先点击“使能腰部三轴”，再调整角度。现有驱动不提供使能状态回读。'
+        : '反馈已读取且在当前调整范围内；可连续点按小步按钮。现有腰部驱动不提供使能状态回读。');
+  }
+  if (state) render();
+}
+
+async function waistAction(command, values = {}, button = null) {
+  const isMotion = command === 'jog' || command === 'target';
+  if (command === 'stop') {
+    waistMotionToken++;
+    waistMoving = false;
+    waistReadAt = 0;
+    if (state) render();
+  }
+  if (isMotion && waistMoving) return;
+  const token = isMotion ? ++waistMotionToken : waistMotionToken;
+  if (isMotion) {
+    waistMoving = true;
+    if (state) render();
+  }
+  const result = await perform('waist', {command, ...values}, button);
+  if (!result) {
+    if (isMotion && token === waistMotionToken) {
+      waistMoving = false;
+      waistReadAt = 0;
+      waistAutoRetryAt = performance.now() + 2000;
+      waistServerPending = true;
+      $('waist-detail').textContent = '腰部目标请求未确认；已锁定调整并将自动重读反馈，请检查现场运动，必要时停止腰部运动。';
+      if (state) render();
+    }
+    return;
+  }
+  if (command === 'status') {
+    showWaistFeedback(result);
+  } else if (command === 'stop') {
+    waistServerPending = false;
+  } else if (command === 'enable') {
+    if (state) {
+      state.waist_enable_requested = true;
+      render();
+    }
+  } else if (isMotion) {
+    if (token !== waistMotionToken) {
+      try { await api('waist', {command: 'stop'}); }
+      catch (error) { notice(`腰部停止请求未确认：${error.message}`, true); }
+      return;
+    }
+    $('waist-detail').textContent = `${result.axis} 号已发送 ${result.target_deg.toFixed(2)}° 目标，等待实测到位…`;
+    waistServerPending = true;
+    let confirmed = 0;
+    const timeoutMs = command === 'target' ? 30000 : 20000;
+    const startedAt = performance.now();
+    const deadline = startedAt + timeoutMs;
+    const tolerance = Math.min(0.2, Math.max(0.03, Math.abs(result.target_deg - result.from_deg) / 2));
+    try {
+      while (token === waistMotionToken && performance.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 400));
+        if (token !== waistMotionToken) return;
+        const feedback = await api('waist', {command: 'status'});
+        if (token !== waistMotionToken) return;
+        showWaistFeedback(feedback);
+        const position = feedback.axes?.[result.axis]?.position_deg;
+        const fault = [31, 32, 33].some(axis => !waistErrorAllowsMotion(feedback.axes?.[axis]?.error));
+        if (fault) throw new Error('腰部出现不允许运动的错误码；已锁定调整，请检查反馈');
+        if (performance.now() - startedAt >= 4000 && Number.isFinite(position)
+            && Math.abs(position - result.from_deg) < 0.05
+            && Math.abs(result.target_deg - result.from_deg) >= 0.05) {
+          await api('waist', {command: 'stop'});
+          waistServerPending = false;
+          throw new Error('腰部目标未产生可测运动，已请求停止。请核对腰部使能与实际状态，再读取反馈。');
+        }
+        confirmed = !feedback.motion_pending && Number.isFinite(position)
+          && Math.abs(position - result.target_deg) <= tolerance ? confirmed + 1 : 0;
+        if (confirmed >= 2) {
+          $('waist-detail').textContent = `${result.axis} 号实测已到 ${position.toFixed(2)}°，可以继续点按调整。`;
+          return;
+        }
+      }
+      if (token === waistMotionToken) throw new Error(`${timeoutMs / 1000} 秒内未确认腰部到位；请停止运动并检查现场反馈`);
+    } catch (error) {
+      if (token === waistMotionToken) {
+        waistReadAt = 0;
+        waistAutoRetryAt = performance.now() + 2000;
+        waistServerPending = true;
+        for (const axis of [31, 32, 33]) $(`waist-value-${axis}`).textContent = '反馈等待自动重读';
+        $('waist-detail').textContent = `${error.message}；已锁定调整，正在自动重读反馈。`;
+        notice(error.message, true);
+      }
+    } finally {
+      if (token === waistMotionToken) {
+        waistMoving = false;
+        if (state) render();
+      }
+    }
+  }
+}
+$('waist-read').onclick = () => waistAction('status', {}, $('waist-read'));
+$('waist-enable').onclick = () => {
+  if (confirm('确认机械臂已失能、躯干已托稳、急停可触及，并已核对腰部实际姿态与显示角度一致？将请求同时使能腰部三轴。'))
+    waistAction('enable', {}, $('waist-enable'));
+};
+$('waist-stop').onclick = () => waistAction('stop', {}, $('waist-stop'));
+for (const button of document.querySelectorAll('[data-waist-axis]')) button.onclick = () =>
+  waistAction('jog', {axis: Number(button.dataset.waistAxis),
+                       direction: Number(button.dataset.direction)}, button);
+for (const form of document.querySelectorAll('[data-waist-target-form]')) {
+  form.noValidate = true;
+  form.querySelector('input').addEventListener('input', () => { if (state) render(); });
+  form.onsubmit = event => {
+  event.preventDefault();
+  const input = form.querySelector('input');
+  const target = Number(input.value);
+  if (!input.validity.valid || !Number.isFinite(target)) {
+    const axis = Number(form.dataset.waistTargetForm);
+    const range = waistTargetRange(waistAxes?.[axis]?.position_deg);
+    notice(range ? `腰关节 ${axis} 目标须在 ${range.min.toFixed(2)}°～${range.max.toFixed(2)}° 内；当前输入未发送。`
+      : '请先读取该关节反馈，再输入允许范围内的目标角度。', true);
+    return;
+  }
+  waistAction('target', {axis: Number(form.dataset.waistTargetForm), target_deg: target},
+    form.querySelector('button'));
+  };
+}
 $('recover').onclick = () => {
   const handOnly = Boolean(state?.mode?.hand_only);
   const message = handOnly
@@ -193,7 +367,7 @@ $('recover').onclick = () => {
   if (confirm(message)) perform('remote_recover', {}, $('recover'));
 };
 $('disable-all').onclick = () => {
-  if (confirm('确认停止当前目标流并失能双臂与双手？')) perform('remote_disable', {name: 'gateway'});
+  if (confirm('确认停止当前目标流并失能双臂与双手？腰部需在独立控制区处理。')) perform('remote_disable', {name: 'gateway'});
 };
 $('enable').onclick = () => {
   if (confirm('确认机器人周围安全且实体急停可触及？机器人将先回零并张开灵巧手；随后请按页面提示摆好 PICO 准备姿态，检测通过后自动开始跟随。'))
@@ -274,6 +448,85 @@ function render() {
   // lookup path in both cases.
   const members = robot.feedback?.sides || (robot.feedback && mode.side !== 'both'
     ? {[mode.side]: robot.feedback} : {});
+  const waistRemoteFresh = state.connected && state.remote_age_s < 2;
+  const waistDriverKnown = state.remote?.sessions?.includes('esrobo_waist');
+  const waistDriver = waistRemoteFresh && waistDriverKnown;
+  // A waist status request shares the SSH lock with remote polling. While it
+  // runs, remote_age_s may exceed 2 s even though the driver is still alive.
+  // Keep the measured positions and in-flight confirmation until a fresh
+  // status actually reports that the session ended (or SSH disconnects).
+  if (!state.connected || (waistRemoteFresh && !waistDriverKnown)) {
+    waistAxes = null; waistReference = null; waistLimit = null;
+    waistSingleTurnMin = null; waistSingleTurnMax = null; waistReadAt = 0;
+    waistAutoRetryAt = 0;
+    waistServerPending = false;
+    waistMotionToken++; waistMoving = false;
+    for (const axis of [31, 32, 33]) $(`waist-value-${axis}`).textContent = '反馈未读取 / 已失效';
+  }
+  const waistCode = state.capabilities?.waist_control && state.remote?.waist_control_available;
+  const armDisabled = fresh && liveGateway && ['IDLE', 'FAULT'].includes(robot.mode)
+    && Object.values(members).length > 0
+    && Object.values(members).every(value => value.enable_states?.length === 7
+      && value.enable_states.every(enabled => enabled === false));
+  const waistFeedbackRecent = Boolean(waistReadAt > 0 && waistAxes && waistReference && Number.isFinite(waistLimit)
+    && Number.isFinite(waistSingleTurnMin) && Number.isFinite(waistSingleTurnMax)
+    && performance.now() - waistReadAt < 15000);
+  const waistFeedbackValid = waistFeedbackRecent && [31, 32, 33].every(axis =>
+    Number.isFinite(waistAxes[axis]?.position_deg) && waistErrorAllowsMotion(waistAxes[axis]?.error)
+    && Number.isFinite(waistReference[axis])
+    && waistTargetRange(waistAxes[axis].position_deg));
+  for (const form of document.querySelectorAll('[data-waist-target-form]')) {
+    const axis = Number(form.dataset.waistTargetForm);
+    const input = form.querySelector('input');
+    const range = waistFeedbackRecent ? waistTargetRange(waistAxes?.[axis]?.position_deg) : null;
+    if (range) {
+      input.min = String(range.min);
+      input.max = String(range.max);
+    } else {
+      input.removeAttribute('min');
+      input.removeAttribute('max');
+    }
+    const invalidTarget = input.value !== '' && range && !input.validity.valid;
+    const rangeLabel = form.querySelector('[data-waist-range]');
+    rangeLabel.textContent = range
+      ? `目标角度（${range.min.toFixed(2)}°～${range.max.toFixed(2)}°）${invalidTarget ? ' · 输入越界' : ''}`
+      : '目标角度（读取反馈后显示范围）';
+    rangeLabel.classList.toggle('invalid', Boolean(invalidTarget));
+  }
+  const waistCanEnable = waistCode && waistDriver && armDisabled && !waistMoving && !waistServerPending
+    && !state.processes.teleop?.running && waistFeedbackValid;
+  const waistCanMove = waistCanEnable && state.waist_enable_requested;
+  $('waist-gate').textContent = !state.connected ? '未连接机器人'
+    : !waistRemoteFresh ? waistMoving ? '正在读取腰部实测反馈' : '等待网关状态刷新'
+      : !waistDriver ? '腰部驱动未运行'
+        : !liveGateway ? '等待网关确认机械臂失能'
+          : !armDisabled ? '等待机械臂停止并失能'
+            : state.processes.teleop?.running ? '请先结束遥操作计算'
+              : waistMoving ? '等待腰部实测到位'
+                : waistServerPending ? '上一腰部目标尚未确认到位'
+                : !waistFeedbackRecent ? '请重新读取腰部反馈'
+                : !waistFeedbackValid ? '位置或错误码未通过 · 控制锁定'
+                  : !state.waist_enable_requested ? '请先使能腰部三轴'
+                  : state.waist_moved ? '可调整腰部 · 臂使能受限' : '反馈合格 · 可单独调整';
+  $('waist-gate').className = 'tag ' + (state.waist_moved ? 'fault' : waistCanMove ? 'active' : '');
+  $('waist-read').disabled = !waistCode || !waistDriver || waistMoving;
+  $('waist-enable').disabled = !waistCanEnable;
+  $('waist-stop').disabled = !waistCode || !waistDriver;
+  for (const button of document.querySelectorAll('[data-waist-axis]')) {
+    const position = waistAxes?.[Number(button.dataset.waistAxis)]?.position_deg;
+    const next = position + Number(button.dataset.direction);
+    button.disabled = !waistCanMove || !Number.isFinite(next)
+      || next < waistSingleTurnMin || next > waistSingleTurnMax;
+  }
+  for (const form of document.querySelectorAll('[data-waist-target-form]'))
+    form.querySelector('button').disabled = !waistCanMove;
+  if (!state.connected) $('waist-detail').textContent = 'SSH 已断开，旧反馈已失效。请重新连接机器人，再读取腰部反馈。';
+  else if (!waistRemoteFresh) $('waist-detail').textContent = waistMoving
+    ? '正在读取腰部实测反馈；到位前暂时锁定调整按钮。'
+    : '网关状态暂时未更新；已锁定调整，恢复后自动重读腰部反馈。';
+  else if (!waistCode) $('waist-detail').textContent = '机器人尚未同步腰部控制代码；同步 robot_link 后刷新页面。';
+  else if (!waistDriver) $('waist-detail').textContent = '先在左侧启动腰部三轴驱动，再读取三轴反馈。';
+  else if (waistFeedbackValid && !liveGateway) $('waist-detail').textContent = '腰部反馈正常；机械臂网关未运行，页面无法确认机械臂七轴失能，因此尚未开放调整按钮。';
   const faults = Object.values(members).filter(value => value.controller_fault || value.driver_fault);
   const sides = mode.side === 'both' ? ['left', 'right'] : [mode.side];
   const required = telemetry.required_sources || sides.flatMap(side =>
@@ -469,6 +722,29 @@ async function poll() {
         } catch (_) { /* Other console controls remain available when the viewer is offline. */ }
       }
       render();
+      const waistReadInterval = waistServerPending ? 1000 : 10000;
+      if (waistAxes && !waistMoving && !waistAutoReading
+          && (!waistReadAt || performance.now() - waistReadAt > waistReadInterval)
+          && performance.now() >= waistAutoRetryAt
+          && state.connected && state.remote_age_s < 2
+          && state.remote?.sessions?.includes('esrobo_waist')) {
+        waistAutoReading = true;
+        const readToken = waistMotionToken;
+        api('waist', {command: 'status'}).then(feedback => {
+          if (readToken === waistMotionToken && !waistMoving && state.connected
+              && state.remote?.sessions?.includes('esrobo_waist'))
+            showWaistFeedback(feedback);
+        }).catch(error => {
+          if (readToken !== waistMotionToken || waistMoving) return;
+          waistReadAt = 0;
+          waistAutoRetryAt = performance.now() + 2000;
+          waistServerPending = true;
+          for (const axis of [31, 32, 33]) $(`waist-value-${axis}`).textContent = '反馈等待自动重读';
+          $('waist-detail').textContent = `自动读取腰部反馈失败，正在重试：${error.message}`;
+          notice(`自动读取腰部反馈失败，正在重试：${error.message}`, true);
+          render();
+        }).finally(() => { waistAutoReading = false; });
+      }
     } catch (error) {
       $('connection').textContent = '控制台连接中断';
       $('connection-dot').classList.remove('online');

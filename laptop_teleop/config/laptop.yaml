@@ -17,6 +17,8 @@ hand_feedback_max_age_s: 0.15
 network_margin_s: 0.02
 rate_hz: 50
 minimum_control_rate_hz: 40
+# Full arm target rate may dip briefly; require at least 35 Hz over 2 s.
+arm_rate_tolerance_hz: 5
 # Hand-only mode checks a two-second average; 40 - 5 = 35 Hz stop threshold.
 hand_only_rate_tolerance_hz: 5
 control_gap_timeout_s: 0.08

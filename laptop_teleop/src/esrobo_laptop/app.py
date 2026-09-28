@@ -300,14 +300,13 @@ def main(argv=None):
         next_print, next_record = 0., 0.
         loop_times, compute_times, publish_times = deque(maxlen=200), deque(maxlen=200), deque(maxlen=200)
         compute_durations_ms = deque(maxlen=200)
-        # Hand-only mapping is fast, but independent optical Hand frames can
-        # briefly arrive slower than the feedback loop. Average over two
-        # seconds while keeping the short-gap guard unchanged.
+        # Average short rate dips over two seconds for both modes. The
+        # independent 80 ms gap guard still stops a missing target stream.
         control_monitor = ControlRateMonitor(settings.minimum_control_rate_hz,
                                              settings.control_gap_timeout_s,
                                              rate_tolerance_hz=(settings.hand_only_rate_tolerance_hz
-                                                                if settings.hand_only else None),
-                                             rate_window_s=2.0 if settings.hand_only else 1.0)
+                                                                if settings.hand_only else settings.arm_rate_tolerance_hz),
+                                             rate_window_s=2.0)
         period, next_cycle, deadline_misses = 1/settings.rate_hz, time.monotonic(), 0
         def rate(samples):
             return ((len(samples)-1)/(samples[-1]-samples[0])

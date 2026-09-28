@@ -2,7 +2,7 @@
 #include "std_msgs/msg/float32_multi_array.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/empty.hpp"
-#include "std_msgs/msg/u_int8_multi_array.hpp"
+#include "std_msgs/msg/u_int32_multi_array.hpp"
 
 #include <linux/can.h>
 #include <linux/can/raw.h>
@@ -14,6 +14,7 @@
 #include <cstring>
 #include <thread>
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <vector>
 
@@ -31,8 +32,6 @@ using namespace std::chrono_literals;
 #define CMD_READ_ERROR        0x001F
 
 #define CMD_MOTOR_ENABLE      0x0100
-#define CMD_BRAKE_RELEASE     0x0188
-#define CMD_BRAKE_LOCK        0x0189
 #define CMD_CLEAR_ERROR       0x004E
 #define CMD_MOTOR_START       0x0083
 #define CMD_MOTOR_STOP        0x0084
@@ -77,17 +76,15 @@ public:
             vel_[id] = 0.0f;
             cur_[id] = 0.0f;
             temp_[id] = 0.0f;
-            error_[id] = 0;
+            error_[id] = UINT32_MAX;
         }
 
         // ROS 接口
         pub_state_ = create_publisher<std_msgs::msg::Float32MultiArray>("/erobo/joint_states", 10);
-        pub_error_ = create_publisher<std_msgs::msg::UInt8MultiArray>("/erobo/joint_errors", 10);
+        pub_error_ = create_publisher<std_msgs::msg::UInt32MultiArray>("/erobo/joint_errors", 10);
 
         sub_enable_ = create_subscription<std_msgs::msg::Bool>("/erobo/enable", 10,
             std::bind(&ERoboDriver::cb_enable, this, std::placeholders::_1));
-        sub_brake_ = create_subscription<std_msgs::msg::Bool>("/erobo/brake", 10,
-            std::bind(&ERoboDriver::cb_brake, this, std::placeholders::_1));
         sub_clear_ = create_subscription<std_msgs::msg::Empty>("/erobo/clear_error", 10,
             std::bind(&ERoboDriver::cb_clear, this, std::placeholders::_1));
         sub_stop_ = create_subscription<std_msgs::msg::Empty>("/erobo/stop", 10,
@@ -157,23 +154,14 @@ private:
     int can_fd_;
     std::vector<int> joint_ids_;
     std::map<int, float> pos_, vel_, cur_, temp_;
-    std::map<int, uint8_t> error_;  // 新增：错误码
+    std::map<int, uint32_t> error_;
 
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pub_state_;
-    rclcpp::Publisher<std_msgs::msg::UInt8MultiArray>::SharedPtr pub_error_;  // 新增：错误发布
+    rclcpp::Publisher<std_msgs::msg::UInt32MultiArray>::SharedPtr pub_error_;
 
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_enable_, sub_brake_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_enable_;
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr sub_clear_, sub_stop_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr sub_pos_, sub_vel_, sub_tor_;
-
-    bool send_frame(uint32_t can_id, uint8_t* data, uint8_t len) {
-        struct can_frame frame;
-        frame.can_id = can_id;
-        frame.can_dlc = len;
-        memcpy(frame.data, data, len);
-        int ret = write(can_fd_, &frame, sizeof(frame));
-        return ret == sizeof(frame);
-    }
 
     void send_cmd(int id, uint16_t cmd, bool ext = false) {
         can_frame f{};
@@ -251,12 +239,17 @@ private:
     // ==============================
     // 新增：读取关节错误状态
     // ==============================
-    uint8_t parse_error(int id) {
+    uint32_t parse_error(int id) {
         can_frame rx{};
-        if (read(can_fd_, &rx, sizeof(rx)) > 0 && rx.can_dlc == 5 && rx.data[4] == 0x3E) {
-            return rx.data[3];
+        if (read(can_fd_, &rx, sizeof(rx)) > 0 && rx.can_id == static_cast<uint32_t>(0x5C0 + id)
+                && rx.can_dlc == 5 && rx.data[4] == 0x3E) {
+            return (static_cast<uint32_t>(rx.data[0]) << 24)
+                 | (static_cast<uint32_t>(rx.data[1]) << 16)
+                 | (static_cast<uint32_t>(rx.data[2]) << 8)
+                 | static_cast<uint32_t>(rx.data[3]);
         }
-        return error_[id];
+        // A missing reply must never turn a stale zero into permission to move.
+        return UINT32_MAX;
     }
 
     // ==============================
@@ -296,7 +289,7 @@ private:
             pub_state_->publish(msg);
 
             // 新增：发布错误码
-            std_msgs::msg::UInt8MultiArray err_msg;
+            std_msgs::msg::UInt32MultiArray err_msg;
             for (int id : joint_ids_) {
                 err_msg.data.push_back(id);
                 err_msg.data.push_back(error_[id]);
@@ -308,22 +301,13 @@ private:
     }
 
     void cb_enable(const std_msgs::msg::Bool::SharedPtr msg) {
-        for (int id : joint_ids_)
-            send_write(id, CMD_MOTOR_ENABLE, msg->data ? 1 : 0);
-        RCLCPP_INFO(get_logger(), msg->data ? "电机已使能" : "电机已失能");
-    }
-
-    void cb_brake(const std_msgs::msg::Bool::SharedPtr msg) {
-        for (int id : joint_ids_) {
-            if (msg->data) {
-                uint8_t cmd[2] = {0x01, 0x4F};
-                send_frame(0x65F - 31 + id, cmd, 2);
-            } else {
-                uint8_t cmd[6] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00};
-                send_frame(0x65F - 31 + id, cmd, 6);
-            }
+        if (!msg->data) {
+            RCLCPP_ERROR(get_logger(), "腰部电机禁止失能；忽略 /erobo/enable=false");
+            return;
         }
-        RCLCPP_INFO(get_logger(), msg->data ? "刹车已释放" : "刹车已锁定");
+        for (int id : joint_ids_)
+            send_write(id, CMD_MOTOR_ENABLE, 1);
+        RCLCPP_INFO(get_logger(), "腰部电机使能请求已发送");
     }
 
     void cb_clear(const std_msgs::msg::Empty::SharedPtr) {

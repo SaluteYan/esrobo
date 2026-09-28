@@ -6,6 +6,7 @@ from collections import deque
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import pty
@@ -24,15 +25,32 @@ REMOTE_PYTHON = '/home/esrobo/miniconda3/envs/teleop_esrobo/bin/python'
 ROBOT_HOST = '192.168.10.100'
 GATEWAY_STARTUP_LOG = '/tmp/esrobo_gateway_startup.log'
 SESSIONS = dict(hands='esrobo_hands', hand_bridge='esrobo_hand_bridge', gateway='esrobo_gateway',
-                head='esrobo_head', camera='esrobo_camera', head_web='esrobo_head_web')
+                waist='esrobo_waist', head='esrobo_head', camera='esrobo_camera', head_web='esrobo_head_web')
 LABELS = dict(pc_service='PICO PC Service', pico='PICO 采集', sensecom='SenseCom',
               glove_ros='SenseGlove ROS', glove='手套输入与标定', teleop='重定向 / IK', check='环境检查')
 STATUS_FILE = ROOT / 'log/dashboard_teleop.json'
+WAIST_MOVED_FILE = ROOT / 'log/dashboard_waist_moved.json'
+# Encoder readings at the operator-confirmed upright URDF zero pose.
+WAIST_REFERENCE_DEG = {31: 139.0, 32: 215.0, 33: 144.0}
+WAIST_REFERENCE_TOLERANCE_DEG = 0.2
+WAIST_SINGLE_TURN_MIN_DEG = 0.0
+WAIST_SINGLE_TURN_MAX_DEG = 360.0
+WAIST_SINGLE_TURN_BATTERY_WARNING = 0x0C26
+
+
+class WaistCommandNotSent(RuntimeError):
+    """The robot explicitly rejected a waist command before publishing it."""
+
+
 # Read only the journal held open by the live gateway, never a previous run's log.
 REMOTE_STATUS = r'''
 import os,json,time,subprocess
-sessions=subprocess.run(['tmux','list-sessions','-F','#{session_name}'],capture_output=True,text=True).stdout.splitlines()
-result={'sessions':sessions,'robot':None,'can':subprocess.run(['ip','-br','link','show','type','can'],capture_output=True,text=True).stdout}
+session_rows=subprocess.run(['tmux','list-sessions','-F','#{session_name}|#{session_id}:#{session_created}'],capture_output=True,text=True).stdout.splitlines()
+session_info=dict(row.split('|',1) for row in session_rows if '|' in row)
+sessions=list(session_info)
+result={'sessions':sessions,'robot':None,'can':subprocess.run(['ip','-br','link','show','type','can'],capture_output=True,text=True).stdout,
+        'waist_session_id':session_info.get('esrobo_waist',''),
+        'waist_control_available':os.path.isfile('/home/esrobo/Projects/esrobo/robot_link/esrobo_link/waist_control.py')}
 try:
  with open('/tmp/esrobo_gateway_startup.log','rb') as f:
   f.seek(0,2); f.seek(max(0,f.tell()-20000)); result['gateway_startup_log']=f.read().decode(errors='replace')
@@ -124,6 +142,14 @@ class Console:
         self.closed = threading.Event()
         self.events = deque(maxlen=80)
         self.mode = dict(side='both', with_hand=True, hand_only=False, preview=True)
+        try:
+            marker = json.loads(WAIST_MOVED_FILE.read_text())
+            pending = marker.get('pending')
+            self.waist_pending = (pending['axis'], pending['target']) if pending else None
+        except (OSError, ValueError, KeyError, TypeError):
+            self.waist_pending = None
+        self.waist_pending_hits = 0
+        self.waist_enable_requested = False
         threading.Thread(target=self._monitor, daemon=True).start()
         threading.Thread(target=self._watchdog, daemon=True).start()
 
@@ -170,6 +196,8 @@ class Console:
 
     def refresh(self):
         data = json.loads(self.command(['python3', '-c', REMOTE_STATUS]))
+        if data.get('waist_session_id') != self.remote.get('waist_session_id'):
+            self.waist_enable_requested = False
         self.remote, self.remote_time, self.remote_error = data, time.monotonic(), ''
 
     def robot_state(self):
@@ -205,7 +233,9 @@ class Console:
                     remote=self.remote, robot=self.robot_state(), telemetry=self.telemetry(),
                     processes={k: dict(label=LABELS[k], **v.snapshot()) for k, v in list(self.processes.items())},
                     events=list(self.events), mode=mode, owner=self.owner, pc_service=self.pc_service,
-                    capabilities=dict(automatic_can_teardown=True, fault_recovery=True))
+                    capabilities=dict(automatic_can_teardown=True, fault_recovery=True,
+                                      waist_control=True), waist_moved=WAIST_MOVED_FILE.exists(),
+                    waist_enable_requested=self.waist_enable_requested)
 
     def remote_start(self, name, mode):
         if name not in SESSIONS:
@@ -214,9 +244,12 @@ class Console:
         if SESSIONS[name] in self.remote.get('sessions', []):
             self.event(f'{name} 已有会话，保持现有进程；切换模式需先停止网关')
             return
+        if name == 'waist' and not self.remote.get('waist_control_available'):
+            raise RuntimeError('机器人尚未同步腰部控制代码；先同步 robot_link 再启动腰部驱动')
         ros = 'source /opt/ros/humble/setup.bash && source install/setup.bash && '
         commands = dict(hands=ros+'exec ros2 launch linker_hand_ros2_sdk linker_hand_double.launch.py',
                         hand_bridge=ros+'exec python3 teleoperation/bridges/hand_ros_bridge.py --side both',
+                        waist=ros+'exec ros2 run erob_canopen erob_driver_node',
                         head=ros+'exec ros2 launch servo_driver start_servo.py allow_motion:=true',
                         camera='exec bash teleoperation/scripts/run_head_camera_20hz.sh',
                         head_web='exec bash teleoperation/scripts/run_head_camera_web.sh')
@@ -238,17 +271,92 @@ class Console:
                        + shlex.quote('cat >> '+GATEWAY_STARTUP_LOG)+' && ')
             command = 'cd '+shlex.quote(REMOTE)+' &&'+capture+commands[name]
         self.command(['tmux', 'new-session', '-d', '-s', SESSIONS[name], 'bash -lc '+shlex.quote(command)])
-        self.event(f'机器人 {name} 启动已提交，查看日志确认就绪')
+        if name == 'waist':
+            self.waist_enable_requested = False
         self.refresh()
+        if SESSIONS[name] not in self.remote.get('sessions', []):
+            detail = self.remote.get('gateway_startup_log', '').strip() if name == 'gateway' else ''
+            raise RuntimeError(f'机器人 {name} 启动后立即退出' + (f'：{detail[-1800:]}' if detail else '；请查看服务日志'))
+        self.event(f'机器人 {name} 会话已建立，查看日志确认就绪')
 
     def key(self, key):
         # Never type into an exited program's shell. Only the gateway Python pane accepts keys.
-        command = self.command(['tmux', 'display-message', '-p', '-t', SESSIONS['gateway'], '#{pane_current_command}']).strip()
+        panes = self.command(['tmux', 'list-panes', '-a', '-F', '#{session_name}|#{pane_current_command}'])
+        command = next((row.split('|', 1)[1] for row in panes.splitlines()
+                        if row.startswith(SESSIONS['gateway'] + '|')), '')
         if 'python' not in command.lower():
             raise RuntimeError('网关 Python 程序未运行，拒绝发送终端按键')
         self.command(['tmux', 'send-keys', '-t', SESSIONS['gateway'], '-l', key])
         self.command(['tmux', 'send-keys', '-t', SESSIONS['gateway'], 'Enter'])
         self.event(f'网关命令 {key} 已发送；以实时反馈确认结果')
+
+    def waist_command(self, action, axis=None, direction=None, target_deg=None):
+        """Invoke the fixed ROS waist helper; never pass browser text to a shell."""
+        if action not in ('status', 'jog', 'target', 'stop', 'enable'):
+            raise ValueError('未知腰部命令')
+        if not self.remote.get('waist_control_available'):
+            raise RuntimeError('机器人尚未同步腰部控制代码；同步 robot_link 后重试')
+        argv = [REMOTE_PYTHON, '-m', 'esrobo_link.waist_control', action]
+        if action == 'jog':
+            if type(axis) is not int or axis not in (31, 32, 33) or type(direction) is not int or direction not in (-1, 1):
+                raise ValueError('腰部关节或方向无效')
+            argv.extend(['--axis', str(axis), '--direction', str(direction)])
+        elif action == 'target':
+            if (type(axis) is not int or axis not in WAIST_REFERENCE_DEG
+                    or type(target_deg) not in (int, float) or not math.isfinite(target_deg)
+                    or not WAIST_SINGLE_TURN_MIN_DEG <= target_deg <= WAIST_SINGLE_TURN_MAX_DEG):
+                raise ValueError('腰部目标角度无效或超出单圈范围')
+            argv.extend(['--axis', str(axis), '--target-deg', str(target_deg)])
+        script = ('source /opt/ros/humble/setup.bash && source '
+                  + shlex.quote(REMOTE + '/install/setup.bash') + ' && '
+                  + 'export PYTHONPATH=' + shlex.quote(REMOTE + '/robot_link') + ':"${PYTHONPATH:-}" && '
+                  + shlex.join(argv))
+        try:
+            output = self.command(['bash', '-lc', script], timeout=11)
+        except RuntimeError as exc:
+            try:
+                rejection = json.loads(str(exc).strip().splitlines()[-1])
+            except (IndexError, ValueError):
+                raise
+            if isinstance(rejection, dict) and rejection.get('ok') is False:
+                if rejection.get('command_sent') is False:
+                    raise WaistCommandNotSent(rejection.get('error', '腰部命令未发送')) from exc
+                raise RuntimeError(rejection.get('error', '腰部命令结果不确定')) from exc
+            raise
+        try:
+            result = json.loads(output.strip().splitlines()[-1])
+        except (IndexError, ValueError) as exc:
+            raise RuntimeError('腰部控制程序没有返回有效状态：' + output[-500:]) from exc
+        if not result.get('ok'):
+            if result.get('command_sent') is False:
+                raise WaistCommandNotSent(result.get('error', '腰部命令未发送'))
+            raise RuntimeError(result.get('error', '腰部操作失败'))
+        result.pop('ok', None)  # HTTP handler adds the single public success flag.
+        return result
+
+    def waist_interlock(self):
+        if self.running('teleop'):
+            raise RuntimeError('先结束本机遥操作计算，再调整腰部')
+        self.refresh()
+        robot = self.robot_state()
+        feedback = robot.get('feedback') or {}
+        members = feedback.get('sides') if isinstance(feedback, dict) else None
+        members = members if isinstance(members, dict) else {'single': feedback}
+        if (robot.get('age_s', 999) >= 1 or robot.get('mode') not in ('IDLE', 'FAULT')
+                or SESSIONS['gateway'] not in self.remote.get('sessions', [])
+                or not members or any(item.get('enable_states') != [False] * 7
+                                      for item in members.values())):
+            raise RuntimeError('腰部调整需要新鲜的网关状态，且机械臂七轴全部失能')
+
+    def clear_waist_pending(self):
+        self.waist_pending = None
+        self.waist_pending_hits = 0
+        try:
+            marker = json.loads(WAIST_MOVED_FILE.read_text())
+            marker.pop('pending', None)
+            WAIST_MOVED_FILE.write_text(json.dumps(marker))
+        except (OSError, ValueError):
+            pass
 
     def wait_remote_sessions_stopped(self, names, timeout=10):
         deadline = time.monotonic() + timeout
@@ -282,6 +390,33 @@ class Console:
                 raise RuntimeError('网关未确认双臂失能；保留服务并取消 CAN 初始化，请检查网关日志和现场状态')
             time.sleep(.2)
 
+    def wait_waist_stopped(self, timeout=8):
+        """Require fresh, nearly stationary three-axis feedback before closing CAN."""
+        deadline = time.monotonic() + timeout
+        previous = None
+        stable_pairs = 0
+        while time.monotonic() < deadline:
+            axes = self.waist_command('status')['axes']
+            try:
+                positions = {axis: axes[str(axis)]['position_deg'] for axis in WAIST_REFERENCE_DEG}
+                velocities = {axis: axes[str(axis)]['velocity'] for axis in WAIST_REFERENCE_DEG}
+            except (KeyError, TypeError) as exc:
+                raise RuntimeError('腰部三轴反馈不完整；未执行 CAN 初始化') from exc
+            if (all(isinstance(value, (int, float)) and math.isfinite(value)
+                    for value in (*positions.values(), *velocities.values()))
+                    and all(abs(value) <= 1.0 for value in velocities.values())
+                    and previous is not None
+                    and all(abs(positions[axis] - previous[axis]) <= 0.03
+                            for axis in WAIST_REFERENCE_DEG)):
+                stable_pairs += 1
+                if stable_pairs >= 2:
+                    return
+            else:
+                stable_pairs = 0
+            previous = positions
+            time.sleep(.2)
+        raise RuntimeError('腰部停止后未确认三轴停稳；保留驱动且未执行 CAN 初始化')
+
     def initialize_can(self, password):
         if not isinstance(password, str) or '\n' in password:
             raise ValueError('无效密码')
@@ -295,9 +430,17 @@ class Console:
             if self.remote.get('gateway_args'):
                 self.key('d')
                 self.wait_gateway_disabled()
-                self.key('q')
             else:
                 raise RuntimeError('网关会话存在但未确认网关进程；未执行 CAN 初始化，请检查会话与机器人状态')
+        if SESSIONS['waist'] in sessions:
+            self.waist_command('stop')
+            self.clear_waist_pending()
+            self.wait_waist_stopped()
+            self.command(['tmux', 'send-keys', '-t', SESSIONS['waist'], 'C-c'])
+            self.wait_remote_sessions_stopped(('waist',))
+            self.waist_enable_requested = False
+        if SESSIONS['gateway'] in sessions:
+            self.key('q')
             self.wait_remote_sessions_stopped(('gateway',))
         for name in ('hand_bridge', 'hands'):
             self.refresh()
@@ -305,12 +448,13 @@ class Console:
                 self.command(['tmux', 'send-keys', '-t', SESSIONS[name], 'C-c'])
                 self.wait_remote_sessions_stopped((name,))
         self.refresh()
-        if any(SESSIONS[name] in self.remote.get('sessions', []) for name in ('gateway', 'hand_bridge', 'hands')):
+        if any(SESSIONS[name] in self.remote.get('sessions', [])
+               for name in ('waist', 'gateway', 'hand_bridge', 'hands')):
             raise RuntimeError('仍有占用 CAN 的服务；未执行初始化')
         output = self.command(['sudo', '-S', '-p', '', 'bash', REMOTE+'/start_can.sh'],
                               stdin=password+'\n', timeout=45)
-        self.event('网关、双手通信桥和驱动已停止；CAN 初始化完成')
-        return dict(log=output, message='CAN 初始化完成；按需重新启动双手驱动、通信桥和网关')
+        self.event('腰部驱动、网关、双手通信桥和驱动已停止；CAN 初始化完成')
+        return dict(log=output, message='CAN 初始化完成；按需重新启动腰部驱动、双手驱动、通信桥和网关')
 
     def local_start(self, name, data, session):
         if name not in LABELS:
@@ -419,10 +563,23 @@ class Console:
             return {}
         if action == 'stop' or (action == 'release' and session == self.owner):
             self.stop_following()
+            if action == 'stop' and SESSIONS['waist'] in self.remote.get('sessions', []):
+                try:
+                    self.waist_command('stop')
+                    self.clear_waist_pending()
+                except Exception as exc:
+                    self.event('腰部停止请求失败，请检查现场运动：' + str(exc))
             return {}
         if action == 'remote_disable':
             self.disable_component(data.get('name'))
             return {}
+        if action == 'waist' and data.get('command') == 'stop':
+            with self.lock:
+                self.refresh()
+                result = self.waist_command(data['command'])
+                self.clear_waist_pending()
+                self.event(result['message'])
+                return result
         with self.lock:
             if action == 'connect':
                 self.connect(data.get('password', ''))
@@ -456,8 +613,105 @@ class Console:
                         # Never remove the only torque-control service while
                         # the physical head may still be holding torque.
                         self.disable_component('head')
+                    if name == 'waist':
+                        self.waist_interlock()
+                        self.waist_command('stop')
+                        self.clear_waist_pending()
+                        self.waist_enable_requested = False
                     self.command(['tmux', 'send-keys', '-t', SESSIONS[name], 'C-c'])
                 self.event(f'已请求停止机器人 {name}')
+            elif action == 'waist':
+                command = data.get('command')
+                if command not in ('status', 'enable', 'jog', 'target'):
+                    raise ValueError('未知腰部操作')
+                # Reading feedback needs no gateway/interlock refresh. Repeating
+                # that SSH query for every motion-confirmation sample can starve
+                # the dashboard's background freshness polling.
+                if command != 'status':
+                    self.refresh()
+                    self.waist_interlock()
+                if command in ('jog', 'target'):
+                    axis = data.get('axis')
+                    if type(axis) is not int or axis not in WAIST_REFERENCE_DEG:
+                        raise ValueError('腰部关节编号无效')
+                    if command == 'jog' and (type(data.get('direction')) is not int
+                                             or data['direction'] not in (-1, 1)):
+                        raise ValueError('腰部关节或方向无效')
+                    target_deg = data.get('target_deg')
+                    if command == 'target' and (type(target_deg) not in (int, float)
+                                                or not math.isfinite(target_deg)
+                                                or not WAIST_SINGLE_TURN_MIN_DEG <= target_deg <= WAIST_SINGLE_TURN_MAX_DEG):
+                        raise ValueError('腰部目标角度无效或超出单圈范围')
+                    if self.waist_pending is not None:
+                        raise RuntimeError('上一腰部目标尚未确认到位；请等待页面自动读取反馈，或停止腰部运动后重新读取')
+                    if not self.waist_enable_requested:
+                        raise RuntimeError('腰部驱动启动后尚未请求使能；请先读取反馈并点击“使能腰部三轴”')
+                    # A lost SSH reply must not leave arm enable unguarded after
+                    # the ROS command may already have reached the waist.
+                    self.waist_pending = (axis, None)
+                    self.waist_pending_hits = 0
+                    WAIST_MOVED_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        previous_marker = WAIST_MOVED_FILE.read_bytes()
+                    except FileNotFoundError:
+                        previous_marker = None
+                    WAIST_MOVED_FILE.write_text(json.dumps(dict(axis=axis, at=time.time(),
+                                                               pending=dict(axis=axis, target=None))))
+                try:
+                    if command == 'target':
+                        result = self.waist_command(command, axis, target_deg=target_deg)
+                    else:
+                        result = self.waist_command(command, data.get('axis'), data.get('direction'))
+                except WaistCommandNotSent:
+                    if command in ('jog', 'target'):
+                        self.waist_pending = None
+                        self.waist_pending_hits = 0
+                        if previous_marker is None:
+                            WAIST_MOVED_FILE.unlink(missing_ok=True)
+                        else:
+                            WAIST_MOVED_FILE.write_bytes(previous_marker)
+                    raise
+                if command in ('jog', 'target'):
+                    self.waist_pending = (result['axis'], result['target_deg'])
+                    marker = json.loads(WAIST_MOVED_FILE.read_text())
+                    marker['pending'] = dict(axis=result['axis'], target=result['target_deg'],
+                                             from_deg=result['from_deg'])
+                    WAIST_MOVED_FILE.write_text(json.dumps(marker))
+                if command == 'enable':
+                    self.waist_enable_requested = True
+                if command == 'status':
+                    axes = result['axes']
+                    try:
+                        marker = json.loads(WAIST_MOVED_FILE.read_text())
+                    except (OSError, ValueError):
+                        marker = None
+                    if self.waist_pending is not None:
+                        axis, target = self.waist_pending
+                        feedback = axes.get(str(axis), axes.get(axis, {}))
+                        prior = (marker or {}).get('pending', {}).get('from_deg')
+                        tolerance = (min(0.2, max(0.03, abs(target - prior) / 2))
+                                     if target is not None and isinstance(prior, (int, float))
+                                     and math.isfinite(prior) else 0.2)
+                        if (target is not None and feedback.get('error') in (0, WAIST_SINGLE_TURN_BATTERY_WARNING) and
+                                abs(feedback.get('position_deg', float('inf')) - target) <= tolerance):
+                            self.waist_pending_hits += 1
+                            if self.waist_pending_hits >= 2:
+                                self.waist_pending = None
+                                self.waist_pending_hits = 0
+                                if marker:
+                                    marker.pop('pending', None)
+                                    WAIST_MOVED_FILE.write_text(json.dumps(marker))
+                        else:
+                            self.waist_pending_hits = 0
+                    result['motion_pending'] = self.waist_pending is not None
+                    if marker and self.waist_pending is None and time.time() - marker.get('at', time.time()) >= 3:
+                        if all(axes[str(axis)]['error'] in (0, WAIST_SINGLE_TURN_BATTERY_WARNING)
+                               and abs(axes[str(axis)]['position_deg'] - reference) <= WAIST_REFERENCE_TOLERANCE_DEG
+                               for axis, reference in WAIST_REFERENCE_DEG.items()):
+                            WAIST_MOVED_FILE.unlink(missing_ok=True)
+                if result.get('message'):
+                    self.event(result['message'])
+                return result
             elif action == 'remote_log':
                 name = data.get('name')
                 if name not in SESSIONS:
@@ -522,6 +776,8 @@ class Console:
                     raise ValueError('未知网关命令')
                 self.refresh()
                 if key == 'e':
+                    if WAIST_MOVED_FILE.exists():
+                        raise RuntimeError('腰部曾通过页面离开竖直基准；请读取腰部反馈，确认 31/32/33 号回到 139° / 215° / 144°（±0.2°）')
                     remote_args = self.remote.get('gateway_args', [])
                     if ('--side' in remote_args
                             and remote_args[remote_args.index('--side')+1] == 'both'):
@@ -553,6 +809,28 @@ class Console:
                                 '），已在机器人运动前拒绝联合使能。可先选择仅机械臂或仅灵巧手；'
                                 '机械臂与灵巧手联合运动需完成反馈值到 URDF 关节角的几何标定。'
                             )
+                    if not self.mode.get('hand_only'):
+                        if SESSIONS['waist'] not in self.remote.get('sessions', []):
+                            raise RuntimeError('机械臂使能前需要运行腰部驱动并读取竖直姿态反馈')
+                        try:
+                            axes = self.waist_command('status')['axes']
+                            for axis, reference in WAIST_REFERENCE_DEG.items():
+                                feedback = axes[str(axis)]
+                                position = feedback['position_deg']
+                                velocity = feedback['velocity']
+                                error = feedback['error']
+                                if (not isinstance(position, (int, float)) or not math.isfinite(position)
+                                        or not isinstance(velocity, (int, float)) or not math.isfinite(velocity)
+                                        or abs(position - reference) > WAIST_REFERENCE_TOLERANCE_DEG
+                                        or abs(velocity) > 1.0
+                                        or error not in (0, WAIST_SINGLE_TURN_BATTERY_WARNING)):
+                                    raise RuntimeError(
+                                        f'腰部 {axis} 号未停在 URDF 竖直基准 {reference:g}° ±'
+                                        f'{WAIST_REFERENCE_TOLERANCE_DEG:g}°；当前反馈：位置 {position!r}°，'
+                                        f'速度 {velocity!r}°/s，错误码 {error!r}'
+                                    )
+                        except (KeyError, TypeError, ValueError) as exc:
+                            raise RuntimeError('腰部三轴反馈不完整；拒绝机械臂使能') from exc
                 elif key in ('s', 'x'):
                     self.stop_following()
                     return {}
@@ -736,7 +1014,7 @@ def make_handler(console, port):
                     return self.send(*console.head('POST', path, body))
                 if path != '/api/action':
                     return self.send(404, {'error':'不存在'})
-                self.send(200, dict(ok=True, **console.action(data)))
+                self.send(200, {**console.action(data), 'ok': True})
             except Exception as exc:
                 self.send(409, {'error':str(exc)})
 

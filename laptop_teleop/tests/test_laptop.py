@@ -170,6 +170,34 @@ def test_hand_only_rate_floor_cannot_be_configured_below_35_hz():
         settings.validate()
 
 
+def test_arm_rate_tolerance_accepts_brief_38hz_but_rejects_sustained_34hz():
+    settings = Settings(side="right", with_hand=False, hand_only=False)
+    settings.validate()
+    monitor = ControlRateMonitor(settings.minimum_control_rate_hz, .08,
+                                 rate_tolerance_hz=settings.arm_rate_tolerance_hz,
+                                 rate_window_s=2.0)
+    for index in range(79):
+        monitor.observe(index / 38.7, "ACTIVE", True)
+    monitor.observe(3, "IDLE", False)
+    with pytest.raises(RuntimeError, match="stop below 35.0 Hz over 2 s"):
+        for index in range(75):
+            monitor.observe(4 + index / 34, "ACTIVE", True)
+
+
+def test_arm_rate_tolerance_keeps_target_gap_limit():
+    monitor = ControlRateMonitor(40, .08, rate_tolerance_hz=5.0, rate_window_s=2.0)
+    monitor.observe(0, "ACTIVE", True)
+    with pytest.raises(RuntimeError, match="gap"):
+        monitor.observe(.081, "ACTIVE", False)
+
+
+def test_arm_rate_floor_cannot_be_configured_below_35_hz():
+    settings = Settings(side="right", with_hand=False, hand_only=False)
+    settings.arm_rate_tolerance_hz = 5.1
+    with pytest.raises(ValueError, match="at least 35 Hz"):
+        settings.validate()
+
+
 def test_hand_only_two_second_rate_window_allows_short_source_slowdown():
     monitor = ControlRateMonitor(40, .08, rate_tolerance_hz=5.0, rate_window_s=2.0)
     for index in range(135):

@@ -322,13 +322,15 @@ ros2 topic echo /erobo/joint_errors
 [关节ID, 位置角度deg, 速度, 电流, 温度]
 ```
 
-垂直参考位：
+此前使用的腰部编码器参考值（已不对应当前竖直姿态，不可作为机械臂使能目标）：
 
 ```text
-31号 ≈ 180°
-32号 ≈ 180°
-33号 ≈ 150°
+31号 120°
+32号 260°
+33号 170°
 ```
+
+当前网页腰部每次调整以该轴最新反馈（按页面显示的 0.01° 精度）为中心，单次最多 ±5°，并限制在单圈 0°～360°。实机已调整到与 URDF 零位相符的竖直姿态；该姿态下 31/32/33 号实测约 `138.98° / 214.98° / 143.97°`，机械臂使能基准取 `139° / 215° / 144°`（各轴 ±0.2°）。使能前会重新读取三轴位置、速度和错误码。使用前仍需核验实际机械姿态和编码器零点；编码器维修或零点变化后需重新标定基准。`/erobo/joint_errors` 返回完整 32 位错误码；`0x0C26`（3110）表示多圈编码器备用电池电压低。腰部设计为单圈范围内运动，因此该码保留显示但不单独禁止腰部使能与调整；每次上电须核对实际机械姿态与反馈一致，其他非零错误码仍禁止运动。
 
 使能：
 
@@ -336,23 +338,22 @@ ros2 topic echo /erobo/joint_errors
 ros2 topic pub /erobo/enable std_msgs/msg/Bool "{data: true}" -1
 ```
 
-小幅位置测试，先测试 33 号从约 150° 到 151°：
+小幅位置测试：先请求腰部使能；仅在反馈有效、无其他阻断错误码、实际姿态已核验且机械臂失能后，从当前约 144° 测试 33 号到 145°：
 
 ```bash
-ros2 topic pub /erobo/pos_target std_msgs/msg/Float32MultiArray "{data: [33.0, 151.0, 10.0, 20.0]}" -1
+ros2 topic pub /erobo/pos_target std_msgs/msg/Float32MultiArray "{data: [33.0, 145.0, 10.0, 20.0]}" -1
 ```
 
-回到参考位：
+回到当前调整基准：
 
 ```bash
-ros2 topic pub /erobo/pos_target std_msgs/msg/Float32MultiArray "{data: [33.0, 150.0, 10.0, 20.0]}" -1
+ros2 topic pub /erobo/pos_target std_msgs/msg/Float32MultiArray "{data: [33.0, 144.0, 10.0, 20.0]}" -1
 ```
 
-停止和失能：
+减速停止运动（保留电机使能）：
 
 ```bash
 ros2 topic pub /erobo/stop std_msgs/msg/Empty "{}" -1
-ros2 topic pub /erobo/enable std_msgs/msg/Bool "{data: false}" -1
 ```
 
 `/erobo/pos_target` 数据含义：
@@ -616,7 +617,7 @@ udevadm info -q path -n /dev/ttyACM0
 3. 灵巧手驱动启动时会设置较高力矩/速度并移动到预设姿态。
 4. 机械臂 `move_j` 必须给完整 7 关节位置，避免缺失关节被错误处理。
 5. 底盘 `/cmd_vel` 测试后必须主动发送 0 速度。
-6. 腰部 `/erobo/enable`、`/erobo/brake` 作用于扫描到的全部腰部关节，不是单轴独立使能。
+6. 腰部 `/erobo/enable` 只接受 `true`，作用于扫描到的全部腰部关节；驱动忽略 `false`，不提供 `/erobo/brake` 入口。腰部不得通过软件失能。
 7. `debug_cmd.txt` 中部分命令幅度较大，第一次真机调试不要直接照抄。
 
 ## 通过标准

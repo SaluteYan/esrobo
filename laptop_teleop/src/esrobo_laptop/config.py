@@ -26,6 +26,7 @@ class Settings:
     network_margin_s: float = 0.02
     rate_hz: float = 50
     minimum_control_rate_hz: float = 40
+    arm_rate_tolerance_hz: float = 5
     hand_only_rate_tolerance_hz: float = 5
     control_gap_timeout_s: float = 0.08
 
@@ -52,6 +53,9 @@ class Settings:
         if self.hand_only and not (0 <= self.hand_only_rate_tolerance_hz <= 5
                                    and self.minimum_control_rate_hz-self.hand_only_rate_tolerance_hz >= 35):
             raise ValueError("hand-only sustained control rate must remain at least 35 Hz")
+        if not self.hand_only and not (0 <= self.arm_rate_tolerance_hz <= 5
+                                       and self.minimum_control_rate_hz-self.arm_rate_tolerance_hz >= 35):
+            raise ValueError("arm sustained control rate must remain at least 35 Hz")
 
     @property
     def sides(self):
