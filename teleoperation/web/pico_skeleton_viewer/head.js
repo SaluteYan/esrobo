@@ -28,19 +28,28 @@ function render() {
 }
 async function poll() {
   while (running) {
+    let delay = 200;
     try {
       const response = await fetch('/api/head/state', {cache: 'no-store', signal: AbortSignal.timeout(2000)});
-      if (!response.ok) throw new Error('头部相机服务不可用');
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw new Error(detail.error || '头部相机服务不可用');
+      }
       state = await response.json(); render();
       if (state.control.owner === session) await post('heartbeat');
-    } catch (error) { state = null; render(); report(error); }
-    await new Promise(resolve => setTimeout(resolve, 200));
+    } catch (error) { state = null; render(); report(error); delay = 2000; }
+    await new Promise(resolve => setTimeout(resolve, delay));
   }
 }
 async function images() {
   while (running) {
     const requested = stream;
     let delay = 100;
+    if (!state) {
+      $('preview').hidden = true; $('image-empty').hidden = false; $('image-age').textContent = '等待相机服务';
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      continue;
+    }
     try {
       const response = await fetch(`/api/head/${requested}.jpg`, {cache:'no-store', signal:AbortSignal.timeout(2000)});
       if (!response.ok) throw new Error('等待图像或图像已过期');

@@ -1,195 +1,85 @@
-# 日常遥操作步骤
+# 日常遥操作运行顺序
 
-推荐使用统一网页入口：仓库根目录执行 `./laptop_teleop/scripts/run_dashboard.sh`，打开 `http://127.0.0.1:8080`。以下各终端的启动、标定回车和网关命令均已接入页面，具体流程见 [`05_WEB_CONSOLE.md`](05_WEB_CONSOLE.md)。下文保留为命令行操作和故障排查参考；不要同时启动网页与终端中的同一采集/计算程序。
+本文负责每次操作的顺序。首次依赖安装在 [本机 README](../README.md#环境安装与配置)，网页按钮细节在 [05](05_WEB_CONSOLE.md)。网页和终端不能重复启动同一采集、计算、网关或手部桥。
 
-以下流程默认双臂双手，仓库位于 `/home/ddc/DualArmTeleoperation`，机器人为 `192.168.10.100`。首次操作前必须完成环境、网络、共享密钥和机器人端硬件标定。
+## 开始前
 
-## 0. 开始前
+确认机器人运动空间、支撑和现场急停可用。核对所选侧、CAN、控制器健康和新鲜反馈；恢复或模式切换前结束正式计算。腰部应处于已验证的固定模型姿态，调整腰部时不得遥操作机械臂。
 
-- 清空机器人运动范围，确认急停可触及。
-- 机器人双臂、双手已获得新鲜反馈，CAN 和 ROS 驱动无故障。
-- PICO 电量充足，启用 Body 和 Hand 追踪，摘下手套并保持双手可见。
-- 首次联调先使用单臂或 `--preview`，确认方向后再使能。
+选择本次模式：单臂＋同侧手、纯单臂或仅同侧手。双臂模式不能复用单臂的自动准备和回零，需要经过现场验证的双臂流程。
 
-统一设置仓库变量：
+## 服务与输入
+
+1. 运行 `./laptop_teleop/scripts/run_dashboard.sh`，打开 `http://127.0.0.1:8080`。
+2. 连接机器人，选择模式，按需初始化 CAN。带手或仅手模式依次启动双手 ROS 驱动、唯一双手通信桥、网关；纯臂模式可省略双手服务。
+3. 确认网关 `IDLE`、控制器健康、所需反馈新鲜。遇到电子急停先使用明确的受检恢复流程，不反复点击使能或初始化 CAN。
+4. 本机启动 PICO PC Service 和“PICO 全身＋双手采集”。头显开启 Body/Full Body 和 Hand Tracking，手处于摄像头视野内。
+5. 骨架“原始采集”“固定映射”层应随 Body 新帧变化；查看 SDK 与实际转发频率、序号和年龄。带手模式还要求同侧 Hand 和掌面有效。
+
+## 预览验收
+
+先启动预览，稳定保持期望姿态完成参考采集。必须看到实际计算目标和 IK 结果，只有“进程运行”或标定提示不算通过。
+
+- 保持手腕相对前臂不动，移动手臂：手的世界位置和朝向随臂变化。
+- 保持肩肘腕位置，做小幅翻掌、侧摆、弯腕：主要检查 J5、J6、J7 的方向及范围。
+- 自然张手后逐指弯曲，比较 PICO 输入、目标和机器人反馈的索引；不要用显示动画证明硬件到位。
+
+预览只计算，不发送运动目标。网页结束预览会请求停止；正式启动前按页面恢复到 `IDLE`。
+
+## 正式准备、标定与接近
+
+1. 点击“开始正式计算”。`IDLE` 阶段只发送实测姿态，不开始运动。
+2. 人工点击一次“使能并准备 e”。自动准备锁定机器人手的实测姿态，执行机械臂受检回零并验证失能，然后进入 `CALIBRATING`；它与故障恢复按钮的手部优先回零不同。
+3. 保持完整 Body/Hand 输入，自然张手并尽量稳定地保持希望机器人首先到达的姿态。标定平均姿态成为首次目标，不要求特定抬臂角度。
+4. `CHECKING_ENTRY` 规划锁定目标：所有实际进入标定后规划的臂模式均只移动 J1–J5，J6/J7 和手指保持实测位置；规划碰撞只包含机械臂及腕部，排除掌体和手指。
+5. `APPROACHING` 按 50 Hz 固定期限执行受检接近。本机发送独立保活，暂时缺少 PICO 新帧不改写锁定目标。
+6. 到位进入 `WAITING_FOR_ACTIVE_TARGET`，保持机器人并等待完整、新鲜、同步的输入；到位起算的 2 秒期限仍有效。
+7. 进入 `ACTIVE` 后，J6/J7 从实测位置受限速衔接至实时目标；手指按固定首次目标过渡，到位后切换实时跟随。首次接管和断帧恢复分别处理，不能用旧输入完成接管。
+
+实时输入最长 100 ms。暂时缺少完整新帧先减速保持，最多 500 ms；恢复要求连续 3 帧满足连续性。不可达位置可按所选模式进入目标保持；控制器、反馈和持续输入故障仍会闭锁。保持不代表失能。
+
+## 停止与恢复
+
+“停止运动”“结束计算”、页面关闭或控制页面心跳丢失都会结束目标流并请求网关停止。反馈可能仍报告电机使能；急停、停止和失能是不同状态。
+
+显式“受检回零并恢复 IDLE”在单臂带手模式下：
+
+1. 核验七轴新鲜失能反馈和控制器健康；仅按既有条件复位孤立电子急停。
+2. 在当前机械臂姿态检查完整手部归零扫掠，限速恢复该侧自然张开姿态并核验到位。手部阶段持续验证七轴失能、位置漂移不超过 0.2°、手部反馈新鲜且位于认证范围。
+3. 手部成功后才规划和执行机械臂七轴回零；最后核验失能、控制器健康和手部仍在零位，全部通过才报告 `IDLE`。
+
+手部拒绝或取消时七轴不开始运动；该入口不隐式失能仍在承重的机械臂。纯单臂直接走七轴回零；仅手模式的恢复只核验失能与反馈；双臂不提供自动恢复。恢复失败查看阶段和原因，不把机械臂已回零当作整项成功。
+
+结束时依次停止计算、PICO 采集、PC Service，再按需关闭机器人服务。
+
+## 命令行替代入口
+
+从仓库根目录执行；模式参数必须与网关一致：
 
 ```bash
-export ESROBO_REPO=/home/ddc/DualArmTeleoperation
-cd "$ESROBO_REPO"
-```
-
-## 1. 机器人终端 R1：底层驱动与网关
-
-按 [`02_ROBOT_CONNECTION.md`](02_ROBOT_CONNECTION.md) 启动 CAN、LinkerHand 双手驱动、双手桥和硬件网关。网关看到有效反馈后保持 `IDLE`，此时不要输入 `e`。
-
-当前三个机器人进程已运行在 `esrobo_hands`、`esrobo_hand_bridge`、`esrobo_gateway` tmux 会话中。每次操作前仍需执行本机 `run_laptop.sh inspect`；2026-09-22 的检查中左臂控制器处于 `EMERGENCY_STOP`，解除并确认 `controller_fault: null` 前禁止进入第 7 步。
-
-## 2. 本机终端 A：PICO 服务
-
-```bash
-cd "$ESROBO_REPO"
+./laptop_teleop/scripts/run_laptop.sh check --side right
 ./laptop_teleop/scripts/xrobotoolkit_service.sh start
-./laptop_teleop/scripts/xrobotoolkit_service.sh status
-```
-
-在头显端启动全身追踪应用并连接本机 PC Service。然后启动采集适配器：
-
-```bash
 ./laptop_teleop/scripts/run_pico.sh
 ```
 
-默认向本机 `127.0.0.1:15050` 发布，骨架预览为 `http://127.0.0.1:8765`。终端应持续显示真实骨骼帧，而非只显示等待连接。
-
-## 3. 旧版 SenseCom 流程（当前 PICO 模式跳过）
-
-**当前版本第 3–5 节仅保留作旧手套软件维护参考，不属于遥操作启动流程。** 直接执行第 6 节；PICO 统一输入与升级命令见 [文档 06](06_PICO_HAND_INPUT.md)。计算端忽略 SenseGlove 数据。
-
-固定手套为左手 `00885`、右手 `00892`。需要恢复 ROS 配置时执行：
+另一个终端预览：
 
 ```bash
-cd "$ESROBO_REPO"
-./laptop_teleop/scripts/configure_senseglove.sh 00885 00892
-./laptop_teleop/scripts/run_sensecom.sh
+./laptop_teleop/scripts/run_laptop.sh run --preview --side right
 ```
 
-Nova 2 v2.x 不要只在系统蓝牙设置中连接。关闭系统蓝牙设置页，在 SenseCom 左上角菜单选择 **Pair Devices**，确认两只手套出现在 **Nearby Devices** 后点击配对；两只设备进入 **Paired Devices** 且均显示 `Connected` 才算连接完成。v1.x Bluetooth Classic 需先完成 rfcomm 连接。
-
-可以在启动 ROS 前用厂商 SDK 独立验证：
+结束预览并恢复 `IDLE` 后正式计算：
 
 ```bash
-source /opt/ros/humble/setup.bash
-source "$ESROBO_REPO/laptop_teleop/external/senseglove_ros_ws/install/setup.bash"
-ros2 run senseglove_api sg_tester
+./laptop_teleop/scripts/run_laptop.sh run --side right
 ```
 
-正常结果应列出左右两只手套；若输出 `No SenseGloves detected`，先处理 SenseCom 配对，不要继续 ROS 启动提示。
+再通过网页或机器人网关终端人工输入 `e`。网关本地 `s/x` 停止、`d` 失能、单臂 `z` 受检回零、`q` 退出；命令须按 Enter。完整命令和协议见 [robot_link](../../robot_link/README.md)。
 
-## 4. 旧版 SenseGlove ROS（当前 PICO 模式跳过）
+## 离线回归
 
 ```bash
-cd "$ESROBO_REPO"
-./laptop_teleop/scripts/run_senseglove_ros.sh
-```
-
-launch 会提示启动 SenseCom 并按 Enter；终端 B 已连接后按 Enter。另开短命令验证话题：
-
-```bash
-source /opt/ros/humble/setup.bash
-source "$ESROBO_REPO/laptop_teleop/external/senseglove_ros_ws/install/setup.bash"
-ros2 topic list | grep senseglove_states
-ros2 topic hz /senseglove/glove<左序列号>/lh/senseglove_states
-ros2 topic hz /senseglove/glove<右序列号>/rh/senseglove_states
-```
-
-## 5. 旧版手套标定与输入桥（当前 PICO 模式跳过）
-
-首次使用、重新佩戴或标定文件失效时：
-
-```bash
-cd "$ESROBO_REPO"
-./laptop_teleop/scripts/run_senseglove.sh \
-  --left-serial <左手套序列号> --right-serial <右手套序列号> --recalibrate
-```
-
-按终端提示依次保持张手/中性腕姿和握拳等姿态。只有左右话题都有非零实时数据才会完成标定。结果写入 `laptop_teleop/config/senseglove_calibration.json`，该文件不会提交到 Git。
-
-日常已有有效标定时去掉 `--recalibrate`：
-
-```bash
-./laptop_teleop/scripts/run_senseglove.sh \
-  --left-serial <左手套序列号> --right-serial <右手套序列号>
-```
-
-## 6. 本机终端 E：检查、预览、正式运行
-
-先检查模型与 PICO SDK：
-
-```bash
-cd "$ESROBO_REPO"
-./laptop_teleop/scripts/run_laptop.sh check
-```
-
-首次建议在机器人网关保持 `IDLE` 时预览计算，不发送目标：
-
-```bash
-./laptop_teleop/scripts/run_laptop.sh run --preview
-```
-
-确认 PICO 胸前抬臂参考、IK 输出及左右映射正确后退出预览，等待至少 1 秒，再正式启动：
-
-```bash
-./laptop_teleop/scripts/run_laptop.sh run
-```
-
-正式计算启动后，本机先发送机器人当前实测姿态的保持目标。此时无需先做参考标定；输入 `e` 后才重新采集本次运动参考。
-
-## 7. 机器人终端 R1：人工使能
-
-只有在本机各采集终端持续正常、网关状态为 `IDLE`、机器人周边安全时，才在机器人网关终端输入：
-
-```text
-e
-```
-
-`e` 后所选灵巧手先限速回到自然张开位并核对十轴反馈，机械臂再受检回零并验证失能。终端提示后，将前臂抬到胸前、肘部自然弯曲，双手自然张开并保持在头显视野内；PICO 连续检测稳定后自动建立参考、发送零位匹配首帧并进入 `ACTIVE`。双臂网关当前不自动执行缺少互碰扫掠检查的回零，必须按现场双臂恢复流程处理。运动过程中保持急停可触及。
-
-## 8. 停止
-
-在本机计算终端输入以下任一字符后回车：
-
-```text
-s
-x
-q
-```
-
-也可按 Ctrl+C。观察机器人网关退出 `ACTIVE` 并确认机械臂不再接收运动目标。随后按以下顺序停止采集：
-
-1. Ctrl+C 停止 PICO 全身与双手采集。
-2. 如仍在运行旧手套服务，停止手套桥、SenseGlove ROS 和 SenseCom；它们已不参与当前计算。
-3. 按需停止 PC Service：
-
-```bash
-./laptop_teleop/scripts/xrobotoolkit_service.sh stop
-```
-
-4. 在机器人端按硬件文档失能并关闭底层驱动。
-
-## 9. 单臂、纯手臂或仅灵巧手模式
-
-纯左臂只需 PICO Body：
-
-```bash
-# 机器人端
-python -m esrobo_link.gateway --hardware --side left --bind 192.168.10.100 \
-  --config teleoperation/config/teleop_config.yaml --key-file ~/.config/esrobo/robot-link.key
-
-# 本机
-./laptop_teleop/scripts/run_laptop.sh run --side left --arm-only
-```
-
-右臂把 `left` 改成 `right`。单臂加同侧手时，机器人网关增加 `--with-hand`，本机不加 `--arm-only`，并确保同侧 PICO Hand 有效；无需启动手套桥。
-
-仅控制一只灵巧手时仍需机器人端 LinkerHand ROS 驱动和手部通信桥，但不需要 PICO Body 标定、手臂重定向或 IK。以下以右手为例：
-
-```bash
-# 机器人端：保持右臂七轴失能，只允许右手目标
-python -m esrobo_link.gateway --hardware --side right --with-hand --hand-only \
-  --bind 192.168.10.100 --config teleoperation/config/teleop_config.yaml \
-  --key-file ~/.config/esrobo/robot-link.key
-
-# 本机：只消费 right_hand 并发送十轴手目标
-./laptop_teleop/scripts/run_laptop.sh run --side right --hand-only
-```
-
-左手把两处 `right` 改成 `left`。使能前确认网页中对应机械臂仍为 `0 / 7`；网关发现任一轴已使能会拒绝启动或立即停止。
-
-## 10. 无硬件自检
-
-```bash
-cd "$ESROBO_REPO"
-/home/ddc/miniforge3/envs/esrobo_laptop/bin/python -m esrobo_laptop.demo
 ./laptop_teleop/scripts/test.sh
 ```
 
-演示只使用本机临时端口、模拟网关和临时密钥，不连接 `192.168.10.100`，不会创建设备后端。
+独立性能分析见 [故障排查](04_TROUBLESHOOTING.md#独立测试与耗时测量)。回归通过不等于真机动作验收通过。

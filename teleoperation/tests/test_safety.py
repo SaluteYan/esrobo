@@ -114,7 +114,7 @@ class NeroMappingTests(unittest.TestCase):
         )
         output = self.driver._clamp(target_physical, target_physical, "left", 0.02)
         expected_urdf = np.asarray(
-            [1.047198, -1.308997, 1.570796, 2.094395, 1.047198, -0.523599, 0.959931]
+            [1.047198, -1.308997, 1.570796, 2.094395, 2.0, -0.663225, 1.396263]
         )
         expected_physical, _ = self.driver._full_to_physical(
             np.concatenate([expected_urdf, expected_urdf])
@@ -457,6 +457,8 @@ class ArmVectorCoordinateTests(unittest.TestCase):
         for side in ("left", "right"):
             device = self._direction_filter_device()
             device._cfg.elbow_angle_mapping = "responsive_absolute"
+            device._cfg.arm_vector_position_mode = "segment_direction_relative"
+            device._cfg.upper_arm_direction_mapping = "relative"
             device._signs = np.ones(3)
             device._held_segment_directions = {"left": {}, "right": {}}
             device._last_body_frame_packet_time_monotonic = 10.0
@@ -517,15 +519,6 @@ class ArmVectorCoordinateTests(unittest.TestCase):
 
         self.assertGreater(np.arctan2(adaptive_result[1], adaptive_result[0]),
                            np.arctan2(fixed_result[1], fixed_result[0]))
-
-    def test_prediction_soft_gate_rejects_jitter_and_preserves_motion(self):
-        device = self._direction_filter_device()
-
-        self.assertEqual(device._prediction_velocity_gain(0.04), 0.0)
-        self.assertEqual(device._prediction_velocity_gain(0.30), 1.0)
-        middle = device._prediction_velocity_gain(0.155)
-        self.assertGreater(middle, 0.0)
-        self.assertLess(middle, 1.0)
 
     def test_calibrated_senseglove_delta_is_not_rezeroed_by_pico_rebase(self):
         device = BodyDevice.__new__(BodyDevice)
@@ -703,30 +696,37 @@ class BodyReferencePromptTests(unittest.TestCase):
         self.assertIn("PICO 手臂参考姿态标定", text)
         self.assertIn("秒后进入稳定缓冲", text)
         self.assertIn("正在采集参考姿态", text)
-        self.assertIn("胸前抬臂参考已锁定", text)
+        self.assertIn("当前姿态参考已锁定", text)
 
-    def test_reference_rejects_arms_hanging_at_sides(self):
+    def test_reference_starts_with_complete_arm_hanging_at_side(self):
         device = self._device()
-        device._cfg.reference_min_upper_raise_deg = 35.0
-        device._cfg.reference_min_elbow_flexion_deg = 25.0
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             device._update_auto_reference(10.0)
         self.assertFalse(device._reference_locked)
-        self.assertIsNone(device._reference_start_time)
-        self.assertIn("手臂仍接近身体侧面", output.getvalue())
+        self.assertEqual(device._reference_start_time, 10.0)
+        self.assertIn("PICO 手臂参考姿态标定", output.getvalue())
+        self.assertIn("请保持当前姿态", output.getvalue())
 
-    def test_reference_accepts_raised_bent_arm_pose(self):
+    def test_reference_starts_with_deep_elbow_bend(self):
         device = self._device()
-        device._cfg.reference_min_upper_raise_deg = 35.0
-        device._cfg.reference_min_elbow_flexion_deg = 25.0
-        device._cfg.reference_max_elbow_flexion_deg = 125.0
         points = {
             "shoulder": np.asarray([0.0, 0.0, 0.0]),
-            "elbow": np.asarray([0.3, 0.0, -0.3]),
-            "wrist": np.asarray([0.6, 0.0, -0.3]),
+            "elbow": np.asarray([0.0, 0.0, -0.3]),
+            "wrist": np.asarray([0.05, 0.0, -0.005]),
         }
-        self.assertIsNone(device._reference_pose_rejection({"left": points}))
+        device._current_arm_points.return_value = points
+        device._update_auto_reference(10.0)
+        self.assertEqual(device._reference_start_time, 10.0)
+
+    def test_reference_waits_for_complete_pico_data(self):
+        device = self._device()
+        device._current_arm_points.return_value = None
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            device._update_auto_reference(10.0)
+        self.assertIsNone(device._reference_start_time)
+        self.assertIn("等待完整的 PICO", output.getvalue())
 
     def test_unstable_reference_restarts_full_countdown(self):
         device = self._device()
@@ -849,6 +849,7 @@ class NeroSingleArmTests(unittest.TestCase):
             nonlocal feedback
             feedback = np.asarray(q).copy()
         self.driver.read_joints = mock.Mock(side_effect=read)
+        self.driver._read_checked_motion_feedback = self.driver.read_joints
         self.driver._arm.move_j.side_effect = send
         self.driver._arm.disable.return_value = True
         with mock.patch("esrobo_teleop.robot.nero_driver.time.sleep"):
@@ -888,6 +889,7 @@ class NeroSingleArmTests(unittest.TestCase):
             return joints
 
         self.driver.read_joints = mock.Mock(side_effect=read_sample)
+        self.driver._read_checked_motion_feedback = self.driver.read_joints
 
         returned = self.driver._return_group_to_zero(
             np.zeros(14), np.arange(7), zero, math.radians(1.0), 1.0
@@ -935,6 +937,7 @@ class NeroSingleArmTests(unittest.TestCase):
             feedback = np.asarray(values).copy()
 
         self.driver.read_joints = mock.Mock(side_effect=read_sample)
+        self.driver._read_checked_motion_feedback = self.driver.read_joints
         self.driver._arm.move_j.side_effect = accept_command
         returned = self.driver._return_group_to_zero(
             np.zeros(14), np.arange(7), zero, math.radians(1.0), 2.0
@@ -1093,7 +1096,43 @@ class HandMappingTests(unittest.TestCase):
         active[1] = limits["thumb_cmc_yaw"][1]
         active[2] = limits["thumb_cmc_pitch"][1]
         right = self.driver._rad_to_servo(active, "right")
-        np.testing.assert_array_equal(right[[0, 1, 9]], [40, 40, 100])
+        np.testing.assert_array_equal(right[[0, 1, 9]], [150, 40, 100])
+
+    def test_right_thumb_output_cannot_drive_further_into_measured_flexion_stop(self):
+        self.driver._feedback["right"] = np.asarray(
+            [138, 210, 254, 254, 254, 254, 110, 109, 119, 33], dtype=float
+        )
+        self.driver._feedback_time["right"] = time.monotonic()
+        self.driver._last_cmd["right"] = self.driver._feedback["right"].copy()
+        left = np.asarray(self.driver._cfg.left_open, dtype=float)
+        right = self.driver._feedback["right"].copy()
+        right[0] = 110
+        self.driver._send_physical(left, right)
+        self.assertEqual(self.driver._last_cmd["right"][0], 138)
+
+        right[0] = 142
+        self.driver._send_physical(left, right)
+        self.assertEqual(self.driver._last_cmd["right"][0], 142)
+        right[0] = 130
+        self.driver._send_physical(left, right)
+        self.assertEqual(self.driver._last_cmd["right"][0], 142)
+
+        self.driver._feedback["right"][0] = 151
+        right[0] = 130
+        self.driver._send_physical(left, right)
+        self.assertEqual(self.driver._last_cmd["right"][0], 150)
+
+    def test_right_thumb_at_flexion_stop_blocks_automatic_open_without_command(self):
+        self.driver._feedback_time = {"left": time.monotonic(), "right": time.monotonic()}
+        self.driver._feedback["left"] = np.asarray(self.driver._cfg.left_open, dtype=float)
+        self.driver._feedback["right"] = np.asarray(
+            [138, 210, 254, 254, 254, 254, 110, 109, 119, 33], dtype=float
+        )
+        aligned, errors = self.driver.align_and_verify_open_pose()
+        self.assertFalse(aligned)
+        self.assertEqual(errors["right"][0], 138 - 255)
+        self.assertIn("automatic open inhibited", self.driver.describe_open_pose_errors(errors))
+        self.driver._sock.sendto.assert_not_called()
 
     def test_right_thumb_teleop_endpoints_do_not_change_safe_open_pose(self):
         active = np.zeros(10, dtype=np.float64)
@@ -1151,6 +1190,7 @@ class HandMappingTests(unittest.TestCase):
     def test_quit_return_uses_fresh_feedback_and_reaches_open_pose(self):
         now = time.monotonic()
         self.driver._feedback_time = {"left": now, "right": now}
+        self.driver._feedback["right"][0] = 200
         with mock.patch(
             "esrobo_teleop.robot.linker_hand_driver.time.sleep"
         ):

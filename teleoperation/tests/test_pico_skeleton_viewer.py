@@ -2,7 +2,10 @@ import json
 from pathlib import Path
 import socket
 import time
-from urllib.request import urlopen, Request
+from urllib.request import build_opener, ProxyHandler, Request
+
+# These tests address only loopback servers, independent of machine proxies.
+urlopen = build_opener(ProxyHandler({})).open
 from urllib.error import HTTPError
 
 import pytest
@@ -13,7 +16,8 @@ from esrobo_teleop.debug.skeleton_viewer import SkeletonViewerServer, SkeletonVi
 def _packet(sequence=4):
     return {
         "sequence": sequence,
-        "xrt_body_timestamp_ns": 123456,
+        "body_sample_sequence": sequence,
+        "body_freshness_source": "component-packet",
         "frames": {
             "waist": {"pos": [0.0, 1.0, 0.0]},
             "left_shoulder": {"pos": [-0.2, 1.5, 0.0]},

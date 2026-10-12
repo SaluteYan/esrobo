@@ -13,6 +13,8 @@ header{height:80px;padding:0 30px;display:flex;align-items:center;gap:24px;backg
 .bar{gap:8px}.bar button{white-space:normal;text-align:center}
 .recovery-panel{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:16px 0 4px;padding:13px 15px;border:1px solid var(--line);border-radius:9px;background:#f6f8f6}
 .recovery-panel.fault{border-color:#dfb99c;background:#fff8f1}
+.first-fault{margin-top:12px;padding:12px;border:1px solid #dfb99c;border-radius:7px;background:#fff8f1;color:#783c29;font-size:11px;line-height:1.6;overflow-wrap:anywhere}.first-fault strong{display:block;margin-bottom:5px}.first-fault pre{margin:8px 0;font-size:10px}.first-fault small{color:#826e64}
+#runtime-status.input-hold{background:#fff0d8;color:#7c4a18}.safety-gates .hold-motion{color:#754115;background:#ffe4b8}
 .recovery-panel strong{font-size:13px}.recovery-panel p{font-size:12px;line-height:1.6;color:var(--muted);margin:5px 0 0;max-width:70ch}
 .recovery-panel button{flex:none;font-weight:650}
 @media(max-width:760px){.recovery-panel{align-items:stretch;flex-direction:column}.recovery-panel button{width:100%}}

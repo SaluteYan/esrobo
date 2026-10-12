@@ -16,8 +16,9 @@ from esrobo_teleop.config import build_config
 from esrobo_teleop.ik.solver import IkSolver
 from esrobo_teleop.robot.linker_hand_driver import LinkerHandDriver, L10_PHYSICAL_JOINT_NAMES
 
-from esrobo_laptop.acquisition import AnnotatedSocket, annotate, senseglove
-from esrobo_laptop.app import Controller, ControlRateMonitor, feedback_for, main, send_targets
+from esrobo_laptop.acquisition import AnnotatedSocket, annotate, pico, senseglove
+from esrobo_laptop.app import (Controller, ControlRateMonitor, feedback_for, main,
+                               robot_state_receive_timeout, send_targets)
 from esrobo_laptop.config import ROOT, Settings, read_settings, read_robot_config
 from esrobo_laptop.contract import local_id, verify_contract
 from esrobo_laptop.demo import run_demo
@@ -102,6 +103,19 @@ def test_feedback_age_accumulates_cache_compute_and_network():
         feedback_for(state, settings, 10., now=11.)
 
 
+def test_planning_receives_have_bounded_grace_only_with_all_arm_motors_disabled():
+    settings = Settings(side="right", with_hand=False)
+    state = dict(mode="CHECKING_ENTRY", feedback=dict(enable_states=[False] * 7))
+    assert robot_state_receive_timeout(state, settings) == .14
+    state["feedback"]["enable_states"][3] = True
+    assert robot_state_receive_timeout(state, settings) == .08
+    state["feedback"]["enable_states"] = [False] * 7
+    state["mode"] = "APPROACHING"
+    assert robot_state_receive_timeout(state, settings) == .08
+    state["mode"] = "ACTIVE"
+    assert robot_state_receive_timeout(state, settings) == .08
+
+
 def test_hand_feedback_uses_strict_freshness_budget():
     settings = Settings(side="right", with_hand=True)
     state = dict(mode="ACTIVE", feedback_cache_age_s=.01, feedback=dict(
@@ -137,6 +151,18 @@ def test_live_control_rate_monitor_rejects_gap_and_slow_rate():
     with pytest.raises(RuntimeError, match="below required"):
         for index in range(31):
             monitor.observe(3+index/30, "ACTIVE", True)
+
+
+def test_control_gap_uses_last_entry_target_during_active_transition():
+    monitor = ControlRateMonitor(40, .08)
+    monitor.observe(1.0, "WAITING_FOR_ACTIVE_TARGET", True)
+    monitor.observe(1.02, "ACTIVE", False)
+    monitor.observe(1.06, "ACTIVE", False)
+    with pytest.raises(RuntimeError, match="control target gap exceeded 80 ms"):
+        monitor.observe(1.081, "ACTIVE", False)
+    monitor.observe(2.0, "IDLE", False)
+    with pytest.raises(RuntimeError, match="control target gap exceeded 80 ms"):
+        monitor.observe(2.01, "ACTIVE", False)
 
 
 def test_live_control_rate_monitor_accepts_rounding_jitter_at_39_9_hz():
@@ -297,6 +323,18 @@ def test_senseglove_entrypoint_marks_dead_sdk_and_single_glove(rx, expected):
     assert meta["physical_sides"] == ["left"]
 
 
+def test_pico_transport_summary_uses_bounded_history_and_silent_tail():
+    from esrobo_laptop.pico_transport import TransportMetrics, summary_times
+    metrics = TransportMetrics()
+    for i in range(1000):
+        metrics.mark('notification', i*1_000_000)
+    _, times, _ = metrics.raw()
+    assert len(times['notification']) == 200
+    stat = summary_times(times['notification'], 2_000_000_000)
+    assert stat['hz'] < 200  # Silence is not reported as an old 1000 Hz burst.
+    assert set(stat) == {'hz', 'age_ms'}
+
+
 @pytest.mark.parametrize("side", ["left", "right"])
 def test_partitioned_ik_and_wrist_mapping_without_pink(config, side):
     solver = IkSolver(config.ik)
@@ -321,6 +359,53 @@ def test_partitioned_ik_and_wrist_mapping_without_pink(config, side):
     np.testing.assert_allclose(result[offset+4:offset+7], 0, atol=1e-6)
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_pico_wrist_finite_rotation_mapping_matches_urdf(config, side):
+    solver = IkSolver(config.ik)
+    q = np.zeros(14)
+    offset = 0 if side == "left" else 7
+    wrist = WristMapping(solver, config.robot, side, q, max_angle_deg=60.)
+    base = solver.current_task_frame_poses(q)[f"{side}_wrist"]
+    wanted = np.deg2rad([-40., 25., -30.])
+    moved = q.copy()
+    moved[offset+4:offset+7] = wanted
+    actual = solver.current_task_frame_poses(moved)[f"{side}_wrist"]
+    desired_local = (mu.quat_wxyz_to_matrix(base[3:]).T
+                     @ mu.quat_wxyz_to_matrix(actual[3:]))
+    mapped = wrist.terminal(desired_local)
+    np.testing.assert_allclose(mapped, wanted, atol=np.deg2rad(.1))
+    assert wrist.last_diagnostics["linear_orientation_error_deg"] > 10.
+    assert wrist.last_diagnostics["mapped_orientation_error_deg"] < .1
+    assert not any(wrist.last_diagnostics["at_joint_limit"])
+
+
+def test_pico_wrist_mapping_keeps_contract_joint_limits_with_larger_range(config):
+    solver = IkSolver(config.ik)
+    q = np.zeros(14)
+    wrist = WristMapping(solver, config.robot, "right", q, max_angle_deg=60.)
+    from scipy.spatial.transform import Rotation
+    target = wrist.terminal(Rotation.from_euler("xyz", [70., 55., -70.], degrees=True).as_matrix())
+    lower, upper = solver.position_envelope("right")
+    assert np.all(target >= lower[4:] - 1e-9)
+    assert np.all(target <= upper[4:] + 1e-9)
+    assert not wrist.last_diagnostics["joint_norm_capped"]
+
+
+def test_pico_wrist_j5_can_use_more_than_old_40_degree_mapping_range(config):
+    solver = IkSolver(config.ik)
+    wrist = WristMapping(solver, config.robot, "right", np.zeros(14), max_angle_deg=60.)
+    from scipy.spatial.transform import Rotation
+    desired = Rotation.from_rotvec(wrist.axes[:, 0] * np.deg2rad(55.)).as_matrix()
+    target = wrist.terminal(desired)
+    assert np.degrees(target[0]) == pytest.approx(55., abs=.1)
+    assert wrist.last_diagnostics["mapped_orientation_error_deg"] < .1
+
+
+def test_legacy_pico_wrist_angle_setting_rejects_values_over_180_degrees():
+    with pytest.raises(ValueError, match="PICO wrist mapping angle"):
+        Settings(pico_wrist_max_angle_deg=181.).validate()
+
+
 def test_controller_hold_never_sends_solved_target_before_active():
     settings = Settings(side="left", with_hand=False)
     backend = MockBackend("left", False)
@@ -343,37 +428,122 @@ def test_controller_hold_never_sends_solved_target_before_active():
     client.send_target.assert_not_called()
 
 
+def test_short_pico_gap_holds_arm_and_hand_then_resumes_after_three_matching_frames():
+    settings = Settings(side="right", with_hand=True)
+    backend = MockBackend("right", True)
+    backend.enabled = backend.hand_enabled = True
+    client = Mock(received_at=time.monotonic())
+    pipeline = Mock(initialized=True, preparation_status="")
+    pipeline.body.input_lock = threading.RLock()
+    ticket = {key: time.monotonic() for key in ("right_arm", "right_hand", "right_wrist")}
+    pipeline.body.ticket.return_value = ticket
+    pipeline.capture.return_value = (ticket, {}, np.zeros(10))
+    target = {"right": dict(arm_urdf_rad=[0.] * 7, hand_unit=[128] * 10, hold=False)}
+    pipeline.solve.return_value = target
+    controller = Controller(client, pipeline, settings, backend.contract)
+    state = dict(mode="ACTIVE", contract=backend.contract, feedback=backend.snapshot(),
+                 feedback_cache_age_s=0.)
+    assert controller.step(state) == target
+    controller.last_active_target_at -= .05
+    pipeline.body.ticket.return_value = None
+    assert controller.step(state) is None
+    assert controller.hold_missing_input(state, "no new sample")
+    assert controller.holds_sent == 1
+    pipeline.body.ticket.return_value = ticket
+    moved = copy.deepcopy(target)
+    moved["right"]["arm_urdf_rad"][0] = np.deg2rad(12)
+    pipeline.solve.return_value = moved
+    assert controller.step(state) is None
+    assert controller.input_resume_count == 0
+    assert controller.input_resume_diagnostics['joint'] == 1
+    assert controller.input_resume_diagnostics['arm_delta_deg'] == pytest.approx(12)
+    assert controller.input_resume_diagnostics['allowed'] is False
+    assert 'J1 target delta 12.00deg' in controller.input_hold_status
+    # A later missing frame must not hide why the last received target failed recovery.
+    pipeline.body.ticket.return_value = None
+    assert controller.step(state) is None
+    assert controller.hold_missing_input(state, 'waiting for next complete source frame')
+    assert 'last recovery check: right J1 target delta 12.00deg' in controller.input_hold_status
+    pipeline.body.ticket.return_value = ticket
+    pipeline.solve.return_value = target
+    assert controller.step(state) is None
+    assert controller.step(state) is None
+    assert controller.input_resume_count == 2
+    assert controller.step(state) == target
+    assert controller.input_hold_started_at is None
+    assert client.send_hold.call_count == 5
+    assert client.send_target.call_count == 2
+
+
+def test_input_hold_expires_and_rejects_stale_robot_feedback():
+    settings = Settings(side="right", with_hand=True)
+    backend = MockBackend("right", True)
+    backend.enabled = backend.hand_enabled = True
+    client = Mock(received_at=time.monotonic())
+    controller = Controller(client, Mock(), settings, backend.contract)
+    controller.last_active_target = {"right": dict(arm_urdf_rad=[0.] * 7, hand_unit=[128] * 10)}
+    controller.last_active_target_at = time.monotonic() - .05
+    state = dict(mode="ACTIVE", contract=backend.contract, feedback=backend.snapshot(),
+                 feedback_cache_age_s=0.)
+    state["feedback"]["arm_feedback_age_s"] = .2
+    with pytest.raises(InputUnavailable, match="stale"):
+        controller.hold_missing_input(state, "no new sample")
+    client.send_hold.assert_not_called()
+    controller.input_hold_started_at = time.monotonic() - .51
+    state["feedback"]["arm_feedback_age_s"] = 0.
+    with pytest.raises(RuntimeError, match="hold exceeded"):
+        controller.hold_missing_input(state, "no new sample")
+    client.send_hold.assert_not_called()
+
+
 def test_recoverable_position_limit_brakes_then_resumes_after_three_good_frames(config):
     pipeline = Pipeline.__new__(Pipeline)
     pipeline.cfg = config
     pipeline.settings = Settings(side="right", with_hand=False)
     solver = Mock()
     solver._prev_targets = np.zeros(14)
-    solver.solve.return_value = np.zeros(14)
+    solver._prev_targets[8] = .122173
+    solver.solve.return_value = solver._prev_targets.copy()
     solver.last_solution_valid = False
-    solver.solution_diagnostics = dict(recoverable_position_limit=True,
+    solver.solution_diagnostics = dict(recoverable_position_limit=False,
+                                       position_limit_approach=True,
                                        active_position_bounds=[dict(joint=2, bound="upper",
                                                                     limit_rad=.122173)])
     pipeline.solvers = {"right": solver}
     pipeline.wrists = {}
-    pipeline.position_solutions = {}
     pipeline.position_limit_holds = {"right": False}
+    pipeline.position_limit_approaching = {"right": False}
     pipeline.position_limit_recovery = {"right": 0}
     pipeline.check_ticket = Mock()
     frame = ({"right_arm": time.monotonic()}, dict(left_wrist=None, right_wrist=None,
                                                    left_elbow=None, right_elbow=None), None)
     measured = np.zeros(14)
+    approaching = pipeline.solve(frame, measured, {}, allow_limit_hold=True)
+    assert solver.solve.call_args.kwargs["limit_hold_fast_retry"] is False
+    assert approaching["right"]["hold"] is False
+    assert approaching["right"]["limit_approach"] is True
+    client = Mock()
+    send_targets(client, approaching, pipeline.settings)
+    client.send_target.assert_called_once_with(arm_urdf_rad=solver._prev_targets[7:].tolist(), hand_unit=None)
+    client.send_hold.assert_not_called()
+
+    solver.solution_diagnostics = dict(recoverable_position_limit=True,
+                                       position_limit_approach=False,
+                                       active_position_bounds=[dict(joint=2, bound="upper",
+                                                                    limit_rad=.122173)])
     targets = pipeline.solve(frame, measured, {}, allow_limit_hold=True)
+    assert solver.solve.call_args.kwargs["limit_hold_fast_retry"] is False
     assert targets["right"]["hold"] is True
     client = Mock()
     send_targets(client, targets, pipeline.settings)
-    client.send_hold.assert_called_once_with()
+    client.send_hold.assert_called_once_with(reason="position")
     client.send_target.assert_not_called()
 
     solver.last_solution_valid = True
     solver.solution_diagnostics = dict(elbow_error_m=.02, wrist_error_m=.01)
     for _ in range(config.ik.position_limit_recovery_frames - 1):
         assert pipeline.solve(frame, measured, {}, allow_limit_hold=True)["right"]["hold"] is True
+        assert solver.solve.call_args.kwargs["limit_hold_fast_retry"] is True
     assert pipeline.solve(frame, measured, {}, allow_limit_hold=True)["right"]["hold"] is False
 
 
@@ -386,8 +556,8 @@ def test_nonrecoverable_ik_rejection_still_stops_following(config):
     solver.solve.return_value = np.zeros(14)
     pipeline.solvers = {"right": solver}
     pipeline.wrists = {}
-    pipeline.position_solutions = {}
     pipeline.position_limit_holds = {"right": False}
+    pipeline.position_limit_approaching = {"right": False}
     pipeline.position_limit_recovery = {"right": 0}
     with pytest.raises(InputUnavailable, match="right IK rejected"):
         pipeline.solve(({}, dict(left_wrist=None, right_wrist=None,
@@ -420,12 +590,12 @@ def test_right_pico_full_fist_reaches_four_finger_closed_end_without_changing_th
     assert [opened[index] for index in (2, 3, 4, 5)] == [255]*4
     left = hand_units(angles, np.asarray(config.hand.left_open, dtype=float),
                       config.hand, "left", reference)
-    assert [left[index] for index in (2, 3, 4, 5)] == [51]*4
+    assert [left[index] for index in (2, 3, 4, 5)] == [0]*4
 
 
 def test_right_pico_thumb_flexes_more_and_sways_less_without_coupling(config):
     from esrobo_teleop.robot.linker_hand_driver import ACTIVE_HAND_JOINTS, ACTIVE_JOINT_LIMITS_RAD
-    from esrobo_laptop.mapping import RIGHT_THUMB_FLEXION_GAIN, RIGHT_THUMB_SIDE_GAIN
+    from esrobo_laptop.mapping import THUMB_FLEXION_GAIN, THUMB_SIDE_GAIN
 
     upper = np.asarray([ACTIVE_JOINT_LIMITS_RAD[name][1] for name in ACTIVE_HAND_JOINTS])
     reference = np.zeros(10)
@@ -438,9 +608,9 @@ def test_right_pico_thumb_flexes_more_and_sways_less_without_coupling(config):
                            (config.hand.right_teleop_closed[0] - config.hand.right_open[0]))
     baseline_side = round(config.hand.right_open[1] + .8 *
                           (config.hand.right_teleop_closed[1] - config.hand.right_open[1]))
-    assert right[0] == round(config.hand.right_open[0] + .4 * RIGHT_THUMB_FLEXION_GAIN *
+    assert right[0] == round(config.hand.right_open[0] + .4 * THUMB_FLEXION_GAIN *
                              (config.hand.right_teleop_closed[0] - config.hand.right_open[0]))
-    assert right[1] == round(config.hand.right_open[1] + .8 * RIGHT_THUMB_SIDE_GAIN *
+    assert right[1] == round(config.hand.right_open[1] + .8 * THUMB_SIDE_GAIN *
                              (config.hand.right_teleop_closed[1] - config.hand.right_open[1]))
     assert right[0] < baseline_pitch
     assert right[1] > baseline_side
@@ -449,10 +619,23 @@ def test_right_pico_thumb_flexes_more_and_sways_less_without_coupling(config):
 
     left = hand_units(angles, np.asarray(config.hand.left_open_feedback, dtype=float),
                       config.hand, "left", reference)
-    assert left[0] == round(config.hand.left_open[0] + .4 *
+    assert left[0] == round(config.hand.left_open[0] + .4 * THUMB_FLEXION_GAIN *
                             (config.hand.left_closed[0] - config.hand.left_open[0]))
-    assert left[1] == round(config.hand.left_open[1] + .8 *
+    assert left[1] == round(config.hand.left_open[1] + .8 * THUMB_SIDE_GAIN *
                             (config.hand.left_closed[1] - config.hand.left_open[1]))
+
+
+def test_right_thumb_full_flexion_uses_soft_limit_and_measured_geometry(config):
+    from esrobo_teleop.robot.linker_hand_driver import ACTIVE_HAND_JOINTS, ACTIVE_JOINT_LIMITS_RAD
+    upper = np.asarray([ACTIVE_JOINT_LIMITS_RAD[name][1] for name in ACTIVE_HAND_JOINTS])
+    angles = np.zeros(10)
+    angles[2] = upper[2]
+    reference = np.zeros(10)
+    feedback = np.asarray(config.hand.right_open_feedback, dtype=float)
+    right = hand_units(angles, feedback, config.hand, "right", reference)
+    assert right[0] == config.hand.right_thumb_pitch_min_unit == 150
+    assert config.hand.geometry_feedback_calibration["right"]["thumb_cmc_pitch"]["raw"] == [254, 138]
+    assert config.hand.geometry_feedback_calibration["left"]["thumb_cmc_pitch"]["raw"] == [255, 0]
 
 
 def test_controller_starts_new_reference_if_returning_state_was_too_brief():
@@ -507,6 +690,7 @@ def test_laptop_pipeline_builds_viewer_layers_for_selected_arm():
     pipeline = Pipeline.__new__(Pipeline)
     pipeline.settings = Settings(side='right', with_hand=True)
     pipeline.solvers = {'right': Solver()}
+    pipeline.wrists = {}
     poses = {
         'right_elbow': np.array([.2, 1., 0., 1., 0., 0., 0.]),
         'right_wrist': np.array([.3, 2., 0., 1., 0., 0., 0.]),

@@ -54,7 +54,7 @@ robot:
   # Startup preflight and all slow return planning/execution keep the guard.
   teleop_torso_collision_enabled: false
   collision_package_dirs: []  # also search model/urdf beside the workspace
-  torso_collision_margin_m: 0.03
+  torso_collision_margin_m: 0.02  # 20 mm torso clearance
   shoulder_collision_margin_m: 0.005  # installed link2/waist3 attachment clearance
   # Initial full-arm J1..J7 commissioning limits. Velocity is rad/s,
   # acceleration is rad/s^2, and step is rad per accepted feedback update.
@@ -75,22 +75,25 @@ robot:
   right_command_trajectory_enabled: true
   command_trajectory_lead_deg: [3, 3, 3, 3, 1.5, 1.5, 1.5]
   command_trajectory_max_dt_s: 0.1
+  return_command_trajectory_max_dt_s: 0.12  # planned return only; live following remains 0.1 s
   # Hold the last controller target during a brief assembled-feedback gap.
   # Resume only after two consecutive fresh frames and a complete safety recheck.
   runtime_feedback_recovery_timeout_s: 0.3
   command_trajectory_lead_timeout_s: 2.0
   joint_sync_error_deadband_deg: 0.05
   # Initial full-arm commissioning envelope in URDF coordinates (J1..J7).
-  # deg lower=[-60,-75,-90,-8,-60,-30,-55]
-  # deg upper=[ 60,  7, 90,85, 60, 35, 55]
-  joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -1.570796, -0.139626, -1.047198, -0.523599, -0.959931]
-  joint_soft_upper_limits_urdf: [1.047198, 0.122173, 1.570796, 1.483530, 1.047198, 0.610865, 0.959931]
-  # Preserve the per-side commissioned limits updated on 2026-09-16.
+  # deg lower=[-60,-75,-90,-8,-150,-38,-80]
+  # deg upper=[ 60,  7, 90,85, 150, 50, 80]
+  joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -1.570796, -0.139626, -2.617994, -0.663225, -1.396263]
+  joint_soft_upper_limits_urdf: [1.047198, 0.122173, 1.570796, 1.483530, 2.617994, 0.872665, 1.396263]
+  # 2026-10-05: wrist J5 +/-150, J6 -38/+50, J7 +/-80 deg; inside URDF/SDK margins.
   # URDF J3: left [-150,+90] deg; right [-90,+150] deg. Both J4: [-8,+120] deg.
-  left_joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -2.617994, -0.139626, -1.047198, -0.523599, -0.959931]
-  left_joint_soft_upper_limits_urdf: [1.047198, 0.122173, 1.570796, 2.094395, 1.047198, 0.610865, 0.959931]
-  right_joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -1.570796, -0.139626, -1.047198, -0.523599, -0.959931]
-  right_joint_soft_upper_limits_urdf: [1.047198, 0.122173, 2.617994, 2.094395, 1.047198, 0.610865, 0.959931]
+  left_joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -2.617994, -0.139626, -2.617994, -0.663225, -1.396263]
+  left_joint_soft_upper_limits_urdf: [1.047198, 0.122173, 1.570796, 2.094395, 2.617994, 0.872665, 1.396263]
+  right_joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -1.570796, -0.139626, -2.617994, -0.663225, -1.396263]
+  # Right J1 positive rotation carries the arm forward (+X in the URDF).
+  # 2026-10-03: expand forward soft travel from +60 to +75 deg.
+  right_joint_soft_upper_limits_urdf: [1.308997, 0.122173, 2.617994, 2.094395, 2.617994, 0.872665, 1.396263]
   max_joint_deviation_from_start: 0.0  # legacy uniform limit; disabled in favor of per-joint limits
   # SenseGlove pilot: only terminal physical joints 5/6/7 control hand orientation.
   right_wrist_joint_indices: [4, 5, 6]    # zero-based SDK joint indices
@@ -133,20 +136,17 @@ retarget:
   host: 0.0.0.0
   port: 15050
   retargeting_mode: arm_vector
-  # Capture the operator reference with both forearms held in front of the
-  # headset.  Reject arms hanging at the sides, where PICO hand tracking is
-  # easily occluded.  A comfortable bent-elbow pose is sufficient.
-  reference_min_upper_raise_deg: 35.0
-  reference_min_elbow_flexion_deg: 25.0
-  reference_max_elbow_flexion_deg: 125.0
-  # Align the raised reference upper-arm direction with a minimum rotation.
-  # H1/H2 transverse axes remain fixed by source_to_robot_rotation.
-  arm_vector_position_mode: segment_direction_relative
+  # Any complete PICO waist/shoulder/elbow/wrist pose may start calibration;
+  # the later stability and safe-handover checks still apply.
+  # Track absolute upper/forearm directions in the robot/waist frame.
+  # Calibration supplies only the first planned approach target.
+  arm_vector_position_mode: segment_direction_absolute
+  upper_arm_direction_mapping: absolute
   position_delta_signs: [1.0, 1.0, 1.0]
   swap_left_right_targets: false
   enable_elbow_ik_targets: true
   auto_start_reference: true
-  auto_start_reference_prepare_s: 1.5       # time to settle into the prompted raised pose
+  auto_start_reference_prepare_s: 1.5       # time to settle into the chosen pose
   auto_start_reference_delay_s: 1.5         # stabilization + sample phase duration
   auto_start_reference_sample_start_s: 0.5  # initial half-second is not sampled
   auto_start_reference_max_position_std_m: 0.05
@@ -170,13 +170,7 @@ retarget:
   arm_reference_enable_max_upper_delta_deg: 30.0
   arm_reference_enable_max_forearm_delta_deg: 30.0
   arm_vector_max_reach: 0.72
-  arm_vector_prediction_horizon_s: 0.03
-  arm_vector_prediction_lookback_s: 0.05
-  arm_vector_prediction_max_displacement_m: 0.03
-  # PICO points below 0.06 m/s are treated as tracker jitter; prediction fades
-  # in smoothly and is fully active above 0.25 m/s.
-  arm_vector_prediction_start_velocity_m_s: 0.06
-  arm_vector_prediction_full_velocity_m_s: 0.25
+  # Generate arm targets from the latest measured shoulder/elbow/wrist points.
   max_endpoint_translation_velocity_m_s: 0.22
   # PICO segment direction filter: low cutoff at rest, higher cutoff in motion.
   arm_vector_filter_min_cutoff_hz: 3.0
@@ -269,7 +263,11 @@ hand:
       ring_mcp_roll: {raw: [0, 255], rad: [0.0, 0.20], error_rad: 0.05, max_velocity_rad_s: 1.0, verified: true}
       pinky_mcp_roll: {raw: [0, 255], rad: [0.0, 0.30], error_rad: 0.05, max_velocity_rad_s: 1.0, verified: true}
       thumb_cmc_roll: {raw: [0, 255], rad: [0.0, 1.03], error_rad: 0.05, max_velocity_rad_s: 1.615686, verified: true}
-    right: *l20lite_l10_geometry
+    # The right thumb's linked three-joint flexion reaches its physical stop
+    # near feedback 138.  Keep this feedback geometry separate from the left.
+    right:
+      <<: *l20lite_l10_geometry
+      thumb_cmc_pitch: {raw: [254, 138], rad: [0.0, 0.52], error_rad: 0.05, max_velocity_rad_s: 1.0, verified: true}
   left_topic: /cb_left_hand_control_cmd
   right_topic: /cb_right_hand_control_cmd
   publish_hz: 50.0
@@ -306,8 +304,11 @@ hand:
   # separate from the command endpoint because command/feedback may differ by
   # one count; repeated current hardware feedback places joint 0 near 254.
   right_open_feedback: [254, 210, 254, 254, 254, 254, 109, 109, 119, 33]
-  right_closed: [73,  75,  0,   0,   0,   0,   110, 110, 120, 78]
-  # Right-thumb teleoperation endpoints (indices 0/1/9). These stay inside
-  # ranges exercised by the vendor L10 examples. Per-frame limits still apply.
-  # Startup/q continue to use right_open; this only expands active tracking.
-  right_teleop_closed: [40, 40, 0, 0, 0, 0, 110, 110, 120, 100]
+  # The measured flexion stop is near 138; command only down to 150 so the
+  # motor does not continue pressing into the stop.
+  right_thumb_pitch_min_unit: 150
+  right_closed: [150, 75,  0,   0,   0,   0,   110, 110, 120, 78]
+  # Right-thumb teleoperation endpoints (indices 0/1/9).  Pitch is kept away
+  # from its observed flexion stop; startup/q still use right_open and block
+  # automatic open return if pitch feedback is already below the soft floor.
+  right_teleop_closed: [150, 40, 0, 0, 0, 0, 110, 110, 120, 100]

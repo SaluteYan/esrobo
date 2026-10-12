@@ -1,105 +1,137 @@
-# ESROBO 本机遥操作计算端
+# ESROBO 本机遥操作
 
-`laptop_teleop` 在本机统一采集 PICO 全身骨骼与光学手部追踪，完成参考标定、人体到机器人重定向和双臂逆运动学，再通过 `robot_link` 协议把七轴关节目标与十轴手目标发送给机器人主机 `192.168.10.100:16000`。机器人主机负责协议校验、安全状态机、反馈与底层硬件执行。当前遥操作不再依赖 SenseGlove，旧手套输入被计算端忽略。
+`laptop_teleop` 在电脑上采集 PICO Body/Hand，完成参考标定、重定向和 IK，再通过认证 UDP 将关节目标发送给机器人 `robot_link` 网关。网页负责服务管理、预览、人工准备、状态和日志；机器人主机运行 CAN/ROS 驱动、反馈校验和轨迹执行。当前输入使用 PICO，不需要 SenseGlove。
 
-PICO Body 的 24 关节提供肩、肘和手腕整体姿态；五指来自同一 SDK 的独立 Hand 26 点追踪，不能由 24 点全身骨架推导。迁移与操作见 [`docs/06_PICO_HAND_INPUT.md`](docs/06_PICO_HAND_INPUT.md)。
+本文负责项目入口、**环境安装与配置**；日常操作和实现细节分别放在 [docs](docs/README.md)。
 
-详细安装和每日操作命令集中在 [`docs/`](docs/README.md)。首次部署按文档 01→02→03 的顺序执行。
+## 快速入口
 
-代码结构、具体实现与遥操作计算链路见 [`docs/08_CODE_AND_COMPUTATION.md`](docs/08_CODE_AND_COMPUTATION.md)。
+环境已经就绪时，在仓库根目录运行：
 
-统一网页控制台负责本机与机器人程序管理、模式选择、标定交互、使能/停止、反馈与日志展示，并通过 SSH 接入现有相机和头部调整页面。网页操作见 [`docs/05_WEB_CONSOLE.md`](docs/05_WEB_CONSOLE.md)。
-
-## 系统边界
-
-```mermaid
-flowchart LR
-  P[PICO 头显] --> X[XRoboToolkit PC Service]
-  X --> PA[PICO 采集适配器]
-  X --> SA[PICO Hand 五指采集与几何重定向]
-  PA --> B[本机输入缓存与新鲜度检查]
-  SA --> B
-  B --> R{所选模式}
-  R -->|手臂模式| IK[参考标定、重定向与双臂 IK]
-  R -->|仅灵巧手| HM[PICO 五指到 L10 映射]
-  HM --> C
-  IK --> C[RobotClient / HMAC UDP]
-  C <-->|目标与实测反馈| G[192.168.10.100 Robot Gateway]
-  G --> H[机器人双臂、双手底层驱动]
+```bash
+./laptop_teleop/scripts/run_dashboard.sh
 ```
 
-SSH 用于机器人程序管理、操作员网关命令、日志读取及相机 HTTP 转发。运动目标走 UDP 16000；共享密钥提供消息认证，不加密运动数据。PICO、IK 和网页控制台均在本机运行，CAN、LinkerHand 和相机 ROS 驱动运行在机器人主机。
+打开 **http://127.0.0.1:8080**。网页启动不自动使能或运动。按 [网页指南](docs/05_WEB_CONSOLE.md)选择模式、连接机器人、检查采集、预览，再人工准备。完整每日步骤见 [运行手册](docs/03_OPERATION_RUNBOOK.md)。
 
-## 目录结构
+## 环境安装与配置
 
-```text
-laptop_teleop/
-├── README.md                 项目结构、模块与数据流
-├── docs/                     安装、部署、运行和排障操作文档
-├── environment.yml          Conda 环境 esrobo_laptop
-├── config/laptop.yaml       机器人地址、模式、输入与反馈时限
-├── src/esrobo_laptop/
-│   ├── acquisition.py       PICO Body/Hand 采集、独立采样与 UDP 发布
-│   ├── pico_hand.py         26 点手部追踪到灵巧手十轴的几何映射
-│   ├── inputs.py            UDP 输入合并、来源与采样时间检查
-│   ├── pipeline.py          参考采集、重定向、IK、手指映射流水线
-│   ├── mapping.py           手指十轴输出及未控制轴保持
-│   ├── contract.py          本机与机器人配置合同校验
-│   ├── config.py            laptop.yaml 与机器人配置加载
-│   ├── app.py               inspect/check/run 主程序
-│   ├── dashboard.py         本机 HTTP 控制台、SSH/tmux 与进程管理
-│   └── demo.py              无硬件本机闭环演示
-├── scripts/
-│   ├── setup_all.sh         Conda、PICO、SenseGlove 一次安装
-│   ├── install_env.sh       安装 Miniforge并创建 Conda 环境
-│   ├── install_pico.sh      安装 PC Service并编译 Python SDK
-│   ├── install_senseglove.sh 构建 SenseGlove ROS 工作空间
-│   ├── check_environment.sh 环境完整性检查
-│   ├── xrobotoolkit_service.sh 管理 PICO PC Service
-│   ├── configure_senseglove.sh 写入左右手套序列号
-│   ├── run_sensecom.sh      启动 SenseCom
-│   ├── run_senseglove_ros.sh 启动手套 ROS 驱动
-│   ├── run_pico.sh          发布带原始采样时间的 PICO 输入
-│   ├── run_senseglove.sh    标定并发布手指/IMU 输入
-│   ├── run_laptop.sh        检查、预览或连接机器人运行
-│   ├── run_dashboard.sh     一条命令启动网页遥操作控制台
-│   └── test.sh              本机、通信和 IK 回归测试
-├── tests/                   本机整合测试
-├── web/                     控制台页面、样式与浏览器状态控制
-├── external/                外部 SDK/ROS 源码与构建产物（Git 忽略）
-└── log/                     会话、PICO参考和服务日志（Git 忽略）
+本机部署以 Ubuntu 22.04 amd64 为基准，默认 Miniforge 在 `/home/ddc/miniforge3`、环境为 `esrobo_laptop`，机器人为 Ubuntu/ROS 2 Humble。路径由 `scripts/common.sh` 等部署设置决定；新机器不要把示例路径当成已安装状态。
+
+### 安装当前 PICO 计算端
+
+从仓库根目录执行：
+
+```bash
+./laptop_teleop/scripts/install_env.sh
+./laptop_teleop/scripts/install_pico.sh
 ```
 
-## 处理流程
+`install_env.sh` 安装用户目录 Miniforge、创建 Conda 环境并安装本项目；`install_pico.sh` 校验并安装 PC Service，获取外部源码、应用仓库 SDK 补丁、构建原生库与 Python 绑定。系统安装使用交互 sudo，不保存密码。升级 SDK 也运行 `install_pico.sh`，随后重启唯一采集进程。
 
-1. `run_pico.sh` 从 `xrobotoolkit_sdk` 读取左右肩、肘、腕等骨骼点，复用 `teleoperation/bridges/xrobotoolkit_body_udp_bridge.py` 生成 `arm_vector`。
-2. 同一采集进程独立读取每侧 PICO Hand 的 26 个关节、有效标记、时间戳和接收序号，映射为十轴手指弯曲/侧摆目标。
-3. 两类数据通过 `127.0.0.1:15050` 传输，分别标记 `pico` / `pico_hand`。带手臂模式仅在所选侧的肩肘腕、五指与手腕姿态均有效且未超时后计算；仅灵巧手模式只要求所选侧 `pico_hand`。不使用通用 XR 时间戳刷新手指缓存。
-4. `pipeline.py` 复用人体参考、骨段重定向和分区位置 IK。J1–J4 跟随肩肘腕目标；带手模式 J5–J7 使用相对标定零位的 PICO 手腕旋转；手指映射为 LinkerHand L10 的 0–255 十轴值。纯单臂模式保持末端三轴反馈值。
-5. `app.py` 每次求解前后检查输入与机器人状态新鲜度，通过 `RobotClient` 发送带序号、会话令牌、配置指纹和 HMAC 的目标。仅灵巧手目标包没有机械臂字段，机器人网关还会持续确认七个手臂驱动均为失能。机器人端仍执行手部步长、速度、反馈和 lease 门禁。
+`setup_all.sh` 是兼容完整安装入口，还会构建旧 SenseGlove 工作空间；当前 PICO 部署不必执行这一旧设备安装。机器人端 LinkerHand ROS 驱动仍需保留。
+
+环境文件与用途：
+
+| 文件 | 用途 |
+| --- | --- |
+| [environment.yml](environment.yml) | Conda Python 3.10、NumPy/SciPy、Pinocchio、PyYAML、Paramiko、编译工具和测试依赖。 |
+| [pyproject.toml](pyproject.toml) | 本机 Python 包元数据及 pip 安装依赖。 |
+| [config/laptop.yaml](config/laptop.yaml) | 网关地址、模式、密钥路径、输入端口与时效、50 Hz 控制及频率门禁。 |
+| [../teleoperation/config/teleop_config.yaml](../teleoperation/config/teleop_config.yaml) | 两端一致的模型、映射、IK、驱动与保护参数。 |
+| `scripts/common.sh` | 脚本路径和 Miniforge/环境定位。 |
+| `scripts/patch_pico_sdk.py`、`scripts/pico_component_sample.hpp` | SDK 组件快照、新帧通知和接口版本补丁。 |
+
+这些机器可读文件保留为实际安装/配置入口，README 不替代它们。安装目录、密钥和运行日志不提交 Git。
+
+### Python 与 SDK 验证
+
+```bash
+source /home/ddc/miniforge3/etc/profile.d/conda.sh
+conda activate esrobo_laptop
+python -c 'import numpy, scipy, yaml, pinocchio; print("IK environment OK")'
+```
+
+脚本默认直接调用环境 Python，不要求先激活。Miniforge 在其他位置时可设置：
+
+```bash
+MINIFORGE_DIR=/实际路径/miniforge3 ./laptop_teleop/scripts/install_env.sh
+```
+
+验证 SDK 通知接口：
+
+```bash
+PY=/home/ddc/miniforge3/envs/esrobo_laptop/bin/python
+LIB="$PWD/laptop_teleop/external/XRoboToolkit-PC-Service-Pybind/lib"
+PYTHONNOUSERSITE=1 LD_LIBRARY_PATH="$LIB:/home/ddc/miniforge3/envs/esrobo_laptop/lib" \
+  "$PY" -c 'import xrobotoolkit_sdk as s; assert s.get_tracking_updates_version()==1; assert all(callable(getattr(s,n,None)) for n in ("wait_tracking_updates","get_tracking_diagnostics","close")); print("PICO SDK notifications v1 OK")'
+```
+
+旧 SDK 明确要求重建，不回退到读取缓存时刻作为新时间。通知/独立转发规则见 [PICO 输入](docs/06_PICO_HAND_INPUT.md)。
+
+### ROS 与网络边界
+
+机器人侧的双手、相机等使用 ROS 2 Humble 和已构建工作空间；构建用系统 Python，不在 Conda 中替代 ROS Python。机器人配置与部署见 [连接指南](docs/02_ROBOT_CONNECTION.md)及 [硬件调试](../HARDWARE_BRINGUP.md)。
+
+头显连接本机当前局域网 IP，PC Service 接入 TCP 63901；本机 SDK 使用 127.0.0.1:60061。运动目标/反馈使用机器人 UDP 16000，本机 Body/Hand 默认 UDP 15050，手部机器人桥 15051/15052。共享密钥位于 `~/.config/esrobo/robot-link.key`，两端一致且权限 600，不能写入 YAML 或仓库。
+
+```bash
+./laptop_teleop/scripts/run_laptop.sh check --side right
+./laptop_teleop/scripts/xrobotoolkit_service.sh status
+```
+
+`check_environment.sh` 仍检查旧 SenseGlove 完整安装，缺少旧手套组件不等同于当前 PICO 无法运行；当前模式以 `run_laptop.sh check` 的必要组件检查为准。
 
 ## 运行模式
 
-| 用途 | 本机参数 | 机器人网关参数 | 所需输入 |
+| 模式 | 本机参数 | 网关参数 | 必需 PICO 输入 |
 | --- | --- | --- | --- |
-| 双臂双手 | 默认 | `--side both` | 双侧 PICO Body + Hand |
-| 左臂左手 | `--side left` | `--side left --with-hand` | 左侧 PICO Body + Hand |
-| 右臂右手 | `--side right` | `--side right --with-hand` | 右侧 PICO Body + Hand |
-| 纯左臂 | `--side left --arm-only` | `--side left` | 左侧 PICO |
-| 纯右臂 | `--side right --arm-only` | `--side right` | 右侧 PICO |
-| 仅左灵巧手 | `--side left --hand-only` | `--side left --with-hand --hand-only` | 左侧 PICO Hand |
-| 仅右灵巧手 | `--side right --hand-only` | `--side right --with-hand --hand-only` | 右侧 PICO Hand |
+| 右臂＋右手 | `--side right` | `--side right --with-hand` | 右 Body/Hand/掌面。 |
+| 左臂＋左手 | `--side left` | `--side left --with-hand` | 左 Body/Hand/掌面。 |
+| 纯右臂 | `--side right --arm-only` | `--side right` | 右 Body。 |
+| 纯左臂 | `--side left --arm-only` | `--side left` | 左 Body。 |
+| 仅右手 | `--side right --hand-only` | `--side right --with-hand --hand-only` | 右 Hand，机械臂七轴失能。 |
+| 仅左手 | `--side left --hand-only` | `--side left --with-hand --hand-only` | 左 Hand，机械臂七轴失能。 |
+| 双臂双手 | 默认 | `--side both` | 双侧完整输入；不支持自动准备/回零。 |
 
-默认配置见 [`config/laptop.yaml`](config/laptop.yaml)：机器人地址为 `192.168.10.100`、端口为 `16000`，计算上限 50 Hz，人体输入最长 100 ms，机械臂和灵巧手反馈最长 150 ms。机器人端 LinkerHand ROS 驱动约 59 Hz 发布状态，非阻塞通信桥以相同频率转发给网关。机器人端的 URDF、关节映射、手部映射和安全配置必须与本机引用的 `teleoperation/config/teleop_config.yaml` 一致，否则合同校验拒绝运行。
+网页按模式启动程序，已有网关不会随下拉框切换。本机和网关的侧别、手模式、协议、机器人配置及 URDF 指纹须一致。
 
-## 安全与故障语义
+## 源码边界
 
-本机不会在启动程序时自动使能机器人。启动正式计算后，操作员在网页点击“使能并准备”并确认，或在机器人 SSH 网关终端输入 `e`，才启动受检流程：所选灵巧手先限速回到自然张开位并核对十轴反馈，机械臂随后规划回零并验证七轴失能；随后 PICO 要求操作者把前臂抬到胸前、肘部自然弯曲、双手自然张开。连续稳定检测完成后，首帧映射到机器人零位，网关再次检查目标匹配才自动进入 `ACTIVE`。PICO 人手无需单独保存零位文件。双臂模式仍因缺少双臂互碰扫掠检查而拒绝自动回零；应使用经过现场验证的双臂恢复流程。输入过期、反馈异常、IK 失败、网络中断或配置变化会停止本次会话。仅灵巧手模式不会使能或下发手臂目标；检测到任一手臂轴使能会立即终止。网页顶部和遥操作区均可停止运动；设备区还可分别失能左臂、右臂、双手命令和头部舵机。
+```text
+laptop_teleop/
+├── README.md                项目入口、环境安装与配置
+├── environment.yml          Conda 依赖
+├── pyproject.toml           Python 包安装
+├── config/laptop.yaml       本机运行参数
+├── docs/                    连接、操作、网页、PICO、排障、计算逻辑
+├── scripts/                 安装、启动、SDK 补丁和回归入口
+├── src/esrobo_laptop/       采集、输入、映射、IK 流水线、状态机和网页后台
+├── web/                     控制台前端
+├── tests/                   回归和测试专用性能分析
+├── external/                外部依赖及构建，不提交
+└── log/                     本机日志和状态，不提交
+```
 
-## 文档入口
+Body 和 Hand 由一个 SDK 订阅独立提交/转发，控制端按真实时间和组件序号配对。单臂准备回零后标定，首次路径仅 J1–J5、J6/J7 和手指保持实测值，到位后进行全轴接管；显式受检恢复则先在当前失能臂姿态把手归零，再执行七轴回零。阶段规则和保护见 [计算逻辑](docs/08_CODE_AND_COMPUTATION.md)。
 
-- [`docs/01_ENVIRONMENT_SETUP.md`](docs/01_ENVIRONMENT_SETUP.md)：Conda、ROS 2、PICO、SenseGlove 安装与本机当前状态。
-- [`docs/02_ROBOT_CONNECTION.md`](docs/02_ROBOT_CONNECTION.md)：网络、SSH、共享密钥与机器人网关。
-- [`docs/03_OPERATION_RUNBOOK.md`](docs/03_OPERATION_RUNBOOK.md)：从设备连接到安全停止的逐终端操作命令。
-- [`docs/04_TROUBLESHOOTING.md`](docs/04_TROUBLESHOOTING.md)：检查命令、常见故障、日志与恢复。
-- [`docs/05_WEB_CONSOLE.md`](docs/05_WEB_CONSOLE.md)：统一网页启动、连接、标定、模式选择、相机、状态与控制。
+源码更新、两机同步、进程加载和真机验收分别完成。软件回归不会启动真实运动接口：
+
+```bash
+./laptop_teleop/scripts/test.sh
+```
+
+性能耗时仅由独立 `tests/profile_runtime.py` 等工具测量，正式运行不加载逐周期耗时或分位数统计。测试方式见 [排障指南](docs/04_TROUBLESHOOTING.md#独立测试与耗时测量)。
+
+## 文档导航
+
+| 需要解决的问题 | 文档 |
+| --- | --- |
+| 连接机器人、共享密钥、部署服务 | [02 两机连接](docs/02_ROBOT_CONNECTION.md) |
+| 每次运行和结束顺序、命令行替代 | [03 日常操作](docs/03_OPERATION_RUNBOOK.md) |
+| 超时、频率、控制器、手部和独立测量 | [04 故障排查](docs/04_TROUBLESHOOTING.md) |
+| 网页按钮、模式、骨架层、恢复 | [05 网页控制台](docs/05_WEB_CONSOLE.md) |
+| SDK、组件时间、Body/Hand 转发与同步 | [06 PICO 输入](docs/06_PICO_HAND_INPUT.md) |
+| 源码职责、映射/IK、接近和回零实现 | [08 代码与计算](docs/08_CODE_AND_COMPUTATION.md) |
+
+旧 SenseGlove 脚本保留用于设备维护，当前网页和 PICO 计算无需启动。认证密钥、现场运行记录、构建产物和历史测量汇总不上传远程仓库。

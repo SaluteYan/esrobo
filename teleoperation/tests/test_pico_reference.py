@@ -71,6 +71,8 @@ class PicoReferenceTests(unittest.TestCase):
                 solver = IkSolver(cfg.ik)
                 device = self.device(side)
                 # This regression covers the retained legacy mapping mode.
+                device._cfg.arm_vector_position_mode = "segment_direction_relative"
+                device._cfg.upper_arm_direction_mapping = "relative"
                 device._cfg.elbow_angle_mapping = "responsive_absolute"
                 points = {k: v.copy() for k, v in recorded.items()}
                 if side == "left":
@@ -321,6 +323,38 @@ class PicoReferenceTests(unittest.TestCase):
             device._update_auto_reference(now)
         self.assertTrue(device._reference_locked)
 
+    def test_live_arm_targets_use_measured_points_for_motion_stop_and_reversal(self):
+        # Histories imply opposite velocities or no previous sample. None may
+        # move this cycle's source points beyond the actual measurement.
+        for side in ("left", "right"):
+            for full_target in (False, True):
+                for previous_bend in (None, 0.0, 90.0, 45.0):
+                    with self.subTest(side=side, full_target=full_target,
+                                      previous_bend=previous_bend):
+                        device = self.device(side)
+                        self.calibrate(device, self.frames())
+                        current_frames = self.frames(bend=45.0)
+                        device._frames = current_frames
+                        device._last_body_frame_packet_time_monotonic = 11.0
+                        device._body_frame_history = [] if previous_bend is None else [
+                            (10.95, self.frames(bend=previous_bend))]
+                        device._body_frame_history.append((11.0, current_frames))
+                        expected = device._current_arm_points(side)
+                        with mock.patch.object(
+                            device, "_retarget_arm_segment_direction_positions",
+                            wraps=device._retarget_arm_segment_direction_positions,
+                        ) as mapped, mock.patch(
+                            "esrobo_teleop.device.body_device.time.monotonic",
+                            return_value=11.01,
+                        ):
+                            targets = device.advance(full_target=full_target)
+                        self.assertIsNotNone(targets)
+                        mapped.assert_called_once()
+                        actual_points, actual_side = mapped.call_args.args
+                        self.assertEqual(actual_side, side)
+                        for point in ("shoulder", "elbow", "wrist"):
+                            np.testing.assert_array_equal(actual_points[point], expected[point])
+
     def test_same_pose_with_waist_motion_and_swapped_source(self):
         for side in ("left", "right"):
             for swap in (False, True):
@@ -430,7 +464,7 @@ class PicoReferenceTests(unittest.TestCase):
         diagnostics = device.arm_retarget_diagnostics("right")
         self.assertAlmostEqual(diagnostics["mapped_before_filter_deg"], 73.0, delta=0.1)
         self.assertAlmostEqual(diagnostics["limited_deg"], 73.0, delta=0.1)
-        self.assertEqual(len(diagnostics["source_predicted_upper_direction"]), 3)
+        self.assertEqual(len(diagnostics["source_upper_direction"]), 3)
         self.assertEqual(len(diagnostics["desired_after_plane_forearm_direction"]), 3)
         self.assertEqual(len(diagnostics["limited_forearm_direction"]), 3)
         self.assertEqual(diagnostics["limiter"]["method"], "arm_state_arc_backtrack")

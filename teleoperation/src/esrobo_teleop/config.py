@@ -76,7 +76,7 @@ class RobotConfig:
     # returns still use torso_collision_enabled and cannot bypass the guard.
     teleop_torso_collision_enabled: bool = False
     collision_package_dirs: tuple = ()
-    torso_collision_margin_m: float = 0.03
+    torso_collision_margin_m: float = 0.02
     shoulder_collision_margin_m: float = 0.005
     # physical = direction * URDF + offset. The J2 +pi/2 offset follows the
     # pyAgxArm NERO limits and this project's URDF limits exactly.
@@ -97,23 +97,23 @@ class RobotConfig:
     # deliberately asymmetric limits sit inside the SDK hard limits and are
     # converted to each arm's physical convention by the driver.
     joint_soft_lower_limits_urdf: tuple = (
-        -1.047198, -1.308997, -1.570796, -0.139626, -1.047198, -0.523599, -0.959931,
+        -1.047198, -1.308997, -1.570796, -0.139626, -2.617994, -0.663225, -1.396263,
     )
     joint_soft_upper_limits_urdf: tuple = (
-        1.047198, 0.122173, 1.570796, 1.483530, 1.047198, 0.610865, 0.959931,
+        1.047198, 0.122173, 1.570796, 1.483530, 2.617994, 0.872665, 1.396263,
     )
-    # Match the commissioned per-side YAML limits (updated 2026-09-16).
+    # Match the per-side YAML limits (right J1 forward travel updated 2026-10-03).
     left_joint_soft_lower_limits_urdf: Optional[tuple] = (
-        -1.047198, -1.308997, -2.617994, -0.139626, -1.047198, -0.523599, -0.959931,
+        -1.047198, -1.308997, -2.617994, -0.139626, -2.617994, -0.663225, -1.396263,
     )
     left_joint_soft_upper_limits_urdf: Optional[tuple] = (
-        1.047198, 0.122173, 1.570796, 2.094395, 1.047198, 0.610865, 0.959931,
+        1.047198, 0.122173, 1.570796, 2.094395, 2.617994, 0.872665, 1.396263,
     )
     right_joint_soft_lower_limits_urdf: Optional[tuple] = (
-        -1.047198, -1.308997, -1.570796, -0.139626, -1.047198, -0.523599, -0.959931,
+        -1.047198, -1.308997, -1.570796, -0.139626, -2.617994, -0.663225, -1.396263,
     )
     right_joint_soft_upper_limits_urdf: Optional[tuple] = (
-        1.047198, 0.122173, 2.617994, 2.094395, 1.047198, 0.610865, 0.959931,
+        1.308997, 0.122173, 2.617994, 2.094395, 2.617994, 0.872665, 1.396263,
     )
     # Initial full-arm commissioning rate limits for J1..J7.  Scalars remain
     # accepted by the driver for compatibility with older configuration files.
@@ -151,6 +151,9 @@ class RobotConfig:
     right_command_trajectory_enabled: bool = True
     command_trajectory_lead_deg: tuple = (3.0, 3.0, 3.0, 3.0, 1.5, 1.5, 1.5)
     command_trajectory_max_dt_s: float = 0.1
+    # The planned return performs collision checks on every command. Allow a
+    # small scheduling overrun without relaxing the live-following horizon.
+    return_command_trajectory_max_dt_s: float = 0.12
     # A single delayed assembled seven-joint frame must not immediately latch
     # the arm.  No command is sent during this grace period; two consecutive
     # fresh frames are required before the command trajectory is re-based.
@@ -211,15 +214,13 @@ class RetargetConfig:
     max_packet_bytes: int = 65535
     max_stale_time_s: float = 0.5
     retargeting_mode: str = "arm_vector"          # arm_vector | wrist_delta
-    # The operator reference is captured with the arms raised into the headset's
-    # reliable hand-tracking volume.  These bounds reject a stable but occluded
-    # arms-at-the-sides pose before it can become the session reference.
-    reference_min_upper_raise_deg: float = 0.0
-    reference_min_elbow_flexion_deg: float = 0.0
-    reference_max_elbow_flexion_deg: float = 180.0
-    # Reference calibration applies only the minimum rotation needed to align
-    # the upper-arm zero direction; it must not redefine transverse axes.
-    arm_vector_position_mode: str = "segment_direction_relative"
+    # Stabilized segment mapping; upper-arm neutral alignment is selected
+    # independently below and never redefines the configured transverse axes.
+    arm_vector_position_mode: str = "segment_direction_absolute"
+    # In segment_direction_relative, select upper-arm direction independently
+    # of elbow-angle mapping and near-straight forearm-plane stabilization.
+    # absolute uses the configured robot/waist frame, without neutral alignment.
+    upper_arm_direction_mapping: str = "absolute"  # relative | absolute
     # Preserve the live PICO elbow angle.  The raised operator reference aligns
     # coordinate frames; it must not be subtracted from elbow flexion.
     elbow_angle_mapping: str = "direct_absolute"  # direct_absolute | responsive_absolute | smooth_absolute | relative
@@ -253,14 +254,6 @@ class RetargetConfig:
     calibration_delay_s: float = 10.0
     calibration_sample_start_s: float = 6.0
     arm_vector_max_reach: float = 0.72
-    arm_vector_prediction_horizon_s: float = 0.03
-    arm_vector_prediction_lookback_s: float = 0.05
-    arm_vector_prediction_max_velocity_m_s: float = 2.5
-    arm_vector_prediction_max_displacement_m: float = 0.03
-    # Do not extrapolate low-speed tracker jitter. Prediction fades in smoothly
-    # between these two measured point speeds.
-    arm_vector_prediction_start_velocity_m_s: float = 0.06
-    arm_vector_prediction_full_velocity_m_s: float = 0.25
     max_endpoint_translation_velocity_m_s: float = 0.22
     upper_arm_angular_deadband_deg: float = 0.25
     forearm_angular_deadband_deg: float = 0.30
@@ -470,14 +463,18 @@ class HandConfig:
     left_open_feedback: list = field(default_factory=list)
     right_open_feedback: list = field(default_factory=list)
     right_closed: list = field(
-        default_factory=lambda: [73, 75, 0, 0, 0, 0, 110, 110, 120, 78]
+        default_factory=lambda: [150, 75, 0, 0, 0, 0, 110, 110, 120, 78]
     )
+    # Right thumb pitch feedback reaches its physical flexion stop near 138.
+    # Keep commanded flexion 12 units away from that stop, including network
+    # physical targets that bypass the radians-to-servo mapping.
+    right_thumb_pitch_min_unit: int = 150
     # Optional teleoperation-only closed endpoints.  These let teleoperation
     # use a wider verified actuator range without changing the safe open pose
     # used during startup and shutdown.
     left_teleop_closed: list = field(default_factory=list)
     right_teleop_closed: list = field(
-        default_factory=lambda: [40, 40, 0, 0, 0, 0, 110, 110, 120, 100]
+        default_factory=lambda: [150, 40, 0, 0, 0, 0, 110, 110, 120, 100]
     )
 
 
@@ -517,13 +514,4 @@ def load_config(path: str) -> TeleopConfig:
         for key, value in payload.items():
             if key in fields:
                 setattr(target, key, value)
-    pose_bounds = (
-        cfg.retarget.reference_min_upper_raise_deg,
-        cfg.retarget.reference_min_elbow_flexion_deg,
-        cfg.retarget.reference_max_elbow_flexion_deg,
-    )
-    if (any(type(value) not in (int, float) for value in pose_bounds)
-            or not 0 <= pose_bounds[0] <= 180
-            or not 0 <= pose_bounds[1] < pose_bounds[2] <= 180):
-        raise ValueError("invalid PICO raised-arm reference angle bounds")
     return cfg

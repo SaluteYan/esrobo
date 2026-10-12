@@ -62,30 +62,30 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(driver._capture_arm_torque_baseline(arm, 'left', cancelled=lambda: True))
         arm.get_joint_torques.assert_not_called()
 
-    def test_session_preparation_opens_hand_before_arm_return(self):
+    def test_session_preparation_holds_hand_during_arm_return(self):
         backend = self.backend()
         backend.hand_only = False
         events = []
         backend.hand = Mock()
-        backend.hand.geometry_calibration_status.return_value = dict(
-            ready=True, calibrated_joints=10, total_joints=10)
-        backend.hand.open_feedback_calibrated.return_value = True
-        backend.hand.align_and_verify_open_pose.side_effect = (
-            lambda cancelled: events.append('hand_open') or (True, {}))
-        backend.return_zero = Mock(side_effect=lambda cancelled: events.append('arm_return') or {
+        backend.hand.feedback_snapshot.return_value = dict(position_unit=[128] * 10, age_s=0.)
+        backend.hand.set_enabled.side_effect = lambda enabled: events.append('hand_disabled')
+        backend.return_zero = Mock(side_effect=lambda cancelled, **kwargs: events.append('arm_return') or {
             'returned': True, 'disabled': True, 'stage': 'disabling', 'reason': ''})
         result = backend.prepare_session(lambda: False)
-        self.assertEqual(events, ['hand_open', 'arm_return'])
-        self.assertTrue(result['hands_open'])
+        self.assertEqual(events, ['hand_disabled', 'arm_return'])
+        self.assertTrue(result['hands_stationary'])
+        self.assertFalse(result['hands_open'])
+        self.assertTrue(backend.return_zero.call_args.kwargs['arm_only_collision'])
+        self.assertTrue(callable(backend.return_zero.call_args.kwargs['stationary_hand_check']))
+        backend.hand.align_and_verify_open_pose.assert_not_called()
 
-    def test_session_preparation_rejects_incomplete_hand_geometry_without_motion(self):
+    def test_session_preparation_rejects_missing_hand_feedback_without_motion(self):
         backend = self.backend()
         backend.hand_only = False
         backend.hand = Mock()
-        backend.hand.geometry_calibration_status.return_value = dict(
-            ready=False, calibrated_joints=0, total_joints=10)
+        backend.hand.feedback_snapshot.return_value = dict(position_unit=None, age_s=None)
         backend.return_zero = Mock()
-        with self.assertRaisesRegex(RuntimeError, '0/10'):
+        with self.assertRaisesRegex(RuntimeError, 'fresh hand feedback required'):
             backend.prepare_session(lambda: False)
         backend.hand.align_and_verify_open_pose.assert_not_called()
         backend.return_zero.assert_not_called()
@@ -123,7 +123,50 @@ class PhysicalHandTests(unittest.TestCase):
         self.socket.sendto.assert_not_called()
         self.assertFalse(self.driver.is_enabled())
 
+    def test_fifty_hz_jitter_never_silently_drops_a_successful_command(self):
+        for periods in ((.02,), (.019, .021), (.001, .039)):
+            with self.subTest(periods=periods):
+                self.socket.sendto.reset_mock()
+                self.driver._last_cmd['left'][:] = 120
+                self.driver._last_sent_time = 10.
+                self.driver._cfg.max_velocity = 400
+                self.driver._cfg.max_step = 18
+                previous = 120
+                stamp = 10.
+                for n in range(100):
+                    dt = periods[n % len(periods)]
+                    stamp += dt
+                    target = 255 if n < 50 else 0
+                    with patch('esrobo_teleop.robot.linker_hand_driver.time.monotonic', return_value=stamp):
+                        self.driver._feedback_time['left'] = stamp
+                        self.assertTrue(self.driver.command_physical('left', [target]*10))
+                    command = json.loads(self.socket.sendto.call_args.args[0])['left'][0]
+                    budget = int(np.floor(400*min(dt, .02)+1.e-7))
+                    self.assertLessEqual(abs(command-previous), budget)
+                    previous = command
+                self.assertEqual(self.socket.sendto.call_count, 100)
+
+    def test_transport_failure_preserves_published_state_and_velocity_baseline(self):
+        self.driver.command_physical('left', [255]*10)
+        command = self.driver._last_cmd['left'].copy()
+        published = self.driver.feedback_snapshot('left')
+        stamp = self.driver._last_sent_time
+        self.socket.sendto.side_effect = OSError('test UDP failure')
+        with self.assertRaises(OSError):
+            self.driver.command_physical('left', [0]*10)
+        np.testing.assert_array_equal(self.driver._last_cmd['left'], command)
+        self.assertEqual(self.driver._last_sent_time, stamp)
+        latest = self.driver.feedback_snapshot('left')
+        self.assertEqual(latest['command_seq'], published['command_seq'])
+        self.assertEqual(latest['command_unit'], published['command_unit'])
+
+    def test_enabling_does_not_report_unsent_command_as_published(self):
+        self.assertIsNone(self.driver.feedback_snapshot('left')['command_unit'])
+        self.assertEqual(self.driver.feedback_snapshot('left')['command_seq'], 0)
+
     def test_open_return_stops_when_feedback_disappears_mid_ramp(self):
+        if 'right' in self.driver._active_sides:
+            self.driver._feedback['right'][0] = 160
         with patch.object(self.driver, '_feedback_is_fresh', side_effect=[True, True, False]), \
                 patch('esrobo_teleop.robot.linker_hand_driver.time.sleep'):
             self.assertFalse(self.driver.return_to_open())
@@ -182,7 +225,9 @@ class DualPhysicalHandTests(PhysicalHandTests):
         self.socket.sendto.assert_called_once()
         payload = json.loads(self.socket.sendto.call_args.args[0])
         self.assertEqual(payload['left'][0], 122)
-        self.assertEqual(payload['right'][0], 138)
+        # A target below the commissioned thumb flexion floor moves away from
+        # the measured stop rather than pushing farther into it.
+        self.assertEqual(payload['right'][0], 142)
         for i in (6, 7, 8):
             self.assertEqual(payload['left'][i], 120)
             self.assertEqual(payload['right'][i], 140)

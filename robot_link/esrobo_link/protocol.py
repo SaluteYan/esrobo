@@ -97,16 +97,57 @@ def validate_target(msg, contract):
             raise ProtocolError("hand_unit requires ten integers in [0,255]")
     elif hand is not None:
         raise ProtocolError("hand not enabled on this endpoint")
-    return {"arm_urdf_rad": arm, "hand_unit": hand}
+    result = {"arm_urdf_rad": arm, "hand_unit": hand}
+    if contract.get("entry_protocol") in (1, 2, 3, 4, 5, 6):
+        entry = msg.get("entry")
+        if not isinstance(entry, dict) or entry.get("phase") not in ("idle", "candidate", "ready", "active"):
+            raise ProtocolError("safe handover metadata required; update laptop and gateway together")
+        token = entry.get("token", "")
+        if not isinstance(token, str) or len(token) > 64:
+            raise ProtocolError("invalid handover token")
+        source = (vector(entry.get("source"), 9, "entry source")
+                  if entry["phase"] in ("candidate", "ready") else None)
+        reference_source = (vector(entry.get("reference_source"), 9, "calibrated entry source")
+                            if contract.get("entry_protocol") in (2, 3, 4, 5, 6)
+                            and entry["phase"] in ("candidate", "ready") else None)
+        result["entry"] = dict(phase=entry["phase"], token=token, source=source,
+                               reference_source=reference_source)
+    return result
+
+
+def validate_entry_keepalive(msg, contract):
+    """Communication liveness for one frozen plan; never a sensor sample."""
+    if (contract.get("entry_keepalive_protocol") != 1 or contract.get("side") == "both"
+            or contract.get("hand_only")):
+        raise ProtocolError("entry keepalive protocol 1 required")
+    if msg.get("contract_id") != contract["id"] or msg.get("side") != contract["side"]:
+        raise ProtocolError("side/configuration contract mismatch")
+    allowed = {"v", "type", "session", "seq", "lease", "side", "contract_id", "plan_token"}
+    if set(msg) - allowed:
+        raise ProtocolError("entry keepalive cannot contain targets or sensor metadata")
+    token = msg.get("plan_token")
+    if not isinstance(token, str) or len(token) != 32:
+        raise ProtocolError("invalid entry plan token")
+    return token
 
 
 def validate_hold(msg, contract):
-    """A fresh single arm request to brake/hold without a position target."""
-    if (contract["side"] == "both" or contract.get("with_hand")
+    """A fresh request to brake/hold; it never carries a position target."""
+    if contract.get("input_hold_protocol") not in (1, 2) and (
+            contract["side"] == "both" or contract.get("with_hand")
             or contract.get("hand_only")):
         raise ProtocolError("hold is commissioned only for one arm without a hand")
     if msg.get("contract_id") != contract["id"] or msg.get("side") != contract["side"]:
         raise ProtocolError("side/configuration contract mismatch")
     if any(name in msg for name in ("arm_urdf_rad", "hand_unit", "targets")):
         raise ProtocolError("hold cannot contain a position or hand command")
+    reason = msg.get("reason", "input")
+    if reason not in ("input", "position"):
+        raise ProtocolError("hold reason must be input or position")
+    if reason == "position":
+        if contract.get("input_hold_protocol") != 2:
+            raise ProtocolError("position hold requires input hold protocol 2")
+        if contract["side"] == "both" or contract.get("hand_only"):
+            raise ProtocolError("position hold requires a single arm endpoint")
+        return {"hold": True, "hold_reason": "position"}
     return {"hold": True}

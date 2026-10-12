@@ -170,7 +170,33 @@ class GeometryGuardTests(unittest.TestCase):
         cfg = build_config().ik
         cfg.urdf_path = str(ROOT / 'urdf/esrobo_waist_with_head.urdf')
         cls.solver = IkSolver(cfg)
-        cls.guards = {side: TorsoCollisionGuard(cls.solver, side) for side in ('left', 'right')}
+        cls.guards = {side: TorsoCollisionGuard(cls.solver, side, margin=.03) for side in ('left', 'right')}
+
+    def test_current_clearance_rejects_19mm_and_accepts_21mm(self):
+        from esrobo_teleop.config import load_config
+        from esrobo_teleop.robot.torso_collision import TorsoCollisionGuard
+        cfg = load_config(str(ROOT / 'config/teleop_config.yaml'))
+        self.assertEqual(cfg.robot.torso_collision_margin_m, .02)
+        self.assertEqual(build_config().robot.torso_collision_margin_m, .02)
+        guard = TorsoCollisionGuard(self.solver, 'right', include_fingers=False)
+        self.assertEqual(guard.margin, cfg.robot.torso_collision_margin_m)
+        self.assertEqual(guard.shoulder_margin, .005)
+        q = np.zeros(14)
+        for distance, accepted in ((.019, False), (.02, False), (.021, True)):
+            with self.subTest(distance=distance), mock.patch.object(
+                    guard.coal, 'distance', return_value=distance):
+                self.assertEqual(guard(q, q), accepted)
+                self.assertEqual(guard.last_diagnostics['required_m'], .02)
+
+    def test_20mm_acceptance_differs_from_historical_30mm_palm_refusal(self):
+        from esrobo_teleop.robot.torso_collision import TorsoCollisionGuard
+        q = np.zeros(14)
+        q[:7] = np.deg2rad([2.27, -12.645, -25.203, 28.305, .001, -.092, -.162])
+        for margin, accepted in ((.03, False), (.02, True)):
+            guard = TorsoCollisionGuard(self.solver, 'left', margin=margin, include_fingers=False)
+            self.assertEqual(guard(q, q), accepted)
+            self.assertAlmostEqual(guard.last_diagnostics['clearance_m'], .027608973183751082)
+            self.assertEqual(guard.last_diagnostics['required_m'], margin)
 
     def test_recorded_collision_poses_are_rejected_before_contact(self):
         g = self.guards['left']
@@ -197,7 +223,7 @@ class GeometryGuardTests(unittest.TestCase):
     def test_arm_only_profile_keeps_arm_wrist_and_palm_checks_without_finger_feedback(self):
         from esrobo_teleop.robot.torso_collision import TorsoCollisionGuard
         for side, offset in (("left", 0), ("right", 7)):
-            guard = TorsoCollisionGuard(self.solver, side, include_fingers=False)
+            guard = TorsoCollisionGuard(self.solver, side, margin=.03, include_fingers=False)
             zero = np.zeros(14)
             self.assertTrue(guard(zero, zero), guard.last_diagnostics)
             self.assertEqual(guard.last_diagnostics["collision_profile"], "arm_wrist_palm")
@@ -207,7 +233,7 @@ class GeometryGuardTests(unittest.TestCase):
         # protection. This is a logged left-arm pose immediately before the
         # controller collision report; its palm body is inside the 30 mm
         # software clearance even without any articulated-finger geometry.
-        left_guard = TorsoCollisionGuard(self.solver, "left", include_fingers=False)
+        left_guard = TorsoCollisionGuard(self.solver, "left", margin=.03, include_fingers=False)
         q = np.zeros(14)
         q[:7] = np.deg2rad([
             2.27, -12.645, -25.203, 28.305, 0.001, -0.092, -0.162,
@@ -230,12 +256,28 @@ class GeometryGuardTests(unittest.TestCase):
         q = np.zeros(14)
         q[7:] = ((physical - np.asarray(robot.right_joint_offsets))
                  / np.asarray(robot.right_joint_directions))
-        guard = TorsoCollisionGuard(self.solver, "right", include_fingers=False)
+        guard = TorsoCollisionGuard(self.solver, "right", margin=.03, include_fingers=False)
         self.assertTrue(guard(q, q), guard.last_diagnostics)
         self.assertGreaterEqual(
             guard.last_diagnostics["clearance_m"],
             guard.last_diagnostics["required_m"],
         )
+
+    def test_right_idle_pose_near_waist_uses_tight_enclosing_link3_hull(self):
+        from esrobo_teleop.robot.torso_collision import TorsoCollisionGuard
+        # 2026-09-30 gateway preflight: the link3 axis-aligned box reported
+        # 27.34 mm to waist_link3 against a 30 mm requirement. The convex hull
+        # still encloses the STL but removes this particular box-only rejection.
+        q = np.zeros(14)
+        q[7:] = [
+            0.01663298777150596, -0.011972958668680977,
+            0.4935965657565164, -0.022794000031045945,
+            -0.2183406894244906, -0.05373868766890541,
+            -0.03529055747532535,
+        ]
+        guard = TorsoCollisionGuard(self.solver, "right", margin=.03, include_fingers=False)
+        self.assertEqual(guard.margin, 0.03)
+        self.assertTrue(guard(q, q), guard.last_diagnostics)
 
     def test_missing_mesh_never_falls_back_to_guessed_dimensions(self):
         import tempfile
@@ -256,7 +298,7 @@ class GeometryGuardTests(unittest.TestCase):
         g.lock = threading.Lock()
         g.margin = .01
         g.last_diagnostics = {}
-        def clearance(q, halfwidth):
+        def clearance(q, halfwidth, *, include_fingers=True):
             distance = np.linalg.norm(q[:2]-[1., 0.]) - .15
             g._box_certified = distance > g.margin + np.linalg.norm(halfwidth[:2])
             return distance
@@ -265,6 +307,27 @@ class GeometryGuardTests(unittest.TestCase):
         b[:2] = 1
         # Every point on the diagonal is clear; the independent-axis box is not.
         self.assertFalse(g(a, b))
+
+    def test_interval_check_splits_axis_with_largest_limiting_motion(self):
+        import threading
+        from esrobo_teleop.robot.torso_collision import TorsoCollisionGuard
+        g = TorsoCollisionGuard.__new__(TorsoCollisionGuard)
+        g.lock = threading.Lock()
+        g.margin = .01
+        g.last_diagnostics = {}
+        centers = []
+        def clearance(q, _halfwidth, *, include_fingers=True):
+            centers.append(q.copy())
+            g._box_certified = len(centers) > 1
+            g._split_weights = np.array([1., 10.] + [0.] * 12)
+            return .1
+        g._clearance = clearance
+        a, b = np.zeros(14), np.zeros(14)
+        b[:2] = [.1, .08]
+        self.assertTrue(g(a, b))
+        self.assertEqual(len(centers), 3)
+        self.assertAlmostEqual(centers[1][0], centers[0][0])
+        self.assertNotAlmostEqual(centers[1][1], centers[0][1])
 
 
 class ReturnTrajectoryTests(unittest.TestCase):
@@ -297,6 +360,7 @@ class ReturnTrajectoryTests(unittest.TestCase):
             return feedback.copy()
 
         d.read_joints = mock.Mock(side_effect=read)
+        d._read_checked_motion_feedback = d.read_joints
         d._emit_probe = lambda event: events.append(event)
         with mock.patch('esrobo_teleop.robot.nero_driver.time.sleep'):
             returned = d._return_group_to_zero(
@@ -331,6 +395,7 @@ class ReturnTrajectoryTests(unittest.TestCase):
             events.append((event, d._arm.move_j.call_count))
 
         d.read_joints = mock.Mock(side_effect=read)
+        d._read_checked_motion_feedback = d.read_joints
         d._emit_probe = record
         with mock.patch('esrobo_teleop.robot.nero_driver.time.sleep'):
             returned = d._return_group_to_zero(
@@ -367,6 +432,7 @@ class ReturnTrajectoryTests(unittest.TestCase):
             nonlocal feedback
             feedback = np.array(q)
         d.read_joints = mock.Mock(side_effect=read)
+        d._read_checked_motion_feedback = d.read_joints
         d._arm.move_j.side_effect = send
         self.assertTrue(d._return_group_to_zero(np.zeros(14), np.arange(7), zero, .01, 2.))
         sent = np.array([c.args[0] for c in d._arm.move_j.call_args_list])

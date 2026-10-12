@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PICO 双臂骨架诊断</title>
-  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./styles.css?v=20261009-entry-boundary">
 </head>
 <body>
   <main class="workspace">
@@ -35,6 +35,7 @@
 
     <section class="viewport" aria-label="三维骨架视图">
       <div id="scene"></div>
+      <div id="data-warning" class="data-warning" role="status">尚未收到 Body 骨架数据。</div>
       <div class="side-label left">左臂</div>
       <div class="side-label right">右臂</div>
       <div class="axis-legend">
@@ -45,6 +46,15 @@
     </section>
 
     <aside class="diagnostics">
+      <section>
+        <h2>采集与转发（独立于网页 20 Hz 轮询）</h2>
+        <dl class="metrics">
+          <div><dt>SDK Body / 左手 / 右手</dt><dd id="sdk-rates">-- Hz</dd></div>
+          <div><dt>Body 实际转发</dt><dd id="forward-rate">-- Hz</dd></div>
+          <div><dt>诊断年龄</dt><dd id="transport-age">-- ms</dd></div>
+        </dl>
+        <pre id="transport-counts">等待采集诊断</pre>
+      </section>
       <section>
         <h2>追踪质量</h2>
         <dl class="metrics">
@@ -85,6 +95,6 @@
       </section>
     </aside>
   </main>
-  <script type="module" src="./app.js"></script>
+  <script type="module" src="./app.js?v=20261009-entry-boundary"></script>
 </body>
 </html>

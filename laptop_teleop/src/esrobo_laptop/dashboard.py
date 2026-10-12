@@ -19,11 +19,13 @@ import time
 from urllib.parse import urlsplit
 
 from .config import ROOT, WORKSPACE
+from .contract import REQUIRED_ENTRY_PROTOCOL, REQUIRED_ENTRY_KEEPALIVE_PROTOCOL
 
 REMOTE = '/home/esrobo/Projects/esrobo'
 REMOTE_PYTHON = '/home/esrobo/miniconda3/envs/teleop_esrobo/bin/python'
 ROBOT_HOST = '192.168.10.100'
 GATEWAY_STARTUP_LOG = '/tmp/esrobo_gateway_startup.log'
+STARTUP_LOGS = dict(gateway=GATEWAY_STARTUP_LOG, hands='/tmp/esrobo_hands_startup.log')
 SESSIONS = dict(hands='esrobo_hands', hand_bridge='esrobo_hand_bridge', gateway='esrobo_gateway',
                 waist='esrobo_waist', head='esrobo_head', camera='esrobo_camera', head_web='esrobo_head_web')
 LABELS = dict(pc_service='PICO PC Service', pico='PICO 采集', sensecom='SenseCom',
@@ -51,10 +53,22 @@ sessions=list(session_info)
 result={'sessions':sessions,'robot':None,'can':subprocess.run(['ip','-br','link','show','type','can'],capture_output=True,text=True).stdout,
         'waist_session_id':session_info.get('esrobo_waist',''),
         'waist_control_available':os.path.isfile('/home/esrobo/Projects/esrobo/robot_link/esrobo_link/waist_control.py')}
+# Inspect listeners without opening a connection or requesting camera/control data.
 try:
- with open('/tmp/esrobo_gateway_startup.log','rb') as f:
-  f.seek(0,2); f.seek(max(0,f.tell()-20000)); result['gateway_startup_log']=f.read().decode(errors='replace')
+ head_listener=False
+ for table in ('/proc/net/tcp','/proc/net/tcp6'):
+  with open(table) as f:
+   for row in f.read().splitlines()[1:]:
+    fields=row.split()
+    if len(fields)>3 and fields[3]=='0A' and fields[1].endswith(':223E'):
+     head_listener=True
+ result['head_web_listening']=head_listener
 except OSError: pass
+for service in ('gateway','hands'):
+ try:
+  with open('/tmp/esrobo_'+service+'_startup.log','rb') as f:
+   f.seek(0,2); f.seek(max(0,f.tell()-20000)); result[service+'_startup_log']=f.read().decode(errors='replace')
+ except OSError: pass
 for name in os.listdir('/proc'):
  if not name.isdigit(): continue
  try:
@@ -137,6 +151,8 @@ class Console:
         self.pc_service = False
         self.lock = threading.RLock()
         self.remote_lock = threading.Lock()
+        self.head_connect_lock = threading.Lock()
+        self.head_retry_at = 0.
         self.owner = None
         self.heartbeat = 0.
         self.closed = threading.Event()
@@ -150,6 +166,9 @@ class Console:
             self.waist_pending = None
         self.waist_pending_hits = 0
         self.waist_enable_requested = False
+        self.auto_handover_last_attempt = 0.
+        self.auto_handover_error = ''
+        self.auto_handover_blocked = False
         threading.Thread(target=self._monitor, daemon=True).start()
         threading.Thread(target=self._watchdog, daemon=True).start()
 
@@ -175,6 +194,7 @@ class Console:
             if self.ssh:
                 self.ssh.close()
             self.ssh = client
+            self.head_retry_at = 0.
         self.event('SSH 已连接，主机密钥验证通过')
         self.refresh()
 
@@ -235,7 +255,8 @@ class Console:
                     events=list(self.events), mode=mode, owner=self.owner, pc_service=self.pc_service,
                     capabilities=dict(automatic_can_teardown=True, fault_recovery=True,
                                       waist_control=True), waist_moved=WAIST_MOVED_FILE.exists(),
-                    waist_enable_requested=self.waist_enable_requested)
+                    waist_enable_requested=self.waist_enable_requested,
+                    auto_handover_error=self.auto_handover_error)
 
     def remote_start(self, name, mode):
         if name not in SESSIONS:
@@ -246,6 +267,7 @@ class Console:
             return
         if name == 'waist' and not self.remote.get('waist_control_available'):
             raise RuntimeError('机器人尚未同步腰部控制代码；先同步 robot_link 再启动腰部驱动')
+        self.check_service_can(name, mode)
         ros = 'source /opt/ros/humble/setup.bash && source install/setup.bash && '
         commands = dict(hands=ros+'exec ros2 launch linker_hand_ros2_sdk linker_hand_double.launch.py',
                         hand_bridge=ros+'exec python3 teleoperation/bridges/hand_ros_bridge.py --side both',
@@ -263,24 +285,51 @@ class Console:
             gateway.append('--hand-only')
         commands['gateway'] = 'exec '+shlex.join(gateway)
         command = 'cd '+shlex.quote(REMOTE)+' && '+commands[name]
-        if name == 'gateway':
+        if name in STARTUP_LOGS:
             # tmux destroys the pane when startup fails. Capture its output
             # before exec so the traceback remains available after exit.
-            capture = (' : > '+shlex.quote(GATEWAY_STARTUP_LOG)+' && '
+            startup_log = STARTUP_LOGS[name]
+            capture = (' : > '+shlex.quote(startup_log)+' && '
                        'tmux pipe-pane -t "$TMUX_PANE" '
-                       + shlex.quote('cat >> '+GATEWAY_STARTUP_LOG)+' && ')
+                       + shlex.quote('cat >> '+startup_log)+' && ')
             command = 'cd '+shlex.quote(REMOTE)+' &&'+capture+commands[name]
         self.command(['tmux', 'new-session', '-d', '-s', SESSIONS[name], 'bash -lc '+shlex.quote(command)])
         if name == 'waist':
             self.waist_enable_requested = False
         self.refresh()
         if SESSIONS[name] not in self.remote.get('sessions', []):
-            detail = self.remote.get('gateway_startup_log', '').strip() if name == 'gateway' else ''
+            detail = self.remote.get(name+'_startup_log', '').strip() if name in STARTUP_LOGS else ''
             raise RuntimeError(f'机器人 {name} 启动后立即退出' + (f'：{detail[-1800:]}' if detail else '；请查看服务日志'))
         self.event(f'机器人 {name} 会话已建立，查看日志确认就绪')
 
+    def check_service_can(self, name, mode):
+        required = []
+        if name == 'hands':
+            required = ['can_hand1', 'can_hand2']
+        elif name == 'waist':
+            required = ['can_waist']
+        elif name == 'gateway':
+            sides = ('left', 'right') if mode['side'] == 'both' else (mode['side'],)
+            if not mode['hand_only']:
+                required += [('can_piper1' if side == 'left' else 'can_piper2') for side in sides]
+            if mode['with_hand']:
+                required += [('can_hand2' if side == 'left' else 'can_hand1') for side in sides]
+        interfaces = {}
+        for line in self.remote.get('can', '').splitlines():
+            fields = line.split()
+            if fields:
+                flags = re.search(r'<([^>]*)>', line)
+                interfaces[fields[0]] = set(flags.group(1).split(',')) if flags else set()
+        unavailable = [interface + (' 不存在' if interface not in interfaces else ' 未启用')
+                       for interface in required if 'UP' not in interfaces.get(interface, set())]
+        if unavailable:
+            raise RuntimeError('CAN 未就绪：'+ '、'.join(unavailable)
+                               +'。机器人重启后需先按现场流程关闭相关服务并初始化 CAN，再启动驱动和网关。')
+
     def key(self, key):
         # Never type into an exited program's shell. Only the gateway Python pane accepts keys.
+        previous_result = self.robot_state().get('operator_result', {}) if key == 'g' else {}
+        previous_seq = previous_result.get('seq', -1)
         panes = self.command(['tmux', 'list-panes', '-a', '-F', '#{session_name}|#{pane_current_command}'])
         command = next((row.split('|', 1)[1] for row in panes.splitlines()
                         if row.startswith(SESSIONS['gateway'] + '|')), '')
@@ -288,6 +337,25 @@ class Console:
             raise RuntimeError('网关 Python 程序未运行，拒绝发送终端按键')
         self.command(['tmux', 'send-keys', '-t', SESSIONS['gateway'], '-l', key])
         self.command(['tmux', 'send-keys', '-t', SESSIONS['gateway'], 'Enter'])
+        if key == 'g':
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                self.refresh()
+                state = self.robot_state()
+                result = state.get('operator_result', {})
+                if result.get('action') == 'g' and result.get('seq', -1) > previous_seq:
+                    if not result.get('accepted'):
+                        message = result.get('message') or '网关拒绝接管请求'
+                        self.event(f'网关拒绝接管：{message}')
+                        raise RuntimeError(message)
+                    self.event('网关已接受接管请求；正在检查目标和路径')
+                    return dict(message=result.get('message') or '网关已接受接管请求')
+                if state.get('mode') in ('CHECKING_ENTRY', 'APPROACHING',
+                                         'WAITING_FOR_ACTIVE_TARGET', 'ACTIVE'):
+                    self.event('网关已进入接管阶段；正在检查目标和路径')
+                    return dict(message='网关已进入接管阶段；正在检查目标和路径')
+                time.sleep(.1)
+            raise RuntimeError('网关未确认接管请求；请检查网关状态和日志')
         self.event(f'网关命令 {key} 已发送；以实时反馈确认结果')
 
     def waist_command(self, action, axis=None, direction=None, target_deg=None):
@@ -490,12 +558,42 @@ class Console:
             state = self.robot_state()
             if state.get('mode') != 'IDLE' or state.get('age_s', 999) > 1:
                 raise RuntimeError('需要新鲜的 IDLE 网关状态')
+            feedback = state.get('feedback') or {}
+            members = feedback.get('sides') or {'single': feedback}
+            if (not mode['preview'] and any(
+                    item.get('controller_fault') or item.get('driver_fault')
+                    for item in members.values())):
+                raise RuntimeError('控制器/驱动故障仍未解除；先结束计算并执行受检回零恢复。IDLE 不代表控制器正常')
             remote_args = self.remote.get('gateway_args', [])
             remote_side = remote_args[remote_args.index('--side')+1] if '--side' in remote_args else 'left'
             remote_hand = remote_side == 'both' or '--with-hand' in remote_args
             remote_hand_only = '--hand-only' in remote_args
             if (remote_side, remote_hand, remote_hand_only) != (mode['side'], mode['with_hand'], mode['hand_only']):
                 raise RuntimeError('所选模式与正在运行的机器人网关不一致；停止并按所选模式重启网关')
+            if (mode['side'] != 'both' and not mode['hand_only']
+                    and state.get('entry_protocol') != REQUIRED_ENTRY_PROTOCOL):
+                raise RuntimeError(
+                    f"机器人网关接管协议为 {state.get('entry_protocol')!r}，"
+                    f"本机当前需要 {REQUIRED_ENTRY_PROTOCOL}；请同步机器人端 robot_link、"
+                    "teleoperation 源码并核对配置，安全退出旧网关后重新启动")
+            if (mode['side'] != 'both' and not mode['hand_only']
+                    and state.get('entry_keepalive_protocol') != REQUIRED_ENTRY_KEEPALIVE_PROTOCOL):
+                raise RuntimeError("机器人网关缺少接近阶段保活协议 1；请同步机器人端 robot_link 并重启网关")
+            if not mode['hand_only']:
+                feedback = state.get('feedback') or {}
+                members = feedback.get('sides') if mode['side'] == 'both' else {mode['side']: feedback}
+                sides = ('left', 'right') if mode['side'] == 'both' else (mode['side'],)
+                if not all(
+                    isinstance((members or {}).get(side, {}).get('arm_urdf_rad'), list)
+                    and len(members[side]['arm_urdf_rad']) == 7
+                    and all(isinstance(angle, (int, float)) and math.isfinite(angle)
+                            for angle in members[side]['arm_urdf_rad'])
+                    and isinstance(members[side].get('arm_feedback_age_s'), (int, float))
+                    and 0 <= members[side]['arm_feedback_age_s'] <= 0.1
+                    and not members[side].get('feedback_diagnostic')
+                    for side in sides
+                ):
+                    raise RuntimeError('关节角反馈未重新核验；失能不代表已回零，暂不能开始计算')
             if mode['preview']:
                 argv.append('--preview')
             if mode['hand_only']:
@@ -506,6 +604,9 @@ class Console:
         self.processes[name] = Process([str(scripts/argv[0]), *argv[1:]])
         if name == 'teleop':
             self.owner, self.heartbeat, self.mode = session, time.monotonic(), mode
+            self.auto_handover_last_attempt = 0.
+            self.auto_handover_error = ''
+            self.auto_handover_blocked = False
         if name == 'check':
             side_label = {'both': '双臂', 'left': '左臂', 'right': '右臂'}[mode['side']]
             hand_label = ('仅灵巧手' if mode['hand_only'] else
@@ -604,7 +705,7 @@ class Console:
                     raise ValueError('未知服务')
                 self.refresh()
                 if name in ('gateway', 'hands', 'hand_bridge'):
-                    if self.running('teleop') or self.robot_state().get('mode') in ('ACTIVE', 'ARMING', 'RETURNING', 'RECOVERING'):
+                    if self.running('teleop') or self.robot_state().get('mode') in ('ACTIVE', 'ARMING', 'RETURNING', 'RECOVERING', 'CHECKING_ENTRY', 'APPROACHING', 'WAITING_FOR_ACTIVE_TARGET'):
                         raise RuntimeError('请先停止遥操作并确认机器人停止')
                 if name == 'gateway':
                     self.key('q')
@@ -716,9 +817,9 @@ class Console:
                 name = data.get('name')
                 if name not in SESSIONS:
                     raise ValueError('未知服务')
-                if name == 'gateway':
+                if name in STARTUP_LOGS:
                     self.refresh()
-                    saved = self.remote.get('gateway_startup_log', '')
+                    saved = self.remote.get(name+'_startup_log', '')
                     if saved:
                         return dict(log=saved)
                 return dict(log=self.command(['tmux', 'capture-pane', '-p', '-t', SESSIONS[name], '-S', '-180']))
@@ -729,9 +830,13 @@ class Console:
                     raise RuntimeError('先停止本机计算再恢复网关')
                 self.refresh()
                 state = self.robot_state()
+                feedback = state.get('feedback') or {}
+                inherited_fault = (state.get('mode') == 'IDLE' and
+                                   bool(feedback.get('controller_fault') or feedback.get('driver_fault')))
                 if (SESSIONS['gateway'] not in self.remote.get('sessions', [])
-                        or state.get('age_s', 999) > 1 or state.get('mode') != 'FAULT'):
-                    raise RuntimeError('恢复需要新鲜的 FAULT 网关状态')
+                        or state.get('age_s', 999) > 1
+                        or (state.get('mode') != 'FAULT' and not inherited_fault)):
+                    raise RuntimeError('恢复需要新鲜的 FAULT 状态，或 IDLE 下仍有控制器/驱动故障')
                 if state.get('recovery_supported') is not True:
                     raise RuntimeError('机器人网关尚未加载故障恢复功能；请同步新代码并重启一次网关')
                 if state.get('stop_send_returned') is False:
@@ -772,10 +877,10 @@ class Console:
                 self.event('手套序列号已配置')
             elif action == 'gateway_key':
                 key = data.get('key')
-                if key not in ('e', 's', 'x', 'd', 'dl', 'dr', 'dh', 'z', 'q'):
+                if key not in ('e', 'g', 's', 'x', 'd', 'dl', 'dr', 'dh', 'z', 'q'):
                     raise ValueError('未知网关命令')
                 self.refresh()
-                if key == 'e':
+                if key in ('e', 'g'):
                     if WAIST_MOVED_FILE.exists():
                         raise RuntimeError('腰部曾通过页面离开竖直基准；请读取腰部反馈，确认 31/32/33 号回到 139° / 215° / 144°（±0.2°）')
                     remote_args = self.remote.get('gateway_args', [])
@@ -790,9 +895,11 @@ class Console:
                     if (session != self.owner or not self.running('teleop') or self.mode['preview']
                             or local.get('age_s', 999) > 1 or not local.get('targets')
                             or local.get('sent', 0) < 1 or state.get('age_s', 999) > 1
-                            or state.get('mode') != 'IDLE' or not members
+                            or state.get('mode') != ('CALIBRATING' if key == 'g' else 'IDLE') or not members
                             or any(v.get('controller_fault') for v in members.values())):
-                        raise RuntimeError('使能需要正式计算、持续有效目标、新鲜 IDLE 反馈且控制器无故障')
+                        raise RuntimeError('准备/接管需要正式计算、持续有效目标、新鲜对应阶段反馈且控制器无故障')
+                    if key == 'g' and not state.get('entry_ready'):
+                        raise RuntimeError('请保持接管姿态稳定，等待完整目标就绪')
                     if self.mode.get('with_hand') and not self.mode.get('hand_only'):
                         incomplete = []
                         for side, member in members.items():
@@ -840,7 +947,9 @@ class Console:
                     argv = self.remote['gateway_args']
                     if argv[argv.index('--side')+1] == 'both':
                         raise RuntimeError('双臂网关不支持自动回零；请按机器人恢复流程处理')
-                self.key(key)
+                result = self.key(key)
+                if key == 'g':
+                    return result or {}
             else:
                 raise ValueError('未知操作')
         return {}
@@ -848,7 +957,19 @@ class Console:
     def head(self, method, path, body=None):
         if not self.connected():
             raise RuntimeError('请先连接机器人 SSH')
-        channel = self.ssh.get_transport().open_channel('direct-tcpip', ('127.0.0.1', 8766), ('127.0.0.1', 0), timeout=3)
+        import paramiko
+        unavailable = '机器人相机网页服务未监听 8766；请在“设备与驱动”中启动“相机网页服务”'
+        with self.head_connect_lock:
+            now = time.monotonic()
+            if now-self.remote_time < 2 and self.remote.get('head_web_listening') is False:
+                raise RuntimeError(unavailable)
+            if now < self.head_retry_at:
+                raise RuntimeError(unavailable + '；稍后自动重试')
+            try:
+                channel = self.ssh.get_transport().open_channel('direct-tcpip', ('127.0.0.1', 8766), ('127.0.0.1', 0), timeout=3)
+            except (paramiko.ChannelException, OSError, TimeoutError) as exc:
+                self.head_retry_at = time.monotonic()+5.
+                raise RuntimeError(unavailable + f'（{exc}）') from exc
         channel.settimeout(3)
         response = None
         try:
@@ -880,6 +1001,30 @@ class Console:
         finally:
             connection.close()
 
+    def _maybe_auto_handover(self):
+        state = self.robot_state()
+        if not (state.get('entry_protocol') in (3, 4, 5, 6) and state.get('mode') == 'CALIBRATING'
+                and state.get('entry_ready') and state.get('age_s', 999) < 1
+                and self.owner and self.running('teleop') and not self.mode['preview']
+                and time.monotonic()-self.heartbeat < 1.5
+                and not self.auto_handover_blocked
+                and time.monotonic()-self.auto_handover_last_attempt >= 1.0):
+            return
+        self.auto_handover_last_attempt = time.monotonic()
+        try:
+            self.action(dict(action='gateway_key', key='g', session=self.owner))
+            self.auto_handover_error = ''
+        except Exception as exc:
+            self.auto_handover_error = str(exc)
+            self.event('自动接管尚未开始：' + str(exc))
+            # Telemetry and gateway snapshots arrive independently. A fresh
+            # gateway entry-ready sample can briefly precede the matching
+            # local target snapshot; retry that transient gate on the next
+            # monitor tick instead of permanently stranding CALIBRATING.
+            transient = ('稳定', '完整目标', '准备/接管需要正式计算、持续有效目标')
+            if not any(fragment in str(exc) for fragment in transient):
+                self.auto_handover_blocked = True
+
     def _monitor(self):
         while not self.closed.wait(.5):
             self.pc_service = subprocess.run(['pgrep', '-f', '^/opt/apps/roboticsservice/RoboticsServiceProcess$'],
@@ -887,6 +1032,7 @@ class Console:
             if self.connected():
                 try:
                     self.refresh()
+                    self._maybe_auto_handover()
                 except Exception as exc:
                     self.remote_error = str(exc)
                     if self.running('teleop'):

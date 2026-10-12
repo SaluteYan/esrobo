@@ -125,6 +125,10 @@ class LinkerHandDriver:
             self._physical_count = 20
         else:
             raise ValueError(f"unsupported hand model: {self._model!r} (L10|L20)")
+        if self._model == "L10" and not (
+            self._cfg.out_min <= self._cfg.right_thumb_pitch_min_unit <= self._cfg.out_max
+        ):
+            raise ValueError("right thumb pitch flexion floor must be in servo range")
 
         if cfg.home and len(cfg.home) == self._physical_count:
             self._home = np.asarray(cfg.home, dtype=np.float64)
@@ -136,6 +140,8 @@ class LinkerHandDriver:
             "right": np.zeros(self._physical_count, dtype=np.float64),
         }
         self._last_sent_time = time.monotonic()
+        self._published_cmd = {}
+        self._published_seq = 0
         self._feedback: dict[str, np.ndarray | None] = {"left": None, "right": None}
         self._feedback_time: dict[str, float | None] = {"left": None, "right": None}
 
@@ -278,6 +284,33 @@ class LinkerHandDriver:
             "invalid_joints": invalid,
         }
 
+    def open_return_geometry_state(self, side: str):
+        """Planned full open sweep, using measured feedback calibration.
+
+        This is a geometry bound, not a new sensor sample. Retain the original
+        receive timestamp and bound both permitted final error and sample age.
+        """
+        from .hand_geometry import HandGeometryState
+        state = self.geometry_state(side, 0.)
+        names = L10_PHYSICAL_JOINT_NAMES
+        if not state.valid or not self.open_feedback_calibrated(side) or len(state.calibrated) != 10:
+            return HandGeometryState(state.stamp, {}, (), False, "complete calibrated hand feedback required")
+        target = self.open_feedback_target(side)
+        intervals = dict(state.intervals)
+        for i, name in enumerate(names):
+            item = self._cfg.geometry_feedback_calibration[side][name]
+            a, b = item['raw']; x, y = item['rad']
+            if not min(a, b) <= target[i] <= max(a, b):
+                return HandGeometryState(state.stamp, {}, (), False, "open feedback outside calibration")
+            slope = (y-x)/(b-a)
+            endpoint = x+(target[i]-a)*slope
+            radius = (item['error_rad'] + item['max_velocity_rad_s'] * self._cfg.geometry_feedback_timeout_s
+                      + abs(slope) * self._cfg.startup_open_tolerance)
+            key = side+'_'+name
+            lo, hi = intervals[key]
+            intervals[key] = (min(lo-radius, endpoint-radius), max(hi+radius, endpoint+radius))
+        return HandGeometryState(state.stamp, intervals, state.calibrated, True)
+
     def _feedback_is_fresh(self) -> bool:
         self._poll_feedback()
         now = time.monotonic()
@@ -320,13 +353,18 @@ class LinkerHandDriver:
         right = np.asarray(self._cfg.right_open, dtype=np.float64)
         self._send_physical(left, right)
 
-    def return_to_open(self, cancelled=None) -> bool:
+    def return_to_open(self, cancelled=None, *, safety_check=None, force=False) -> bool:
         """Move active hands from fresh feedback to their natural open poses."""
         cancelled = cancelled or (lambda: False)
-        if not self._cfg.return_open_on_quit:
+        if not force and not self._cfg.return_open_on_quit:
             self._enabled = False
             return True
         if cancelled() or not self._feedback_is_fresh():
+            self._enabled = False
+            return False
+        if self._right_thumb_beyond_flexion_limit():
+            # Opening this hand automatically from the measured hard stop has
+            # already stalled and heated the motor; require local inspection.
             self._enabled = False
             return False
 
@@ -334,6 +372,9 @@ class LinkerHandDriver:
             side: np.asarray(self._feedback[side], dtype=np.float64).copy()
             for side in self._active_sides
         }
+        # The feedback, not an old command, is the start of this return path.
+        for side, start in starts.items():
+            self._last_cmd[side] = start.copy()
         targets = {
             "left": np.asarray(self._cfg.left_open, dtype=np.float64),
             "right": np.asarray(self._cfg.right_open, dtype=np.float64),
@@ -352,7 +393,11 @@ class LinkerHandDriver:
         left = self._last_cmd["left"].copy()
         right = self._last_cmd["right"].copy()
         for step in range(1, steps + 1):
-            if cancelled() or not self._feedback_is_fresh():
+            if (cancelled() or not self._feedback_is_fresh()
+                    or (safety_check is not None and not safety_check())):
+                self._enabled = False
+                return False
+            if cancelled():
                 self._enabled = False
                 return False
             phase = step / steps
@@ -378,6 +423,13 @@ class LinkerHandDriver:
         }
         tolerance = max(0.0, float(self._cfg.startup_open_tolerance))
         return all(np.max(np.abs(error)) <= tolerance for error in errors.values()), errors
+
+    def _right_thumb_beyond_flexion_limit(self) -> bool:
+        # Caller has already required fresh feedback.
+        return bool(
+            self._model == "L10" and "right" in self._active_sides
+            and self._feedback["right"][0] < self._cfg.right_thumb_pitch_min_unit
+        )
 
     def open_feedback_target(self, side: str) -> np.ndarray:
         """Return measured feedback expected at the physical natural-open pose."""
@@ -412,17 +464,21 @@ class LinkerHandDriver:
             and np.all(target <= self._cfg.out_max)
         )
 
-    def align_and_verify_open_pose(self, cancelled=None) -> tuple[bool, dict[str, np.ndarray]]:
+    def align_and_verify_open_pose(self, cancelled=None, *, safety_check=None, force=False) -> tuple[bool, dict[str, np.ndarray]]:
         """Smoothly command the configured open zero, then verify fresh feedback."""
         cancelled = cancelled or (lambda: False)
-        if not self.return_to_open(cancelled):
-            return False, {}
+        if safety_check is None and not force:
+            sent = self.return_to_open(cancelled)
+        else:
+            sent = self.return_to_open(cancelled, safety_check=safety_check, force=force)
+        if not sent:
+            return False, self.open_pose_status()[1]
         deadline = time.monotonic() + max(
             0.1, float(self._cfg.startup_open_verify_timeout_s)
         )
         status: tuple[bool, dict[str, np.ndarray]] = (False, {})
         while time.monotonic() < deadline:
-            if cancelled():
+            if cancelled() or (safety_check is not None and not safety_check()):
                 return False, status[1]
             status = self.open_pose_status()
             if status[0]:
@@ -443,10 +499,17 @@ class LinkerHandDriver:
             target = self.open_feedback_target(side)
             current = target + np.asarray(error, dtype=np.float64)
             for index in np.flatnonzero(np.abs(error) > tolerance):
+                extra = (
+                    f"; below safe flexion floor {self._cfg.right_thumb_pitch_min_unit}, "
+                    "automatic open inhibited"
+                    if side == "right" and self._model == "L10" and index == 0
+                    and current[index] < self._cfg.right_thumb_pitch_min_unit
+                    else ""
+                )
                 details.append(
                     f"{side} {names[int(index)]}[{int(index)}] "
                     f"position={current[index]:.0f} target={target[index]:.0f} "
-                    f"error={error[index]:+.0f}/255"
+                    f"error={error[index]:+.0f}/255{extra}"
                 )
         return "; ".join(details)
 
@@ -498,8 +561,10 @@ class LinkerHandDriver:
         return np.rint(servo).astype(np.int64)
 
     # -------------------------------------------------------------- safety
-    def _apply_safety(self, side: str, servo: np.ndarray) -> np.ndarray:
+    def _apply_safety(self, side: str, servo: np.ndarray, *, interval_s=None) -> np.ndarray:
         servo = np.clip(servo, self._cfg.out_min, self._cfg.out_max)
+        if side == "right" and self._model == "L10":
+            servo[0] = max(servo[0], self._cfg.right_thumb_pitch_min_unit)
         last = self._last_cmd[side]
         if np.all(np.isnan(last)):
             # First command after enable: cap the jump from the home pose.
@@ -512,8 +577,10 @@ class LinkerHandDriver:
             delta = np.clip(delta, -step, step)
         # Velocity limit (per publish interval).
         interval = 1.0 / max(float(self._cfg.publish_hz), 1.0)
-        max_delta = int(max(self._cfg.max_velocity, 0) * interval)
-        if max_delta > 0:
+        if interval_s is not None:
+            interval = min(interval, max(0., float(interval_s)))
+        max_delta = int(np.floor(max(self._cfg.max_velocity, 0) * interval + 1.e-7))
+        if self._cfg.max_velocity > 0:
             delta = np.clip(delta, -max_delta, max_delta)
         out = base + delta
         out = np.clip(out, self._cfg.out_min, self._cfg.out_max)
@@ -522,9 +589,24 @@ class LinkerHandDriver:
     # ------------------------------------------------------------- output
     def _send_physical(self, left: np.ndarray, right: np.ndarray) -> None:
         left = np.clip(left, self._cfg.out_min, self._cfg.out_max).astype(np.int64).tolist()
-        right = np.clip(right, self._cfg.out_min, self._cfg.out_max).astype(np.int64).tolist()
-        self._last_cmd["left"] = np.asarray(left, dtype=np.float64)
-        self._last_cmd["right"] = np.asarray(right, dtype=np.float64)
+        right_values = np.clip(right, self._cfg.out_min, self._cfg.out_max).astype(np.float64)
+        if "right" in self._active_sides and self._model == "L10":
+            floor = float(self._cfg.right_thumb_pitch_min_unit)
+            if right_values[0] < floor:
+                stamp = self._feedback_time["right"]
+                measured = self._feedback["right"]
+                if (measured is not None and stamp is not None
+                        and time.monotonic() - stamp <= self._cfg.max_stale_time_s
+                        and measured[0] < floor):
+                    # A hand already beyond the new soft limit may return
+                    # gradually toward open, but must never be driven deeper.
+                    right_values[0] = max(
+                        right_values[0], float(measured[0]),
+                        min(float(self._last_cmd["right"][0]), floor),
+                    )
+                else:
+                    right_values[0] = floor
+        right = np.rint(right_values).astype(np.int64).tolist()
         if self._mode == "udp":
             commands = {"left": left, "right": right}
             payload = json.dumps(
@@ -539,6 +621,12 @@ class LinkerHandDriver:
                 msg.name = [f"{side}_{i}" for i in range(len(values))]
                 msg.position = [float(v) for v in values]
                 self._publishers[side].publish(msg)
+        # Failed publication must not consume the last-sent baseline.
+        self._last_cmd["left"] = np.asarray(left, dtype=np.float64)
+        self._last_cmd["right"] = np.asarray(right, dtype=np.float64)
+        for side in self._active_sides:
+            self._published_cmd[side] = self._last_cmd[side].tolist()
+        self._published_seq += 1
 
     def command(self, hand_joints: np.ndarray) -> None:
         with self._feedback_lock:
@@ -555,6 +643,10 @@ class LinkerHandDriver:
                 "position_unit": None if value is None else value.tolist(),
                 "age_s": None if stamp is None else max(0.0, time.monotonic() - stamp),
                 "geometry": self.geometry_calibration_status(side),
+                # Transport output, distinct from measured actuator feedback.
+                "command_unit": (None if side not in self._published_cmd else
+                                 list(self._published_cmd[side])),
+                "command_seq": self._published_seq,
             }
 
     def command_physical(self, side: str, values) -> bool:
@@ -566,7 +658,7 @@ class LinkerHandDriver:
         return self._command_physical_targets({side: values})
 
     def command_physical_batch(self, targets: dict) -> bool:
-        """Validate and publish both hands once under the shared rate limiter."""
+        """Validate and publish both hands once with elapsed-time motion limits."""
         if set(targets) != set(self._active_sides):
             raise ValueError("batch must contain every active hand")
         return self._command_physical_targets(targets)
@@ -586,15 +678,18 @@ class LinkerHandDriver:
                 self._enabled = False
                 return False
             now = time.monotonic()
-            if now - self._last_sent_time < 1.0 / max(1.0, self._cfg.publish_hz):
-                return True
+            # The gateway already schedules target execution. A second 20 ms
+            # drop gate aliases with its cadence and can halve hand output.
+            # Publish every accepted request; cap motion by actual elapsed time
+            # and at most one nominal period, so bursts gain no extra speed.
+            elapsed = now - self._last_sent_time
             allowed = set(self._cfg.enabled_physical_joints)
             commands = {key: value.copy() for key, value in self._last_cmd.items()}
             for side, target in checked.items():
                 for index in range(10):
                     if index not in allowed:
                         target[index] = self._feedback[side][index]
-                commands[side] = self._apply_safety(side, target)
+                commands[side] = self._apply_safety(side, target, interval_s=elapsed)
             self._send_physical(commands["left"], commands["right"])
             self._last_sent_time = now
             return True

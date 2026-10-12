@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class PartitionedPositionTests(unittest.TestCase):
     def test_latest_right_j2_boundary_rejection_is_a_recoverable_hold(self):
-        cfg, solver, _, _ = self.solver("right")
+        cfg, solver, _, hi = self.solver("right")
         feedback = np.array([
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
             1.0114881147007937, 0.12201596800692371,
@@ -63,6 +63,58 @@ class PartitionedPositionTests(unittest.TestCase):
             )
         self.assertFalse(solver.last_solution_valid)
         self.assertFalse(solver.solution_diagnostics["recoverable_position_limit"])
+        self.assertFalse(solver.solution_diagnostics["position_limit_approach"])
+
+        # A fresh, valid target was already accepted at J2=7 degrees. The
+        # measured joint is still travelling there when the next PICO pose
+        # becomes unreachable; keep issuing only that accepted target.
+        solver._prev_targets[8] = hi[1]
+        accepted = solver._prev_targets.copy()
+        with contextlib.redirect_stdout(io.StringIO()):
+            approaching = solver.solve(
+                poses["left_wrist"], poses["right_wrist"], away,
+                poses["left_elbow"], poses["right_elbow"], "right", away[11:],
+            )
+        self.assertFalse(solver.last_solution_valid)
+        self.assertFalse(solver.solution_diagnostics["recoverable_position_limit"])
+        self.assertTrue(solver.solution_diagnostics["position_limit_approach"])
+        np.testing.assert_array_equal(approaching, accepted)
+
+    def test_limit_hold_throttles_branch_retries_and_recovers_on_fresh_pose(self):
+        _, solver, _, _ = self.solver("right")
+        feedback = np.zeros(14)
+        feedback[7:] = [0.715, np.deg2rad(7.0), 1.12, 1.326, 0., 0., 0.]
+        reachable = solver.current_task_frame_poses(feedback)
+        unreachable = {name: pose.copy() for name, pose in reachable.items()}
+        unreachable["right_elbow"][:3] = [0.106526, -0.166963, 1.027307]
+        unreachable["right_wrist"][:3] = [0.359311, 0.104541, 1.174303]
+        solver.initialize_arm_session("right", feedback, .4,
+                                      relative_elbow_reference=True)
+
+        def solve(poses, fast=False):
+            with contextlib.redirect_stdout(io.StringIO()):
+                return solver.solve(
+                    poses["left_wrist"], poses["right_wrist"], feedback,
+                    poses["left_elbow"], poses["right_elbow"], "right", feedback[11:],
+                    limit_hold_fast_retry=fast,
+                )
+
+        solve(unreachable)
+        self.assertTrue(solver.solution_diagnostics["recoverable_position_limit"])
+        self.assertGreater(solver.solution_diagnostics["attempts"], 1)
+        for _ in range(4):
+            solve(unreachable, fast=True)
+            self.assertFalse(solver.last_solution_valid)
+            self.assertTrue(solver.solution_diagnostics["recoverable_position_limit"])
+            self.assertEqual(solver.solution_diagnostics["attempts"], 1)
+            self.assertTrue(solver.solution_diagnostics["limit_hold_fast_retry"])
+        solve(unreachable, fast=True)
+        self.assertGreater(solver.solution_diagnostics["attempts"], 1)
+        self.assertFalse(solver.solution_diagnostics["limit_hold_fast_retry"])
+        solve(reachable, fast=True)
+        self.assertTrue(solver.last_solution_valid)
+        self.assertEqual(solver.solution_diagnostics["attempts"], 1)
+        self.assertEqual(solver._limit_hold_retry_count, 0)
 
     def test_latest_left_session_uses_shared_ik_without_geometry_failure(self):
         session = json.loads((ROOT / 'tests/fixtures/left_feedback_stall_20260920.json').read_text())

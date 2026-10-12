@@ -22,7 +22,8 @@ class ReturnPlan:
 
 class ReturnPlanner:
     def __init__(self, lower, upper, check, *, timeout=5., max_nodes=5000,
-                 seed=0, step=np.deg2rad(4), cancelled=lambda: False):
+                 seed=0, step=np.deg2rad(4), cancelled=lambda: False,
+                 locked_joints=()):
         self.lower, self.upper = np.asarray(lower, float), np.asarray(upper, float)
         if (self.lower.shape != (7,) or self.upper.shape != (7,)
                 or not np.all(np.isfinite([self.lower, self.upper]))
@@ -31,6 +32,10 @@ class ReturnPlanner:
             raise ValueError("invalid return planner limits")
         self.check, self.timeout, self.max_nodes = check, timeout, max_nodes
         self.seed, self.step, self.cancelled = int(seed), step, cancelled
+        self.locked_joints = tuple(int(i) for i in locked_joints)
+        if len(set(self.locked_joints)) != len(self.locked_joints) or any(
+                i < 0 or i >= 7 for i in self.locked_joints):
+            raise ValueError("invalid locked planner joints")
 
     def plan(self, start, goal):
         deadline = time.monotonic() + self.timeout
@@ -42,6 +47,10 @@ class ReturnPlanner:
         def result(path=(), reason=""):
             return ReturnPlan(tuple(np.array(p, copy=True) for p in path), self.seed, nodes, reason)
         start, goal = np.asarray(start, float), np.asarray(goal, float)
+        if (start.shape == (7,) and goal.shape == (7,) and self.locked_joints
+                and not np.array_equal(start[list(self.locked_joints)],
+                                       goal[list(self.locked_joints)])):
+            return result(reason="locked joints differ between start and goal")
         for name, q in (("start", start), ("goal", goal)):
             if (q.shape != (7,) or not np.all(np.isfinite(q))
                     or np.any(q < self.lower) or np.any(q > self.upper)):
@@ -90,12 +99,16 @@ class ReturnPlanner:
         for tree in (a, b):
             root = tree[0][0]
             for joint in range(7):
+                if joint in self.locked_joints:
+                    continue
                 for sign in (-1, 1):
                     target = root.copy()
                     target[joint] = np.clip(target[joint]+sign*self.step, self.lower[joint], self.upper[joint])
                     extend(tree, target)
         while alive() and nodes < self.max_nodes:
-            target = b[0][0] if rng.random() < .2 else rng.uniform(self.lower, self.upper)
+            target = b[0][0].copy() if rng.random() < .2 else rng.uniform(self.lower, self.upper)
+            if self.locked_joints:
+                target[list(self.locked_joints)] = start[list(self.locked_joints)]
             ai, _ = extend(a, target)
             if ai is not None:
                 while alive() and nodes < self.max_nodes:

@@ -3,6 +3,7 @@
 Body's 24 joints cannot describe fingers. The Hand stream is sampled separately,
 with a per-hand SDK reception sequence (never the generic head/XR timestamp).
 """
+import time
 import numpy as np
 
 from esrobo_teleop.robot.linker_hand_driver import ACTIVE_HAND_JOINTS, ACTIVE_JOINT_LIMITS_RAD
@@ -19,6 +20,24 @@ def angle(a, b):
     return float(np.arccos(np.clip(unit(a) @ unit(b), -1., 1.)))
 
 
+def palm_basis(poses):
+    """Anatomical columns: normal, little-to-index, wrist-to-middle MCP.
+
+    Columns are vectors in the SDK tracking space, not quaternion axes. The
+    left hand's normal is mirrored, as is the URDF's index/little direction.
+    """
+    poses = np.asarray(poses, dtype=float)
+    if poses.shape != (26, 7) or not np.all(np.isfinite(poses)):
+        raise ValueError("PICO hand requires 26 finite xyz+xyzw poses")
+    forward = unit(poses[12, :3] - poses[1, :3])
+    lateral = unit(poses[7, :3] - poses[22, :3])
+    cross = np.cross(lateral, forward)
+    if np.linalg.norm(cross) < .5:
+        raise ValueError("degenerate PICO palm plane")
+    normal = unit(cross)
+    return np.column_stack((normal, np.cross(forward, normal), forward))
+
+
 def retarget_hand(poses):
     """Geometric curl/spread, invariant to world pose and left/right reflection.
 
@@ -32,10 +51,7 @@ def retarget_hand(poses):
     if np.any(np.linalg.norm(poses[:, 3:], axis=1) < .5):
         raise ValueError("invalid PICO hand orientation")
     p = poses[:, :3]
-    forward = unit(p[12] - p[1])
-    lateral = unit(p[7] - p[22])
-    normal = unit(np.cross(lateral, forward))
-    lateral = unit(np.cross(forward, normal))
+    normal, lateral, forward = palm_basis(poses).T
 
     def curl(indices):
         bones = np.diff(p[indices], axis=0)
@@ -66,38 +82,61 @@ class PicoHands:
         self.signatures = {}
         self.status = {}
 
+    def map_sample(self, side, sample, *, observed=None):
+        """Map an independent snapshot. SDK access stays with the owner thread."""
+        now = time.monotonic()
+        observed = now if observed is None else observed
+        sequence = int(sample["sequence"])
+        if not sample["active"] or sequence <= 0:
+            raise ValueError("PICO hand tracking inactive")
+        received_ns = int(sample.get("received_monotonic_ns", 0))
+        received = received_ns / 1e9 if received_ns else observed-float(sample["age_s"])
+        age = now-received
+        if not np.isfinite(age) or not 0 <= age <= .1:
+            raise ValueError("PICO Hand stream stale")
+        flags = np.asarray(sample["flags"], dtype=np.uint64)
+        if flags.shape != (26,) or np.any((flags & 3) != 3):
+            raise ValueError("PICO hand joints invalid/occluded")
+        if sequence <= self.last.get(side, 0):
+            self.status[side] = "waiting for new Hand sample"
+            return None
+        self.last[side] = sequence
+        timestamp = int(sample["timestamp_ns"])
+        if sample.get("freshness_source") == "component-packet":
+            # The SDK commits only complete, advancing same-packet
+            # component frames, including valid stationary poses.
+            signature = ("component-packet", int(sample["packet_timestamp_ns"]))
+        else:
+            signature = (("timestamp", timestamp) if timestamp > 0 else
+                         ("poses", tuple(np.asarray(sample["poses"]).ravel())))
+        if signature == self.signatures.get(side):
+            self.status[side] = "Hand timestamp/pose frozen"
+            return None
+        self.signatures[side] = signature
+        angles = retarget_hand(sample["poses"])
+        result = dict(joints=angles, sequence=sequence, age_s=age,
+                            sample_monotonic=received,
+                            palm_basis=palm_basis(sample["poses"]).tolist())
+        self.status[side] = "tracking"
+        # Mapping can take time: never send a result that expired during work.
+        age = time.monotonic() - received
+        if not 0 <= age <= .1:
+            raise ValueError("PICO Hand stream stale after mapping")
+        result["age_s"] = age
+        return result
+
     def poll(self, sdk):
-        """Return only new, valid sides. A missing side never gets mirrored."""
+        """Compatibility getter path, retaining real component freshness."""
         result = {}
         for side in ("left", "right"):
             try:
                 getter = getattr(sdk, f"get_{side}_hand_sample", None)
                 if getter is None:
                     raise ValueError("SDK needs per-hand sample extension; run install_pico.sh")
-                sample = getter()
-                sequence = int(sample["sequence"])
-                if not sample["active"] or sequence <= 0:
-                    raise ValueError("PICO hand tracking inactive")
-                age = float(sample["age_s"])
-                if not np.isfinite(age) or not 0 <= age <= .1:
-                    raise ValueError("PICO Hand stream stale")
-                flags = np.asarray(sample["flags"], dtype=np.uint64)
-                if flags.shape != (26,) or np.any((flags & 3) != 3):
-                    raise ValueError("PICO hand joints invalid/occluded")
-                if sequence <= self.last.get(side, 0):
-                    self.status[side] = "waiting for new Hand sample"
-                    continue
-                self.last[side] = sequence
-                timestamp = int(sample["timestamp_ns"])
-                signature = (("timestamp", timestamp) if timestamp > 0 else
-                             ("poses", tuple(np.asarray(sample["poses"]).ravel())))
-                if signature == self.signatures.get(side):
-                    self.status[side] = "Hand timestamp/pose frozen"
-                    continue
-                self.signatures[side] = signature
-                angles = retarget_hand(sample["poses"])
-                result[side] = dict(joints=angles, sequence=sequence, age_s=age)
-                self.status[side] = "tracking"
+                observed = time.monotonic()
+                mapped = self.map_sample(side, getter(), observed=observed)
+                if mapped is not None:
+                    result[side] = mapped
             except (ValueError, TypeError, KeyError, OverflowError) as exc:
                 self.status[side] = str(exc)
         return result

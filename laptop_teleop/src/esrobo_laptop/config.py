@@ -29,6 +29,12 @@ class Settings:
     arm_rate_tolerance_hz: float = 5
     hand_only_rate_tolerance_hz: float = 5
     control_gap_timeout_s: float = 0.08
+    input_hold_after_s: float = 0.04
+    input_hold_max_s: float = 0.5
+    input_resume_frames: int = 3
+    input_resume_arm_delta_deg: float = 5.0
+    input_resume_hand_delta_unit: int = 15
+    pico_wrist_max_angle_deg: float = 180.0
 
     def validate(self):
         if self.side not in ("left", "right", "both"):
@@ -50,6 +56,15 @@ class Settings:
                 and 1 <= self.minimum_control_rate_hz <= self.rate_hz <= 50
                 and 1/self.minimum_control_rate_hz < self.control_gap_timeout_s <= self.input_max_age_s):
             raise ValueError("invalid freshness or rate limits")
+        if not (0 < self.input_hold_after_s < self.control_gap_timeout_s
+                and self.input_max_age_s < self.input_hold_max_s <= .5
+                and type(self.input_resume_frames) is int and 3 <= self.input_resume_frames <= 5
+                and 0 < self.input_resume_arm_delta_deg <= 5
+                and type(self.input_resume_hand_delta_unit) is int
+                and 0 < self.input_resume_hand_delta_unit <= 15):
+            raise ValueError("invalid bounded input hold limits")
+        if not (0 < self.pico_wrist_max_angle_deg <= 180.0):
+            raise ValueError("PICO wrist mapping angle must stay within 0..60 degrees")
         if self.hand_only and not (0 <= self.hand_only_rate_tolerance_hz <= 5
                                    and self.minimum_control_rate_hz-self.hand_only_rate_tolerance_hz >= 35):
             raise ValueError("hand-only sustained control rate must remain at least 35 Hz")

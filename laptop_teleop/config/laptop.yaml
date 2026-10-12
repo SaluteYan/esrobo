@@ -22,3 +22,6 @@ arm_rate_tolerance_hz: 5
 # Hand-only mode checks a two-second average; 40 - 5 = 35 Hz stop threshold.
 hand_only_rate_tolerance_hz: 5
 control_gap_timeout_s: 0.08
+# Legacy compatibility setting. Absolute PICO palm control has no SO(3)
+# magnitude or combined joint-norm cap; bounded IK enforces each joint limit.
+pico_wrist_max_angle_deg: 180.0

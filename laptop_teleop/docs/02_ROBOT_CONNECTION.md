@@ -1,48 +1,22 @@
-# 网络、SSH 与机器人网关
+# 两机连接与机器人服务
 
-当前网络检查结果：本机 `enp12s0=192.168.10.101/24`，机器人 `192.168.10.100` 可达（约 0.2 ms）。2026-09-22 已在本机创建 `~/.config/esrobo/robot-link.key` 并安全复制到机器人，两端权限均为 `600`。
+本文负责网络、认证和服务部署。环境安装见 [本机 README](../README.md#环境安装与配置)，日常控制顺序见 [运行手册](03_OPERATION_RUNBOOK.md)。示例本机仓库为 `/home/ddc/DualArmTeleoperation`，机器人仓库为 `/home/esrobo/Projects/esrobo`；新部署按实际路径修改。
 
-同日机器人已在三个 tmux 会话中启动 `esrobo_hands`、`esrobo_hand_bridge` 和 `esrobo_gateway`。网关保持 `IDLE`，双手及双臂七轴反馈均有效；右臂正常失能，左臂控制器报告继承的 `EMERGENCY_STOP`，七轴已确认失能。在现场按厂家流程解除左臂急停并重新执行只读检查前，不得向网关输入 `e`。
+## 网络与 SSH
 
-## 1. 网络检查
-
-把本机连接到机器人局域网。机器人固定地址为 `192.168.10.100`；当前本机有线网卡 `enp12s0` 已配置为 `192.168.10.101/24`，并已实测可 ping 通机器人。先查看连接名：
+机器人默认地址为 `192.168.10.100`，运动协议使用 UDP `16000`。头显应连接运行 PC Service 的本机局域网地址，不能填写机器人地址或 `127.0.0.1`。
 
 ```bash
-nmcli connection show
 ip -br address
-```
-
-需要设置静态地址时，把 `<连接名>` 替换为实际值：
-
-```bash
-sudo nmcli connection modify "<连接名>" ipv4.method manual \
-  ipv4.addresses 192.168.10.101/24 ipv4.gateway "" ipv4.dns ""
-sudo nmcli connection up "<连接名>"
 ping -c 3 192.168.10.100
-```
-
-如果该网卡还承担上网任务，不要随意覆盖现有配置；可以为机器人网口新建独立 NetworkManager 连接。
-
-## 2. SSH
-
-机器人用户名以现场实际账户为准，下文用 `esrobo`：
-
-```bash
 ssh esrobo@192.168.10.100
 ```
 
-可选地安装本机公钥，之后无需反复输入机器人密码：
+需要独立机器人网口时，可配置本机 `192.168.10.101/24`；先核对网卡和现有连接，避免覆盖上网配置。网页使用本机 `~/.ssh/known_hosts`，不自动信任未知主机。首次连接或机器人重装后须核对主机指纹。可用 `ssh-copy-id` 安装公钥，网页 SSH 密码仅用于当前连接。
 
-```bash
-ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -C esrobo-laptop
-ssh-copy-id -i ~/.ssh/id_ed25519.pub esrobo@192.168.10.100
-ssh esrobo@192.168.10.100
-```
+## 通信共享密钥
 
-## 3. 配置通信共享密钥
-
-如果机器人已经部署 `~/.config/esrobo/robot-link.key`，优先把这份现有密钥安全复制到本机。先在本机确认文件：
+已有部署优先复制机器人现有密钥，避免让两端分别生成不同内容：
 
 ```bash
 mkdir -p ~/.config/esrobo
@@ -50,7 +24,7 @@ scp esrobo@192.168.10.100:~/.config/esrobo/robot-link.key ~/.config/esrobo/robot
 chmod 600 ~/.config/esrobo/robot-link.key
 ```
 
-如果两端都没有密钥，只在本机创建一次：
+仅在两端都没有密钥时创建一次，再安全复制到机器人同一路径：
 
 ```bash
 mkdir -p ~/.config/esrobo
@@ -59,86 +33,63 @@ scp ~/.config/esrobo/robot-link.key esrobo@192.168.10.100:/tmp/robot-link.key
 ssh esrobo@192.168.10.100 'mkdir -p ~/.config/esrobo && mv /tmp/robot-link.key ~/.config/esrobo/robot-link.key && chmod 600 ~/.config/esrobo/robot-link.key'
 ```
 
-密钥不能写入 YAML、命令历史参数、日志或仓库。两端内容必须完全相同：
+密钥、SSH 密码和会话令牌不能提交到仓库或写入诊断记录。HMAC 验证消息真实性，不加密运动数据。
+
+## 同步版本与配置
+
+本机和机器人须同步 `robot_link`、`teleoperation/src`、机器人 YAML、URDF 及相应驱动修改。只更新网页不会让已运行网关加载新源码。
 
 ```bash
-sha256sum ~/.config/esrobo/robot-link.key
-ssh esrobo@192.168.10.100 'sha256sum ~/.config/esrobo/robot-link.key'
-```
-
-## 4. 同步代码与配置
-
-机器人上应有同一版本仓库。查看双方提交：
-
-```bash
-cd /home/ddc/DualArmTeleoperation && git rev-parse HEAD
+git rev-parse HEAD
 ssh esrobo@192.168.10.100 'cd /home/esrobo/Projects/esrobo && git rev-parse HEAD'
 ```
 
-本机和机器人必须使用相同的 `teleoperation/config/teleop_config.yaml`、URDF、`robot_link` 协议代码。合同指纹不一致时客户端会拒绝发送。
+配置/URDF 指纹和接管协议由客户端检查。出现 fingerprint mismatch 时同步双方配置及模型，在现场确认停止和失能后重启网关；不绕过合同检查。机器人端 LinkerHand ROS 源码更新后还需重新构建该包并加载新的 `install/setup.bash`。
 
-## 5. 机器人端启动
+## 机器人端启动
 
-登录机器人并进入仓库：
+推荐在网页按所选模式启动服务。命令行替代流程如下；不要与网页启动的同名服务并行。
+
+CAN 未就绪时，先确认机械臂停止且失能、相关驱动已退出，再执行：
 
 ```bash
-ssh esrobo@192.168.10.100
 cd /home/esrobo/Projects/esrobo
-```
-
-先按机器人端文档初始化 CAN、启动双手底层驱动与一个双手桥：
-
-```bash
 ./start_can.sh
 ip -br link show type can
+```
+
+CAN 端口命名和 USB 位置见 [硬件调试文档](../../HARDWARE_BRINGUP.md#can-和串口设备)。初始化 CAN 不会清除控制器电子急停。
+
+带手模式先启动双手 ROS 驱动，再启动唯一的双手桥，各占一个终端：
+
+```bash
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 ros2 launch linker_hand_ros2_sdk linker_hand_double.launch.py
 ```
 
-双手 UDP/ROS 桥另开机器人终端：
-
 ```bash
-cd /home/esrobo/Projects/esrobo
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 python3 teleoperation/bridges/hand_ros_bridge.py --side both
 ```
 
-再开机器人网关终端：
+另一个终端启动所选侧网关，例为右臂＋右手：
 
 ```bash
-cd /home/esrobo/Projects/esrobo
 PYTHONPATH="$PWD/robot_link:$PWD/teleoperation/src" \
   /home/esrobo/miniconda3/envs/teleop_esrobo/bin/python \
-  -m esrobo_link.gateway --hardware --side both --bind 192.168.10.100 \
-  --config "$PWD/teleoperation/config/teleop_config.yaml" \
+  -m esrobo_link.gateway --hardware --side right --with-hand \
+  --bind 192.168.10.100 --config "$PWD/teleoperation/config/teleop_config.yaml" \
   --key-file ~/.config/esrobo/robot-link.key
 ```
 
-网关必须先保持 `IDLE`。不要在机器人上同时运行旧遥操作入口、另一个网关或第二个双手桥。详细硬件门禁与恢复命令以机器人端 [`../../robot_link/README.md`](../../robot_link/README.md) 为准。
+左右模式及仅手参数见 [本机 README](../README.md#运行模式)。网关持有机械臂驱动，不同时运行另一个网关、旧遥操作入口或独立机械臂控制进程。双臂自动回零/准备因缺少互碰扫掠核验而被拒绝。
 
-当前部署使用 tmux 保持三个进程，SSH 断开后仍继续运行。查看会话：
-
-```bash
-ssh esrobo@192.168.10.100
-tmux ls
-tmux attach -t esrobo_hands
-tmux attach -t esrobo_hand_bridge
-tmux attach -t esrobo_gateway
-```
-
-从 tmux 会话退出但不停止进程，按 `Ctrl+B`，松开后按 `D`。网关终端的 `e/s/x/d/q` 都必须按 Enter；当前左臂急停未解除时不得输入 `e`。日志位于机器人仓库的 `robot_link/log/`。
-
-## 6. 本机只读验证
-
-机器人网关为 `IDLE` 时，在本机执行：
+## 本机只读验证
 
 ```bash
-cd /home/ddc/DualArmTeleoperation
-./laptop_teleop/scripts/run_laptop.sh inspect
+./laptop_teleop/scripts/run_laptop.sh inspect --side right
 ```
 
-输出应包含已验证的合同、`IDLE` 状态以及左右七轴和双手反馈。`inspect` 会短暂占用唯一会话，退出后等待至少 1 秒再启动正式计算端。
-
-当前已验证的合同 ID 为 `734c63758a78df184838fa603454556387402e33c00eb29b129d74bd000f21ca`。若 `controller_fault.status_name` 为 `EMERGENCY_STOP`，不得反复启动客户端或输入 `e`；先保持七轴失能，排除实体急停、接触、线缆和控制器原因，按厂家流程复位，再重新运行 `inspect`，直到两侧 `controller_fault` 均为 `null`。
+核对合同、网关模式、控制器故障、七轴使能和反馈年龄。`inspect` 会短暂占用会话，退出后等待会话释放再启动正式计算。`IDLE`、tmux 存在或启动命令成功均不能替代新鲜反馈；急停恢复见 [网页恢复操作](05_WEB_CONSOLE.md#停止与受检恢复)。

@@ -2,6 +2,9 @@
 import argparse
 import json
 import socket
+import secrets
+import math
+import copy
 import threading
 import time
 
@@ -26,6 +29,9 @@ class Gateway:
         self.network_done = threading.Event()
         self.mode = "IDLE"
         self.reason = "local e required; no automatic enable"
+        self.first_fault_reason = None
+        self.first_fault_summary = None
+        self._fault_event_pending = None
         self.pending = None
         self.stop_pending = False
         self.stop_send_returned = None
@@ -38,6 +44,54 @@ class Gateway:
         self.journal = journal
         self._last_record = None
         self._record_time = 0.0
+        self.entry_target = None
+        self.entry_token = ""
+        self.entry_plan_token = ""
+        self.entry_candidate_since = None
+        self.entry_ready_deadline = None
+        self.operator_result = dict(seq=0, action="", accepted=False, message="")
+        self._last_state_send_at = None
+        self.state_send_gap_s = None
+        self.state_send_gap_max_s = 0.0
+        self.state_send_gaps_over_80ms = 0
+
+    def record_operator_result(self, action, accepted, message=""):
+        with self.lock:
+            self.operator_result = dict(seq=self.operator_result["seq"] + 1,
+                                        action=action, accepted=bool(accepted),
+                                        message=str(message)[:240])
+
+    @staticmethod
+    def fault_summary(diagnostics):
+        """Small, persistent status view of the exact frame kept in the journal."""
+        if not isinstance(diagnostics, dict):
+            return None
+        if "fault_context" not in diagnostics:
+            for side in ("left", "right"):
+                summary = Gateway.fault_summary(diagnostics.get(side))
+                if summary:
+                    return dict(side=side, **summary)
+            return None
+        context = diagnostics["fault_context"]
+        if not isinstance(context, dict):
+            return None
+        joints = context.get("failed_joints") or []
+        summary = dict(fault=diagnostics.get("fault"),
+                       failed_joints=joints, feedback_dt_s=context.get("feedback_dt_s"))
+        if joints and isinstance(joints[0], int):
+            index = joints[0] - 1
+            for name in ("target_physical_rad", "previous_command_physical_rad",
+                         "feedback_physical_rad", "previous_velocity_physical_rad_s",
+                         "feasible_velocity_lower_rad_s", "feasible_velocity_upper_rad_s",
+                         "lead_rad", "lead_limit_rad"):
+                values = context.get(name)
+                if isinstance(values, list) and 0 <= index < len(values):
+                    summary[name] = values[index]
+        return summary
+
+    def entry_execution_diagnostics(self):
+        getter = getattr(self.backend, 'entry_execution_diagnostics', None)
+        return getter() if callable(getter) else None
 
     def record(self):
         """5 Hz diagnostic snapshots plus state changes; never log key/lease."""
@@ -45,38 +99,139 @@ class Gateway:
             return
         now = time.monotonic()
         with self.lock:
-            identity = (self.mode, self.reason, self.stop_send_returned, self.disable_verified)
-            if identity == self._last_record and now - self._record_time < .2:
+            identity = (self.mode, self.reason, self.stop_send_returned,
+                        self.disable_verified, self.operator_result["seq"], self.first_fault_reason)
+            fault_event = self._fault_event_pending
+            if fault_event is None and identity == self._last_record and now - self._record_time < .2:
                 return
             entry = dict(unix_ns=time.time_ns(), monotonic_s=now, mode=self.mode,
                          reason=self.reason, contract_id=self.backend.contract["id"],
+                         journal_path=getattr(self.journal, "name", None),
+                         first_fault_reason=self.first_fault_reason,
+                         first_fault_summary=self.first_fault_summary,
                          accepted_seq=self.gate.sequence, target=self.gate.target,
+                         entry_plan_target=self.entry_target,
                          target_remaining_s=max(0.0, self.gate.deadline-now),
                          feedback=self.feedback, stop_send_returned=self.stop_send_returned,
                          disable_verified=self.disable_verified, recovery_supported=True,
                          feedback_cache_age_s=None if self.feedback_time is None else now-self.feedback_time,
+                         state_send_gap_s=self.state_send_gap_s,
+                         state_send_gap_max_s=self.state_send_gap_max_s,
+                         state_send_gaps_over_80ms=self.state_send_gaps_over_80ms,
+                         state_send_idle_s=(None if self._last_state_send_at is None
+                                            else now-self._last_state_send_at),
                          rejected_packets=self.rejected_packets, last_rejection=self.last_rejection,
-                         last_return=self.last_return)
+                         last_return=self.last_return, entry_token=self.entry_token,
+                         entry_protocol=self.backend.contract.get("entry_protocol"),
+                         input_hold_protocol=self.backend.contract.get("input_hold_protocol"),
+                         input_hold_age_s=(None if self.gate.hold_started_at is None else
+                                           now-self.gate.hold_started_at),
+                         hold_reason=(self.gate.target.get("hold_reason", "input")
+                                      if self.gate.target and self.gate.target.get("hold") else None),
+                         position_hold_age_s=(None if self.gate.position_hold_started_at is None else
+                                              now-self.gate.position_hold_started_at),
+                         operator_result=self.operator_result,
+                         entry_ready=(self.mode == "CALIBRATING" and self.entry_candidate_since is not None
+                                      and now-self.entry_candidate_since >= .5 and self.gate.fresh(now)
+                                      and self.entry_matches(self.gate.target, distance=.01, joint_limit_deg=.5)))
+            entry.update(self.entry_liveness(now))
+            entry["entry_execution"] = self.entry_execution_diagnostics()
+        if fault_event is not None:
+            self.journal.write(json.dumps(fault_event, allow_nan=False) + "\n")
         self.journal.write(json.dumps(entry, allow_nan=False) + "\n")
         self.journal.flush()
-        self._last_record, self._record_time = identity, now
-
-    def trip(self, reason):
         with self.lock:
+            if self._fault_event_pending is fault_event:
+                self._fault_event_pending = None
+            self._last_record, self._record_time = identity, now
+
+    def trip(self, reason, *, verified_disabled=False):
+        with self.lock:
+            self.entry_plan_token = ""
             self.cancelled.set()
+            intentional_stop = reason.startswith(("operator requested ", "laptop requested stop"))
             if self.mode != "FAULT":
-                self.stop_pending = self.mode in ("ACTIVE", "ARMING", "RETURNING")
+                self.stop_pending = self.stop_pending or (not verified_disabled and self.mode in (
+                    "ACTIVE", "ARMING", "RETURNING", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET"))
                 self.stop_send_returned = None
                 self.disable_verified = None
-            self.mode, self.reason = "FAULT", reason
+            if not intentional_stop and self.first_fault_reason is None:
+                try:
+                    diagnostics = copy.deepcopy(getattr(self.backend, "fault_diagnostics", lambda: None)())
+                except Exception as exc:
+                    diagnostics = {"capture_error": f"{type(exc).__name__}: {exc}"}
+                self.first_fault_reason = reason
+                self.first_fault_summary = self.fault_summary(diagnostics)
+                self._fault_event_pending = dict(
+                    record_type="first_fault", unix_ns=time.time_ns(),
+                    monotonic_s=time.monotonic(), mode_before=self.mode,
+                    reason=reason, contract_id=self.backend.contract["id"],
+                    accepted_seq=self.gate.sequence,
+                    target=copy.deepcopy(self.gate.target),
+                    feedback=copy.deepcopy(self.feedback),
+                    diagnostics=diagnostics)
+            if self.mode != "FAULT" or (not intentional_stop and self.first_fault_reason == reason):
+                self.reason = reason
+            self.mode = "FAULT"
             if self.pending not in ("d", "dl", "dr", "dh"):
                 self.pending = None
         self.backend.cancel()  # Only sets an Event; never performs network/CAN I/O.
 
     def watchdog(self):
         with self.lock:
-            if self.mode in ("ACTIVE", "ARMING") and not self.gate.fresh(time.monotonic()):
+            if (self.mode == "ACTIVE" and self.gate.hold_started_at is not None
+                    and time.monotonic()-self.gate.hold_started_at > .5):
+                self.trip("input hold exceeded 500 ms; explicit local recovery required")
+            if (self.mode == "CALIBRATING" and self.backend.contract.get("entry_protocol") in (1, 2, 3, 4, 5, 6)
+                    and (not self.gate.fresh(time.monotonic())
+                         or self.gate.target.get("entry", {}).get("phase") != "candidate")):
+                if self.backend.contract.get("entry_protocol") == 1:
+                    self.entry_target = None
+                self.entry_candidate_since = None
+            if self.mode in ("ACTIVE", "ARMING", "CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET") and not self.gate.fresh(time.monotonic()):
                 self.trip("joint target lease expired; explicit local recovery required")
+            if self.mode in ("CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET"):
+                if not self.entry_matches(self.gate.target):
+                    self.trip("handover target/reference changed or input expired")
+                elif (self.entry_ready_deadline is not None
+                      and time.monotonic() > self.entry_ready_deadline):
+                    self.trip("fresh ACTIVE target acknowledgment timed out")
+
+    def entry_matches(self, target, *, distance=.02, joint_limit_deg=2.):
+        reference = self.entry_target
+        if reference is None or target is None:
+            return False
+        entry = target.get("entry", {})
+        if entry.get("phase") not in ("candidate", "ready"):
+            return False
+        source = entry.get("source")
+        if not isinstance(source, list) or len(source) != 9:
+            return False
+        protocol = self.backend.contract.get("entry_protocol")
+        baseline = (reference["entry"]["reference_source"]
+                    if protocol in (2, 3, 4, 5, 6)
+                    else reference["entry"]["source"])
+        if protocol in (2, 3, 4, 5, 6):
+            supplied = entry.get("reference_source")
+            if supplied is None or max(abs(a-b) for a,b in zip(supplied, baseline)) > 1.0e-6:
+                return False
+        if protocol not in (3, 4, 5, 6):
+            for offset in (0, 3, 6):
+                if math.dist(source[offset:offset+3], baseline[offset:offset+3]) > distance:
+                    return False
+        if max(abs(a-b) for a,b in zip(reference["arm_urdf_rad"], target["arm_urdf_rad"])) > math.radians(joint_limit_deg):
+            return False
+        if reference.get("hand_unit") is not None:
+            if max(abs(a-b) for a,b in zip(reference["hand_unit"], target["hand_unit"])) > 5:
+                return False
+        return True
+
+    def start_approach(self):
+        with self.lock:
+            if self.motion_cancelled():
+                raise RuntimeError("handover cancelled after planning")
+            self.mode = "APPROACHING"
+            self.reason = "完整路径已认证；正在慢速移动至标定目标，保持 PICO 追踪，抵达后再跟随实时姿态"
 
     def request(self, action):
         """Only the robot operator calls enable/disable/return; the wire supports STOP only."""
@@ -103,8 +258,27 @@ class Gateway:
                 if self.mode != "IDLE" or self.pending or not self.gate.fresh(time.monotonic()):
                     raise RuntimeError("e requires IDLE and a fresh input/feedback stream")
                 self.cancelled.clear()
+                self.entry_target, self.entry_candidate_since = None, None
+                self.entry_token, self.entry_ready_deadline = "", None
+                self.entry_plan_token = ""
+                self.gate.last_entry_keepalive_at = None
                 self.pending, self.mode = "p", "RETURNING"
-                self.reason = "returning robot arm and hand to verified zero"
+                self.reason = "returning arm to verified zero; attached hand remains at measured position"
+            elif action == "g":
+                if (self.backend.contract.get("entry_protocol") not in (1, 2, 3, 4, 5, 6)
+                        or self.mode != "CALIBRATING" or self.pending
+                        or not self.gate.fresh(time.monotonic())
+                        or not self.entry_matches(self.gate.target, distance=.01, joint_limit_deg=.5)
+                        or self.entry_candidate_since is None
+                        or time.monotonic()-self.entry_candidate_since < .5):
+                    raise RuntimeError("检查并接管需要标定完成、持续新鲜且稳定至少 0.5 秒的完整目标")
+                if self.backend.contract.get("entry_protocol") not in (3, 4, 5, 6):
+                    self.entry_target = copy.deepcopy(self.gate.target)
+                self.pending, self.mode = "h", "CHECKING_ENTRY"
+                self.entry_plan_token = secrets.token_hex(16)
+                self.gate.last_entry_keepalive_at = None
+                self.entry_token = ""
+                self.reason = "正在检查标定目标并规划外展路径；机器人仍失能"
             elif action == "z":
                 if not getattr(self.backend, "supports_return", True):
                     raise RuntimeError("z unavailable in hand-only mode or without an inter-arm return checker; no motion sent")
@@ -113,7 +287,11 @@ class Gateway:
                 self.cancelled.clear()
                 self.pending, self.mode = "z", "RETURNING"
             elif action == "r":
-                if self.mode != "FAULT" or self.pending or self.stop_pending or self.stop_send_returned is False:
+                inherited_fault = (self.mode == "IDLE" and
+                                   bool(self.feedback.get("controller_fault") or
+                                        self.feedback.get("driver_fault")))
+                if ((self.mode != "FAULT" and not inherited_fault)
+                        or self.pending or self.stop_pending or self.stop_send_returned is False):
                     raise RuntimeError("recovery requires a stopped FAULT gateway")
                 if getattr(self.backend, "hand_only", False):
                     self.cancelled.clear()
@@ -126,7 +304,21 @@ class Gateway:
                 else:
                     raise RuntimeError("dual-arm recovery requires the supervised inter-arm procedure; no motion sent")
             else:
-                raise ValueError("keys: e prepare+enable, s/x stop, d all, dl left, dr right, dh hands, r recover, z return, q exit")
+                raise ValueError("keys: e prepare, g check+approach, s/x stop, d all, dl left, dr right, dh hands, r recover, z return, q exit")
+
+    def accept_command(self, message, peer, now):
+        """Called under lock; a delayed keepalive cannot cross into ACTIVE."""
+        if message.get("type") == "hold" and self.mode != "ACTIVE":
+            raise ProtocolError("hold requires an active arm session")
+        token = (self.entry_plan_token if self.mode in
+                 ("CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET") else None)
+        return self.gate.accept(message, peer, now, entry_plan_token=token)
+
+    def entry_liveness(self, now):
+        last = self.gate.last_entry_keepalive_at
+        return dict(entry_keepalive_protocol=self.backend.contract.get("entry_keepalive_protocol"),
+                    entry_plan_token=self.entry_plan_token,
+                    entry_keepalive_age_s=None if last is None else max(0., now-last))
 
     def network_loop(self):
         next_state = 0.0
@@ -141,11 +333,14 @@ class Gateway:
                         now = time.monotonic()
                         if message.get("type") == "hello":
                             self.gate.hello(message, peer, now,
-                                            self.mode in ("ACTIVE", "ARMING", "RETURNING", "RECOVERING", "CALIBRATING"))
+                                            self.mode in ("ACTIVE", "ARMING", "RETURNING", "RECOVERING", "CALIBRATING", "CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET"))
                         else:
-                            if message.get("type") == "hold" and self.mode != "ACTIVE":
-                                raise ProtocolError("hold requires an active arm session")
-                            kind = self.gate.accept(message, peer, now)
+                            kind = self.accept_command(message, peer, now)
+                            if (kind == "target" and self.backend.contract.get("entry_protocol") in (1, 2, 3, 4, 5, 6)
+                                    and self.mode == "ACTIVE"):
+                                entry = self.gate.target.get("entry", {})
+                                if entry.get("phase") not in ("ready", "active") or entry.get("token") != self.entry_token:
+                                    self.trip("invalid ACTIVE handover token/phase")
                             if kind == "stop":
                                 self.trip("laptop requested stop")
                                 self.stop_pending = True
@@ -171,14 +366,37 @@ class Gateway:
                         status = dict(mode=self.mode, reason=self.reason,
                                       feedback=self.feedback,
                                       feedback_cache_age_s=None if self.feedback_time is None else now - self.feedback_time,
+                                      state_send_gap_s=self.state_send_gap_s,
+                                      state_send_gap_max_s=self.state_send_gap_max_s,
                                       stop_send_returned=self.stop_send_returned,
                                       disable_verified=self.disable_verified, recovery_supported=True,
                                       rejected_packets=self.rejected_packets, last_rejection=self.last_rejection,
-                                      last_return=self.last_return)
+                                      last_return=self.last_return, entry_token=self.entry_token,
+                                      entry_protocol=self.backend.contract.get("entry_protocol"),
+                                      input_hold_protocol=self.backend.contract.get("input_hold_protocol"),
+                                      input_hold_age_s=(None if self.gate.hold_started_at is None else
+                                                        now-self.gate.hold_started_at),
+                                      hold_reason=(self.gate.target.get("hold_reason", "input")
+                                                   if self.gate.target and self.gate.target.get("hold") else None),
+                                      position_hold_age_s=(None if self.gate.position_hold_started_at is None else
+                                                           now-self.gate.position_hold_started_at),
+                                      entry_ready=(self.mode == "CALIBRATING" and self.entry_candidate_since is not None
+                                                   and now-self.entry_candidate_since >= .5 and self.gate.fresh(now)
+                                                   and self.entry_matches(self.gate.target, distance=.01, joint_limit_deg=.5)))
+                        status.update(self.entry_liveness(now))
+                        status["entry_execution"] = self.entry_execution_diagnostics()
                         packet = pack(self.gate.state(now, status), self.key)
                         peer = self.gate.peer
                     try:
                         self.socket.sendto(packet, peer)
+                        sent_at = time.monotonic()
+                        with self.lock:
+                            if self._last_state_send_at is not None:
+                                gap = sent_at - self._last_state_send_at
+                                self.state_send_gap_s = gap
+                                self.state_send_gap_max_s = max(self.state_send_gap_max_s, gap)
+                                self.state_send_gaps_over_80ms += gap > .08
+                            self._last_state_send_at = sent_at
                     except OSError:
                         self.trip("feedback send failed")
         except Exception as exc:
@@ -195,8 +413,39 @@ class Gateway:
         with self.lock:
             if (self.mode == "CALIBRATING" and self.pending is None
                     and self.gate.target is not None and self.gate.fresh(time.monotonic())):
-                self.pending, self.mode = "e", "ARMING"
-                self.reason = "PICO preparation verified; enabling from matching zero target"
+                if self.backend.contract.get("entry_protocol") in (1, 2, 3, 4, 5, 6):
+                    if self.gate.target.get("entry", {}).get("phase") == "candidate":
+                        if self.backend.contract.get("entry_protocol") in (2, 3, 4, 5, 6) and self.entry_target is None:
+                            self.entry_target = copy.deepcopy(self.gate.target)
+                            self.entry_candidate_since = None
+                        if not self.entry_matches(self.gate.target, distance=.01, joint_limit_deg=.5):
+                            if self.backend.contract.get("entry_protocol") == 1:
+                                self.entry_target = copy.deepcopy(self.gate.target)
+                                self.entry_candidate_since = time.monotonic()
+                            else:
+                                self.entry_candidate_since = None
+                            self.reason = ("标定目标或参考字段不一致；接管暂缓"
+                                           if self.backend.contract.get("entry_protocol") in (3, 4, 5, 6) else
+                                           "PICO 已离开标定姿态或追踪波动；请回到标定姿态并保持稳定")
+                        elif self.entry_candidate_since is None:
+                            self.entry_candidate_since = time.monotonic()
+                            self.reason = "标定目标已锁定；等待新鲜目标连续 0.5 秒"
+                        elif time.monotonic() - self.entry_candidate_since >= .5:
+                            self.reason = ("标定目标已锁定；正在等待控制台自动提交受检接管"
+                                           if self.backend.contract.get("entry_protocol") in (2, 3, 4, 5, 6) else
+                                           "接管姿态已稳定；点击检查并接管，先规划后运动")
+                        else:
+                            self.reason = "等待接管目标连续稳定 0.5 秒"
+                else:
+                    self.pending, self.mode = "e", "ARMING"
+                    self.reason = "PICO preparation verified; enabling from matching zero target"
+            if (self.mode == "WAITING_FOR_ACTIVE_TARGET" and not self.pending
+                    and self.gate.fresh(time.monotonic())
+                    and (self.backend.contract.get("entry_keepalive_protocol") != 1
+                         or time.monotonic() < self.gate.target_deadline)
+                    and self.gate.target.get("entry", {}).get("phase") == "ready"
+                    and self.gate.target["entry"].get("token") == self.entry_token):
+                self.pending = "a"
             stop, self.stop_pending = self.stop_pending, False
             operation, self.pending = self.pending, None
             target = self.gate.target
@@ -229,13 +478,37 @@ class Gateway:
                 with self.lock:
                     self.last_return = result
                     if (not self.motion_cancelled() and result.get("returned")
-                            and result.get("disabled") and result.get("hands_open")):
+                            and result.get("disabled")
+                            and (result.get("hands_open") or result.get("hands_stationary"))):
                         self.mode = "CALIBRATING"
-                        self.reason = ("robot_zero_verified=True; waiting for raised-arm "
-                                       "and natural-open PICO pose")
+                        self.reason = ("robot_zero_verified=True; held hand unchanged; "
+                                       "waiting for complete PICO calibration pose")
                         self.gate.target, self.gate.deadline = None, 0.0
                     else:
                         raise RuntimeError(f"session preparation failed/cancelled: {result}")
+            elif operation == "h":
+                result = self.backend.approach_entry(self.entry_target, self.motion_cancelled,
+                                                     self.start_approach)
+                feedback = self.backend.snapshot()
+                with self.lock:
+                    if self.motion_cancelled():
+                        raise RuntimeError("handover interrupted before arrival")
+                    self.last_return = result
+                    self.feedback, self.feedback_time = feedback, time.monotonic()
+                    self.entry_ready_deadline = time.monotonic() + 2.
+                    self.entry_token = secrets.token_hex(16)
+                    self.mode = "WAITING_FOR_ACTIVE_TARGET"
+                    self.reason = "接管姿态已到位；等待新鲜目标连续性核验"
+            elif operation == "a":
+                self.check_ready_validity()
+                self.backend.activate_entry(target, self.motion_cancelled)
+                with self.lock:
+                    self.check_ready_validity()
+                    if self.motion_cancelled():
+                        raise RuntimeError("activation interrupted")
+                    self.entry_ready_deadline = None
+                    self.entry_plan_token = ""
+                    self.mode, self.reason = "ACTIVE", "safe handover complete; following fresh targets"
             elif operation == "e":
                 self.backend.enable(target, self.motion_cancelled)
                 with self.lock:
@@ -247,21 +520,46 @@ class Gateway:
                 with self.lock:
                     self.last_return = result
                     if not self.cancelled.is_set() and result["returned"] and result["disabled"]:
-                        self.mode, self.reason = "IDLE", "zero/disable verified; local e required"
+                        self.mode = "IDLE"
+                        self.reason = ("zero/hand-open/disable verified; local e required"
+                                       if result.get('hands_open') else
+                                       "zero/disable verified; local e required")
+                        self.first_fault_reason, self.first_fault_summary = None, None
                         self.gate.target, self.gate.deadline = None, 0.0
                     else:
-                        raise RuntimeError(f"return failed/cancelled: {result}")
+                        # A failed hand-open check before/after arm return
+                        # must remain FAULT, but need not re-latch E-stop on an
+                        # already healthy, freshly verified disabled arm. Never
+                        # suppress a pending explicit stop or uncertain state.
+                        verified_disabled = False
+                        if (result.get('disabled') and result.get('stage') in
+                                ('hand_open', 'hand_open_before_arm', 'hand_open_verify')):
+                            fresh = self.backend.snapshot()
+                            age = fresh.get('arm_feedback_age_s')
+                            q = fresh.get('arm_urdf_rad')
+                            verified_disabled = (
+                                fresh.get('enable_states') == [False]*7
+                                and not fresh.get('controller_fault') and not fresh.get('driver_fault')
+                                and isinstance(age, (int, float)) and 0 <= age <= .1
+                                and isinstance(q, list) and len(q) == 7
+                                and all(isinstance(v, (int, float)) and math.isfinite(v) for v in q))
+                            self.feedback, self.feedback_time = fresh, time.monotonic()
+                        self.trip(f"return failed/cancelled: {result}", verified_disabled=verified_disabled)
+                        return
             elif operation == "r":
                 result = self.backend.recover_idle()
                 with self.lock:
                     self.last_return = result
                     if not self.cancelled.is_set() and result.get("disabled") and result.get("hands_ready"):
                         self.mode, self.reason = "IDLE", "hand-only disable/feedback verified; local e required"
+                        self.first_fault_reason, self.first_fault_summary = None, None
                         self.gate.target, self.gate.deadline = None, 0.0
                     else:
                         raise RuntimeError(f"hand-only recovery failed/cancelled: {result}")
             with self.lock:
                 active, target = self.mode == "ACTIVE", self.gate.target
+            if self.mode == "WAITING_FOR_ACTIVE_TARGET":
+                self.backend.monitor_hold()
             if active:
                 if self.motion_cancelled():
                     return
@@ -273,18 +571,33 @@ class Gateway:
             self.trip(f"executor: {type(exc).__name__}: {exc}")
             # enable can fail after partially enabling hardware; stop even if
             # an asynchronous watchdog has already changed the state to FAULT.
-            if operation in ("e", "p"):
+            if operation in ("e", "p", "a"):
                 with self.lock:
                     self.stop_pending = True
 
+    def check_ready_validity(self):
+        if (self.backend.contract.get("entry_keepalive_protocol") == 1
+                and time.monotonic() >= self.gate.target_deadline):
+            raise RuntimeError("fresh ready acknowledgment expired during activation")
+
+    def diagnostic_loop(self):
+        # Planning can block the I/O worker for seconds. Keep dashboard phases
+        # visible without putting filesystem writes on the network watchdog.
+        try:
+            while not self.network_done.wait(.05):
+                self.record()
+        except Exception as exc:
+            self.trip(f"diagnostic writer failed: {exc}")
+
     def run(self):
+        logger = threading.Thread(target=self.diagnostic_loop, name="robot-link-journal", daemon=True)
+        logger.start()
         thread = threading.Thread(target=self.network_loop, name="robot-link-network", daemon=True)
         thread.start()
         try:
             while True:
                 started = time.monotonic()
                 self.tick()
-                self.record()
                 if self.shutdown.is_set():
                     break
                 time.sleep(max(0.0, .02 - (time.monotonic() - started)))
@@ -295,6 +608,7 @@ class Gateway:
             finally:
                 self.network_done.set()
                 thread.join(timeout=1)
+                logger.join(timeout=1)
                 self.socket.close()
                 self.backend.close()
 
@@ -340,7 +654,7 @@ def main():
         raise
     print(json.dumps(dict(listening=gateway.address, hardware=args.hardware,
                           contract=backend.contract), ensure_ascii=False), flush=True)
-    print("Robot terminal: e zero+PICO prepare+enable, s/x stop, d all disable, dl/dr arm disable, dh hands disable, r recover, z return, q exit (Enter required)", flush=True)
+    print("Robot terminal: e zero+PICO prepare, g check+approach, s/x stop, d all disable, dl/dr arm disable, dh hands disable, r recover, z return, q exit (Enter required)", flush=True)
     from pathlib import Path
     log_path = Path(args.log_file) if args.log_file else Path(__file__).resolve().parents[1] / "log" / f"gateway_{time.time_ns()}.jsonl"
     try:
@@ -355,10 +669,16 @@ def main():
     def console():
         import sys
         for line in sys.stdin:
+            action = line.strip()
             try:
-                gateway.request(line.strip())
+                gateway.request(action)
             except (ValueError, RuntimeError) as exc:
+                if action == "g":
+                    gateway.record_operator_result(action, False, str(exc))
                 print(f"REFUSED: {exc}", flush=True)
+            else:
+                if action == "g":
+                    gateway.record_operator_result(action, True, "接管请求已接受；正在检查目标和路径")
         gateway.request("q")  # Losing the operator terminal never leaves following active.
 
     import signal

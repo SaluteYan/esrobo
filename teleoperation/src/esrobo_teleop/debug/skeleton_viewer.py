@@ -6,6 +6,7 @@ from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 from pathlib import Path
 import socket
 import threading
@@ -42,9 +43,13 @@ class SkeletonViewerState:
         self._rotation = [float(value) for value in source_to_robot_rotation]
         self._diagnostics: dict[str, Any] | None = None
         self._diagnostics_monotonic = 0.0
+        self._acquisition_diagnostics = None
+        self._acquisition_diagnostics_monotonic = 0.0
 
     @staticmethod
     def _signature(packet: dict[str, Any]) -> tuple[Any, ...]:
+        if packet.get("body_freshness_source") == "component-packet":
+            return ("component-packet", int(packet["body_sample_sequence"]))
         frames = packet.get("frames", {})
         arm_points = []
         if isinstance(frames, dict):
@@ -55,17 +60,17 @@ class SkeletonViewerState:
                 frame = frames.get(name, {})
                 pos = frame.get("pos", []) if isinstance(frame, dict) else []
                 arm_points.extend(round(float(value), 5) for value in pos[:3])
-        body_timestamp = int(packet.get("xrt_body_timestamp_ns", 0))
-        joint_timestamp = int(packet.get("xrt_body_joint_timestamp_ns", 0))
-        timestamp = body_timestamp if body_timestamp > 0 else joint_timestamp
-        return (timestamp, *arm_points)
+        # Other legacy bridges have no component receipt sequence; this
+        # viewer-only fallback does not certify control input freshness.
+        return tuple(arm_points)
 
     def update(self, packet: dict[str, Any]) -> None:
         now = time.monotonic()
         signature = self._signature(packet)
         with self._lock:
             self._packet = packet
-            self._received_monotonic = now
+            # Show actual component receipt age, including SDK/polling delay.
+            self._received_monotonic = float(packet.get("body_sample_monotonic", now))
             if signature != self._last_signature:
                 self._source_updates.append(now)
                 self._last_signature = signature
@@ -79,7 +84,9 @@ class SkeletonViewerState:
             age_s = now - self._received_monotonic if packet is not None else None
             update_hz = 0.0
             if len(self._source_updates) >= 2:
-                elapsed = self._source_updates[-1] - self._source_updates[0]
+                # Include the silent tail: a past burst must not conceal a
+                # current reception gap behind a high displayed frequency.
+                elapsed = now - self._source_updates[0]
                 update_hz = (len(self._source_updates) - 1) / max(elapsed, 1.0e-9)
             return {
                 "connected": age_s is not None and age_s <= 0.5,
@@ -88,6 +95,9 @@ class SkeletonViewerState:
                 "source_to_robot_rotation": self._rotation,
                 "packet": packet,
                 "diagnostics": self._diagnostics,
+                "acquisition_diagnostics": self._acquisition_diagnostics,
+                "acquisition_diagnostics_age_ms": (None if self._acquisition_diagnostics is None
+                    else round((now-self._acquisition_diagnostics_monotonic)*1000., 1)),
                 "diagnostics_age_ms": (
                     None
                     if self._diagnostics is None
@@ -96,9 +106,21 @@ class SkeletonViewerState:
             }
 
     def update_diagnostics(self, diagnostics: dict[str, Any]) -> None:
+        now = time.monotonic()
+        generated = diagnostics.get('generated_monotonic_s', now)
+        if (type(generated) not in (int, float) or not math.isfinite(generated)
+                or not 0 <= generated <= now):
+            return
         with self._lock:
+            if self._diagnostics is not None and generated < self._diagnostics_monotonic:
+                return
             self._diagnostics = diagnostics
-            self._diagnostics_monotonic = time.monotonic()
+            self._diagnostics_monotonic = generated
+
+    def update_acquisition_diagnostics(self, diagnostics):
+        with self._lock:
+            self._acquisition_diagnostics = diagnostics
+            self._acquisition_diagnostics_monotonic = diagnostics['generated_monotonic_ns']/1e9
 
 
 class SkeletonViewerServer:

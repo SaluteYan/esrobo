@@ -12,58 +12,36 @@ bridge = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bridge)
 
 
-def packet(*, body=0, joint=0, xr=1, x=0.1):
-    return {
-        "xrt_body_timestamp_ns": body,
-        "xrt_body_joint_timestamp_ns": joint,
-        "xrt_timestamp_ns": xr,
-        "frames": {
-            "right_elbow": {
-                "pos": [x, 0.2, 0.3],
-                "quat_xyzw": [0.0, 0.0, 0.0, 1.0],
-            }
-        },
-    }
+def packet(*, sequence=1, x=0.1):
+    return {"body_sample_sequence": sequence,
+            "frames": {"right_elbow": {"pos": [x, .2, .3], "quat_xyzw": [0, 0, 0, 1]}}}
 
 
-def test_generic_xr_timestamp_does_not_make_cached_body_pose_fresh():
-    first = bridge._packet_signature(packet(xr=1))
-    second = bridge._packet_signature(packet(xr=2))
-    assert first == second
+def test_pose_change_cannot_renew_cached_body_sequence():
+    assert bridge._packet_signature(packet(x=.1)) == bridge._packet_signature(packet(x=.11))
 
 
-def test_pose_change_is_freshness_evidence_when_body_timestamps_are_missing():
-    first = bridge._packet_signature(packet(x=0.1))
-    second = bridge._packet_signature(packet(x=0.11))
-    assert first != second
-    assert first[0] == "pose-change"
+def test_static_pose_advances_with_new_component_sequence():
+    assert bridge._packet_signature(packet(sequence=1)) != bridge._packet_signature(packet(sequence=2))
 
 
-def test_body_and_joint_timestamps_take_precedence_over_generic_xr_timestamp():
-    assert bridge._packet_signature(packet(body=10, xr=1)) == ("body-timestamp", 10)
-    assert bridge._packet_signature(packet(joint=20, xr=1)) == ("joint-timestamp", 20)
+def test_receipt_sequence_is_required():
+    import pytest
+    with pytest.raises(KeyError):
+        bridge._packet_signature({"frames": {}})
 
 
-def test_packet_ignores_unrelated_joint_timestamp_for_arm_freshness():
+def test_packet_uses_atomic_sample_without_legacy_timestamp_getters():
     class FakeXrt:
-        def is_body_data_available(self):
-            return True
-
-        def get_body_joints_pose(self):
-            return [[0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0] for _ in range(24)]
-
-        def get_body_timestamp_ns(self):
-            return 0
-
+        def get_body_sample(self):
+            return dict(valid=True, sequence=3, age_s=.01, packet_timestamp_ns=999,
+                        poses=[[.1, .2, .3, 0., 0., 0., 1.] for _ in range(24)])
         def get_time_stamp_ns(self):
-            return 999
-
-        def get_body_joints_timestamp(self):
-            result = [0] * 24
-            result[2] = 123  # A non-arm cache entry must not refresh teleoperation.
-            return result
-
+            raise AssertionError("global XR timestamp must not be read")
     built, valid = bridge._build_packet(FakeXrt(), 1, False)
     assert valid == 24
-    assert built["xrt_body_joint_timestamp_ns"] == 0
-    assert built["body_freshness_source"] == "pose-change"
+    assert built["xrt_body_packet_timestamp_ns"] == 999
+    assert built["body_sample_sequence"] == 3
+    assert built["body_freshness_source"] == "component-packet"
+    assert "xrt_body_timestamp_ns" not in built
+    assert "xrt_body_joint_timestamp_ns" not in built

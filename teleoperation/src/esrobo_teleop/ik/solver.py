@@ -88,6 +88,11 @@ class IkSolver:
         if not np.isfinite(margin_deg) or not 0.0 < margin_deg <= 1.0:
             raise ValueError("position-limit hold feedback margin must be in (0, 1] deg")
         self._position_limit_hold_feedback_margin = np.deg2rad(margin_deg)
+        # Alternate elbow-branch retries are expensive near a hard joint bound.
+        # While an already verified limit hold is active, retry them periodically
+        # rather than on every fresh PICO frame. The primary bounded solve still
+        # runs every frame so a newly reachable target is accepted immediately.
+        self._limit_hold_retry_count = 0
         recovery_error = float(cfg.position_limit_recovery_error_m)
         recovery_frames = int(cfg.position_limit_recovery_frames)
         if (not np.isfinite(recovery_error) or not 0.0 < recovery_error < 0.03
@@ -117,12 +122,15 @@ class IkSolver:
         sl = slice(offset, offset + 7)
         return self._position_lower[sl].copy(), self._position_upper[sl].copy()
 
+    def _diagnostic_print(self, *args, **kwargs):
+        return (getattr(self, 'diagnostic_message_sink', None) or print)(*args, **kwargs)
+
     def _report_solve_failure(self) -> None:
         """Report one state transition without flooding the operator terminal."""
         if self._solve_failure_active:
             return
         self._solve_failure_active = True
-        print(
+        self._diagnostic_print(
             "[ik] solve unavailable; retaining the last accepted command. "
             "Repeated solve messages are suppressed until recovery.",
             flush=True,
@@ -132,7 +140,7 @@ class IkSolver:
         if not self._solve_failure_active:
             return
         self._solve_failure_active = False
-        print("[ik] solve recovered.", flush=True)
+        self._diagnostic_print("[ik] solve recovered.", flush=True)
 
     def _make_config(self, arm_joint_pos: np.ndarray):
         from pink import Configuration
@@ -323,6 +331,13 @@ class IkSolver:
         else:
             self._prev_targets[offset:offset + 7] = measured[offset:offset + 7]
 
+    def reset_command_seed(self, measured):
+        """Retain calibrated elbow/observability references across planned handover."""
+        measured = np.asarray(measured, dtype=float)
+        if measured.shape != (14,) or not np.all(np.isfinite(measured)):
+            raise ValueError("expected fourteen finite measured joints")
+        self._prev_targets = measured.copy()
+
     def reset_j3_observability_baseline(self, side: str) -> None:
         """Clear a side's J3/J4 session references before live arming."""
         if side not in ("left", "right"):
@@ -333,7 +348,8 @@ class IkSolver:
         if hasattr(self, "_segment_bend_baseline"):
             self._segment_bend_baseline[side] = None
 
-    def _solve_partitioned_positions(self, side, measured, elbow_pose, wrist_pose, terminal):
+    def _solve_partitioned_positions(self, side, measured, elbow_pose, wrist_pose, terminal,
+                                     *, limit_hold_fast_retry=False):
         """Fit both URDF endpoints together, keeping all constraints in the solve.
 
         Hand_link is downstream of J5-J7. Its unsigned segment bend is not a
@@ -454,7 +470,21 @@ class IkSolver:
             errors = np.linalg.norm(residual(result.x).reshape(2, 3) / weights, axis=1)
             attempts = 1
             evaluations = result.nfev
-            if not freeze_j3 and np.max(errors) > .03:
+            bounds_at_feedback = []
+            for index in indices:
+                for limit in (self._position_lower[index], self._position_upper[index]):
+                    if abs(target[index] - limit) <= 1.0e-6:
+                        bounds_at_feedback.append(
+                            abs(measured[index] - limit)
+                            <= self._position_limit_hold_feedback_margin
+                        )
+            at_measured_bound = bool(bounds_at_feedback) and all(bounds_at_feedback)
+            fast_retry = bool(limit_hold_fast_retry and self._prev_targets is not None
+                              and np.all(np.isfinite(errors)) and np.max(errors) > .03
+                              and at_measured_bound)
+            self._limit_hold_retry_count = self._limit_hold_retry_count + 1 if fast_retry else 0
+            retry_other_branches = not fast_retry or self._limit_hold_retry_count % 5 == 0
+            if not freeze_j3 and np.max(errors) > .03 and retry_other_branches:
                 # Bounded local IK can settle on the opposite elbow branch.
                 # Try each side of the bend plane without relaxing any bound.
                 for angle in (-2., 2.):
@@ -509,9 +539,31 @@ class IkSolver:
             and active_bounds
             and all(item["feedback_at_bound"] for item in active_bounds)
         )
+        # A previously valid IK target may already sit at the limiting joint
+        # boundary while measured feedback is still catching up. Continue only
+        # that exact, previously valid target; never issue the rejected candidate.
+        # Once feedback reaches the boundary the caller switches to brake/hold.
+        position_limit_approach = bool(
+            np.all(np.isfinite(errors))
+            and np.max(errors) > .03
+            and active_bounds
+            and self._prev_targets is not None
+            and not all(item["feedback_at_bound"] for item in active_bounds)
+            and all(abs(self._prev_targets[offset + item["joint"] - 1] - item["limit_rad"]) <= 1.0e-6
+                    for item in active_bounds)
+        )
+        # A finite bounded position fit can be unreachable before feedback
+        # reaches any joint limit (or without touching a bound at all). This
+        # classification excludes degenerate input, exceptions and invalid
+        # terminal joints, which return above without a position-fit result.
+        position_target_unreachable = bool(
+            np.all(np.isfinite(errors)) and np.all(np.isfinite(target))
+            and np.max(errors) > .03
+        )
         self.solution_diagnostics = {
             "elbow_error_m": float(errors[0]), "wrist_error_m": float(errors[1]),
             "method": "bounded_urdf_positions", "evaluations": evaluations, "attempts": attempts,
+            "limit_hold_fast_retry": bool(fast_retry and not retry_other_branches),
             "j3_frozen": bool(freeze_j3), "target_bend_deg": float(np.degrees(bend)),
             "additional_bend_deg": float(np.degrees(additional)),
             "candidate_urdf_rad": target[offset:offset + 7].tolist(),
@@ -524,6 +576,8 @@ class IkSolver:
             "workspace_wrist_shift_m": float(np.linalg.norm(desired[1] - requested_positions[1])),
             "active_position_bounds": active_bounds,
             "recoverable_position_limit": recoverable_position_limit,
+            "position_limit_approach": position_limit_approach,
+            "position_target_unreachable": position_target_unreachable,
         }
         self._last_elbow_solve_diagnostics = getattr(self, "_last_elbow_solve_diagnostics", {})
         self._last_elbow_solve_diagnostics[side] = {
@@ -535,12 +589,13 @@ class IkSolver:
         }
         if not np.all(np.isfinite(errors)) or np.max(errors) > .03:
             self._report_solve_failure()
-            if recoverable_position_limit and self._prev_targets is not None:
+            if (recoverable_position_limit or position_limit_approach) and self._prev_targets is not None:
                 # Keep the last valid IK target available for diagnostics. The
                 # driver receives an explicit brake/hold request instead of
                 # this target while the human request remains unreachable.
                 return self._prev_targets.copy()
             return measured.copy()
+        self._limit_hold_retry_count = 0
         self.last_solution_valid = True
         self._prev_targets = target.copy()
         self._report_solve_recovery()
@@ -633,22 +688,22 @@ class IkSolver:
         if len(set(indices.tolist())) != indices.shape[0] or np.any(indices < 0) or np.any(indices >= 7):
             raise ValueError("wrist joint indices must be distinct values in 0..6")
 
-        from ..math_utils import quat_wxyz_to_matrix, rotation_matrix_to_rotvec
-
-        frame_key = f"{side}_wrist"
-        base_pose = self.current_task_frame_poses(joints)[frame_key]
-        base_rotation = quat_wxyz_to_matrix(base_pose[3:]).astype(np.float64)
+        if not np.all(np.isfinite(joints)):
+            raise ValueError("finite wrist linearization joints required")
+        # Read exact angular axes from the double-precision URDF Jacobian.
+        # Differencing float32 viewer quaternions at 1e-4 rad biased these axes
+        # enough to produce visible errors at the expanded wrist angles.
+        q = np.zeros(self._model.nq)
+        q[self._arm_q_indices] = joints
+        frame_id = self._model.getFrameId(getattr(self._cfg, f"{side}_hand_frame"))
+        jacobian = self._pin.computeFrameJacobian(
+            self._model, self._data, q, frame_id, self._pin.ReferenceFrame.LOCAL)
+        self._pin.updateFramePlacements(self._model, self._data)
+        base_rotation = self._data.oMf[frame_id].rotation.copy()
         side_offset = 0 if side == "left" else 7
-        epsilon = 1.0e-4
-        columns = []
-        for local_index in indices:
-            perturbed = joints.copy()
-            perturbed[side_offset + local_index] += epsilon
-            pose = self.current_task_frame_poses(perturbed)[frame_key]
-            rotation = quat_wxyz_to_matrix(pose[3:]).astype(np.float64)
-            local_delta = base_rotation.T @ rotation
-            columns.append(rotation_matrix_to_rotvec(local_delta) / epsilon)
-        return base_rotation, np.column_stack(columns).astype(np.float64)
+        columns = [jacobian[3:, self._arm_v_indices[side_offset+index]].copy()
+                   for index in indices]
+        return base_rotation, np.column_stack(columns)
 
     def solve(
         self,
@@ -659,6 +714,7 @@ class IkSolver:
         right_elbow_pose: np.ndarray | None = None,
         partitioned_side: str | None = None,
         terminal_joint_targets: np.ndarray | None = None,
+        limit_hold_fast_retry: bool = False,
     ) -> np.ndarray:
         """Solve IK and return the 14 arm joint targets (rad).
 
@@ -679,6 +735,7 @@ class IkSolver:
                 left_elbow_pose if partitioned_side == "left" else right_elbow_pose,
                 left_wrist_pose if partitioned_side == "left" else right_wrist_pose,
                 terminal_joint_targets,
+                limit_hold_fast_retry=limit_hold_fast_retry,
             )
         from pink import solve_ik
 

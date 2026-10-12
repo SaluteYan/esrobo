@@ -159,7 +159,9 @@ class LinkerHand(Node):
             # one or more joints accept position commands but remain stationary.
             torque = [180] * 10
             pose = [255, 200, 255, 255, 255, 255, 180, 180, 180, 41]
-            speed = [200, 250, 250, 250, 250, 250, 250, 250, 250, 250]
+            # L10 firmware speed scale is 0..255; apply the requested maximum
+            # to both sides. Teleoperation motion bounds remain independent.
+            speed = [255] * 10
         elif self.hand_joint == "L20":
             pose = [255,255,255,255,255,255,10,100,180,240,245,255,255,255,255,255,255,255,255,255]
         elif self.hand_joint == "L21":

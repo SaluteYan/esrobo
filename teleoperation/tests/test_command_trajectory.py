@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import deque
 from unittest import mock
 
 import numpy as np
@@ -30,6 +31,117 @@ def planner():
 
 
 class TrajectoryTests(unittest.TestCase):
+    def test_feedback_motion_reserve_handles_delayed_reversal_with_irregular_intervals(self):
+        # Delayed, acceleration-limited actuator model, not a hardware claim.
+        # The previous static-envelope algorithm faults at sample 43 here
+        # with the same 26 ms J6 interval-inversion pattern as the live run.
+        for sign in (-1, 1):
+            with self.subTest(direction=sign):
+                p = planner()
+                feedback, motor_velocity = np.zeros(7), np.zeros(7)
+                pending = deque([(10., feedback.copy())])
+                stamp = 10.
+                motion_braking_seen = False
+                for i in range(600):
+                    dt = (.0133, .026, .0207)[i % 3]
+                    stamp += dt
+                    target = np.zeros(7)
+                    target[5] = sign * np.deg2rad(10 if int((stamp-10)/.5) % 2 == 0 else -10)
+                    before = p.state
+                    proposal = p.propose(target, feedback, stamp, -np.ones(7), np.ones(7), linear_fk, .22)
+                    self.assertIs(p.state, before)
+                    self.assert_limits(p, before, proposal, feedback, dt)
+                    motion_braking_seen |= proposal.diagnostics['feedback_motion_braking_active'][5]
+                    p.commit(proposal)
+                    pending.append((stamp, proposal.position.copy()))
+                    while len(pending) > 1 and pending[1][0] <= stamp-.3:
+                        pending.popleft()
+                    desired_motor_velocity = np.clip((pending[0][1]-feedback)*20, -p.vmax, p.vmax)
+                    motor_velocity += np.clip(desired_motor_velocity-motor_velocity, -p.amax*dt, p.amax*dt)
+                    feedback += motor_velocity*dt
+                self.assertTrue(motion_braking_seen)
+
+    def test_exact_logged_j6_fault_frames_still_reject_without_committing(self):
+        data = json.loads((Path(__file__).parent/'fixtures/j6_reversal_faults_20261003.json').read_text())
+        self.assertEqual(len(data['cases']), 2)
+        for case in data['cases']:
+            with self.subTest(timestamp=case['unix_ns']):
+                d = case['context']
+                p = planner()
+                p.state = TrajectoryStep(np.array(d['previous_command_physical_rad']),
+                                         np.array(d['previous_velocity_physical_rad_s']),
+                                         d['previous_command_stamp_s'], np.full(7, np.nan), {})
+                before = p.state
+                with self.assertRaisesRegex(TrajectoryFault, 'no acceleration-consistent') as caught:
+                    p.propose(d['target_physical_rad'], d['feedback_physical_rad'], d['feedback_stamp_s'],
+                              -np.ones(7)*3, np.ones(7)*3, linear_fk, .22)
+                self.assertIs(p.state, before)
+                self.assertEqual(caught.exception.diagnostics['failed_joints'], [6])
+                for key in ('feasible_velocity_lower_rad_s', 'feasible_velocity_upper_rad_s'):
+                    np.testing.assert_allclose(caught.exception.diagnostics[key], d[key], atol=1e-12)
+                json.dumps(caught.exception.diagnostics, allow_nan=False)
+
+    def test_reset_held_command_uses_actual_feedback_for_motion_history(self):
+        p = planner()
+        held = np.zeros(7)
+        held[5] = .02
+        actual = np.zeros(7)
+        p.reset(held, 10., feedback=actual)
+        proposal = p.propose(held, actual, 10.02, -np.ones(7), np.ones(7), linear_fk, .22)
+        np.testing.assert_array_equal(proposal.diagnostics['feedback_velocity_rad_s'], np.zeros(7))
+        self.assertFalse(any(proposal.diagnostics['feedback_motion_braking_active']))
+
+    def test_return_clock_refresh_preserves_measurement_interval_and_discards_old_history(self):
+        from dataclasses import replace
+        for refreshed, stamp, valid in ((10.04, 10.06, True), (10.48, 10.5, False)):
+            with self.subTest(stamp=stamp):
+                p = planner()
+                p.state = replace(p.state, stamp=refreshed)
+                feedback = np.zeros(7)
+                feedback[5] = .001
+                proposal = p.propose(np.zeros(7), feedback, stamp,
+                                     -np.ones(7), np.ones(7), linear_fk, .22)
+                self.assertEqual(proposal.diagnostics['feedback_motion_valid'], valid)
+                expected = .001/(stamp-10.) if valid else 0.
+                self.assertAlmostEqual(proposal.diagnostics['feedback_velocity_rad_s'][5], expected)
+
+    def test_uncommitted_proposals_do_not_advance_feedback_history(self):
+        p = planner()
+        first = np.zeros(7)
+        first[5] = .001
+        target = np.zeros(7)
+        before = p.state
+        proposed = p.propose(target, first, 10.02, -np.ones(7), np.ones(7), linear_fk, .22)
+        self.assertIs(p.state, before)
+        second = first * 2
+        retry = p.propose(target, second, 10.04, -np.ones(7), np.ones(7), linear_fk, .22)
+        self.assertAlmostEqual(retry.diagnostics['feedback_velocity_rad_s'][5], .05)
+        p.commit(proposed)
+        following = p.propose(target, first, 10.04, -np.ones(7), np.ones(7), linear_fk, .22)
+        self.assertEqual(following.diagnostics['feedback_velocity_rad_s'][5], 0.)
+        self.assertGreater(following.diagnostics['feedback_closing_lower_rad_s'][5], 0.)
+        json.dumps(following.diagnostics, allow_nan=False)
+
+    def test_planned_return_interval_accepts_small_jitter_with_bounded_motion(self):
+        cfg = build_config().robot
+        self.assertEqual(cfg.command_trajectory_max_dt_s, .1)
+        self.assertEqual(cfg.return_command_trajectory_max_dt_s, .12)
+        p = CommandTrajectory(cfg.right_max_joint_velocity,
+                              cfg.right_max_joint_acceleration,
+                              cfg.right_max_joint_step,
+                              np.deg2rad(cfg.command_trajectory_lead_deg),
+                              max_dt=cfg.return_command_trajectory_max_dt_s)
+        p.reset(np.zeros(7), 10.)
+        target = np.ones(7) * .2
+        step = p.propose(target, np.zeros(7), 10.1016,
+                         -np.ones(7), np.ones(7), linear_fk, .22)
+        self.assert_limits(p, p.state, step, np.zeros(7), .1016)
+        self.assertAlmostEqual(step.diagnostics['feedback_dt_s'], .1016)
+        p.commit(step)
+        with self.assertRaisesRegex(TrajectoryFault, 'feedback interval'):
+            p.propose(target, np.zeros(7), 10.222,
+                      -np.ones(7), np.ones(7), linear_fk, .22)
+
     def test_latest_left_feedback_stall_still_rejects_after_parameter_sync(self):
         path = Path(__file__).parent / 'fixtures/left_feedback_stall_20260920.json'
         context = json.loads(path.read_text())['fault']['fault_context']

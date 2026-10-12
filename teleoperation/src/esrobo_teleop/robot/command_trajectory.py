@@ -27,8 +27,8 @@ class CommandTrajectory:
         ]
         if any(np.any(v <= 0) for v in (self.vmax, self.amax, self.step, self.lead)):
             raise ValueError("command trajectory requires positive seven-axis limits")
-        if not np.isfinite(max_dt) or not 0 < max_dt <= .1:
-            raise ValueError("trajectory max_dt must be in (0, 0.1]")
+        if not np.isfinite(max_dt) or not 0 < max_dt <= .12:
+            raise ValueError("trajectory max_dt must be in (0, 0.12]")
         if not np.isfinite(lead_timeout) or lead_timeout <= 0:
             raise ValueError("invalid trajectory lead timeout")
         self.max_dt, self.lead_timeout = max_dt, lead_timeout
@@ -41,11 +41,17 @@ class CommandTrajectory:
             raise TrajectoryFault("expected seven finite joints")
         return result.copy()
 
-    def reset(self, position, stamp):
+    def reset(self, position, stamp, *, feedback=None):
         if not np.isfinite(stamp):
             raise TrajectoryFault("invalid initialization timestamp")
-        self.state = TrajectoryStep(self._vector(position), np.zeros(7), float(stamp),
-                                    np.full(7, np.nan), {})
+        position = self._vector(position)
+        measured = position if feedback is None else self._vector(feedback)
+        self.state = TrajectoryStep(position, np.zeros(7), float(stamp),
+                                    np.full(7, np.nan), {
+                                        "feedback_physical_rad": measured.tolist(),
+                                        "feedback_motion_stamp_s": float(stamp),
+                                        "feedback_velocity_rad_s": [0.0] * 7,
+                                    })
 
     def invalidate(self):
         self.state = None
@@ -61,7 +67,12 @@ class CommandTrajectory:
         if dt == 0:
             return None
         if dt < 0 or dt > self.max_dt:
-            raise TrajectoryFault(f"feedback interval {dt:.4f}s outside (0, {self.max_dt}]s")
+            raise TrajectoryFault(
+                f"feedback interval {dt:.4f}s outside (0, {self.max_dt}]s "
+                "since last committed command state",
+                dict(fault_code="command_state_interval_exceeded",
+                     feedback_stamp_s=float(stamp), previous_command_stamp_s=state.stamp,
+                     command_state_interval_s=dt))
         target, feedback, lower, upper = [self._vector(v) for v in (target, feedback, lower, upper)]
         if not callable(fk) or not np.isfinite(endpoint_speed) or endpoint_speed <= 0:
             raise TrajectoryFault("valid command FK and endpoint speed limit required")
@@ -96,9 +107,55 @@ class CommandTrajectory:
         def braking_bound(distance):
             return np.sqrt((self.amax * dt) ** 2 + 2 * self.amax * np.maximum(distance, 0)) - self.amax * dt
 
+        # The feedback-centred envelope can move TOWARDS an outstanding
+        # command during a reversal. Static stopping distance alone is then
+        # insufficient, even when every previous command was inside its
+        # instantaneous envelope. Estimate motion only from measured frames
+        # carried by committed proposals; command positions are not feedback.
+        # Planned return can refresh a stationary command's clock after a
+        # long geometry check. Its old measurement must keep its own clock.
+        measured_stamp = state.diagnostics.get("feedback_motion_stamp_s")
+        motion_dt = (float(stamp - measured_stamp)
+                     if isinstance(measured_stamp, (int, float)) and np.isfinite(measured_stamp)
+                     else None)
+        feedback_motion_valid = bool("feedback_physical_rad" in state.diagnostics
+                                     and motion_dt is not None and 0 < motion_dt <= self.max_dt)
+        if feedback_motion_valid:
+            previous_feedback = self._vector(state.diagnostics["feedback_physical_rad"])
+            feedback_velocity = (feedback - previous_feedback) / motion_dt
+            previous_feedback_velocity = self._vector(
+                state.diagnostics.get("feedback_velocity_rad_s", np.zeros(7)))
+        else:
+            # Older externally restored states have no measurement history.
+            # Keep the hard envelope/acceleration checks; do not invent motion.
+            feedback_velocity = previous_feedback_velocity = np.zeros(7)
+        # Retain the larger directional speed across two measured intervals.
+        # A single quiet interval must not instantly erase reversal reserve.
+        closing_lower = np.maximum.reduce((feedback_velocity, previous_feedback_velocity, np.zeros(7)))
+        closing_upper = np.maximum.reduce((-feedback_velocity, -previous_feedback_velocity, np.zeros(7)))
+        uncertainty = np.minimum(np.deg2rad(.05), .05 * self.lead)
+
+        def moving_braking_bound(distance, closing):
+            # Reserve one maximum accepted feedback interval H, followed by
+            # command braking time v/a. With adverse feedback speed w:
+            # v*H + v^2/(2*a) + w*(H + v/a) + uncertainty <= distance.
+            # This is a measured-motion forecast, not a hardware deceleration
+            # guarantee. Abrupt unobserved changes still use the hard guards.
+            active = closing > 1e-9
+            remaining = distance - closing * self.max_dt - uncertainty
+            term = self.amax * self.max_dt + closing
+            root = np.sqrt(term * term + 2 * self.amax * np.maximum(remaining, 0))
+            # Rationalized root avoids cancellation near a shrinking bound.
+            bound = 2 * self.amax * np.maximum(remaining, 0) / (root + term)
+            return np.where(active, np.minimum(bound, self.vmax), self.vmax)
+
+        motion_lower_speed = moving_braking_bound(q - feedback + self.lead, closing_lower)
+        motion_upper_speed = moving_braking_bound(feedback + self.lead - q, closing_upper)
         vmax = np.minimum(self.vmax, self.step / dt)
-        vlow = np.maximum.reduce((-vmax, velocity - self.amax * dt, -braking_bound(q - lo)))
-        vhigh = np.minimum.reduce((vmax, velocity + self.amax * dt, braking_bound(hi - q)))
+        vlow = np.maximum.reduce((-vmax, velocity - self.amax * dt, -braking_bound(q - lo),
+                                  -motion_lower_speed))
+        vhigh = np.minimum.reduce((vmax, velocity + self.amax * dt, braking_bound(hi - q),
+                                   motion_upper_speed))
         reserve_conflict = bool(np.any(vlow > vhigh + 1e-9))
         recovering = bool(state.diagnostics.get("braking_recovery", False))
         # Reserve feasibility is stronger than this frame's hard envelope.
@@ -131,6 +188,13 @@ class CommandTrajectory:
                 "feasible_velocity_upper_rad_s": vhigh.tolist(),
                 "lead_rad": (q - feedback).tolist(),
                 "lead_limit_rad": self.lead.tolist(),
+                "feedback_motion_valid": feedback_motion_valid,
+                "feedback_motion_dt_s": motion_dt,
+                "feedback_velocity_rad_s": feedback_velocity.tolist(),
+                "feedback_closing_lower_rad_s": closing_lower.tolist(),
+                "feedback_closing_upper_rad_s": closing_upper.tolist(),
+                "feedback_motion_velocity_lower_rad_s": (-motion_lower_speed).tolist(),
+                "feedback_motion_velocity_upper_rad_s": motion_upper_speed.tolist(),
             }
             summary = "; ".join(
                 f"J{i+1}: v_min={np.degrees(vlow[i]):+.2f} > "
@@ -253,6 +317,19 @@ class CommandTrajectory:
             "reserve_conflict": reserve_conflict,
             "elbow_waiting_for_bend_plane": bool(elbow_wait),
             "feedback_dt_s": dt,
+            "feedback_physical_rad": feedback.tolist(),
+            "feedback_motion_stamp_s": float(stamp),
+            "feedback_motion_valid": feedback_motion_valid,
+            "feedback_motion_dt_s": motion_dt,
+            "feedback_velocity_rad_s": feedback_velocity.tolist(),
+            "feedback_motion_braking_active": (
+                ((closing_lower > 1e-9) & (desired < 0) & (-desired > motion_lower_speed + 1e-9)) |
+                ((closing_upper > 1e-9) & (desired > 0) & (desired > motion_upper_speed + 1e-9))
+            ).tolist(),
+            "feedback_closing_lower_rad_s": closing_lower.tolist(),
+            "feedback_closing_upper_rad_s": closing_upper.tolist(),
+            "feedback_motion_velocity_lower_rad_s": (-motion_lower_speed).tolist(),
+            "feedback_motion_velocity_upper_rad_s": motion_upper_speed.tolist(),
             "position_clipped": (np.abs(target - bounded_target) > 1e-9).tolist(),
             "velocity_bound_active": (np.abs(desired) > vmax).tolist(),
             "acceleration_bound_active": (np.abs(desired - velocity) > self.amax * dt).tolist(),

@@ -1,5 +1,6 @@
 import * as THREE from "./vendor/three.module.min.js";
 import { OrbitControls } from "./vendor/OrbitControls.js";
+import { freshnessWarning } from "./freshness.js";
 
 const sceneHost = document.querySelector("#scene");
 const scene = new THREE.Scene();
@@ -76,6 +77,12 @@ let paused = false;
 let latestState = null;
 let latestFrames = {};
 let latestDiagnostics = null;
+
+function updateWarning(state) {
+  const warning = document.querySelector("#data-warning");
+  warning.textContent = freshnessWarning(state, mode, paused);
+  warning.hidden = !warning.textContent;
+}
 
 function resetCamera() {
   if (mode === "raw") {
@@ -169,6 +176,7 @@ function metric(id, value) {
 }
 
 function updateDiagnostics(state) {
+  updateWarning(state);
   const packet = state.packet || {};
   latestFrames = packet.frames && typeof packet.frames === "object" ? packet.frames : {};
   latestDiagnostics = state.diagnostics;
@@ -186,8 +194,18 @@ function updateDiagnostics(state) {
     ik:"IK 正解结果", command:"本机计算输出", feedback:"机器人实测反馈"};
   document.querySelector("#layer-status").textContent = layerUnavailable
     ? `${layerLabels[mode]} · 等待数据` : layerLabels[mode];
-  document.querySelector("#rate").textContent = `${Number(state.source_update_hz || 0).toFixed(1)} Hz`;
-  document.querySelector("#sequence").textContent = packet.sequence == null ? "序列 --" : `序列 ${packet.sequence}`;
+  document.querySelector("#rate").textContent = `新 Body ${Number(state.source_update_hz || 0).toFixed(1)} Hz`;
+  const transport = state.acquisition_diagnostics;
+  document.querySelector("#sdk-rates").textContent = transport
+    ? ["body", "left", "right"].map(s => Number(transport.sdk?.[s]?.hz || 0).toFixed(1)).join(" / ") + " Hz" : "-- Hz";
+  document.querySelector("#forward-rate").textContent = transport ? `${Number(transport.timing?.body_forward?.hz || 0).toFixed(1)} Hz` : "-- Hz";
+  document.querySelector("#transport-age").textContent = state.acquisition_diagnostics_age_ms == null ? "-- ms" : `${state.acquisition_diagnostics_age_ms} ms`;
+  document.querySelector("#transport-counts").textContent = transport
+    ? JSON.stringify({计数:transport.counts, 手部:transport.hand_status, 传输录制错误:transport.errors, 日志错误:transport.logging?.errors}, null, 2)
+    : "等待采集诊断";
+  document.querySelector("#sequence").textContent = packet.body_sample_sequence != null
+    ? `Body 接收序号 ${packet.body_sample_sequence}`
+    : packet.sequence == null ? "序列 --" : `序列 ${packet.sequence}`;
   const visibleJointCount = jointNames.filter((name) => framePosition(name, state)).length;
   document.querySelector("#valid-count").textContent = `${visibleJointCount} / ${jointNames.length}`;
 
@@ -253,6 +271,7 @@ document.querySelector("#view-mode").addEventListener("change", (event) => setMo
 document.querySelector("#reset-camera").addEventListener("click", resetCamera);
 document.querySelector("#pause").addEventListener("click", (event) => {
   paused = !paused;
+  updateWarning(latestState);
   event.currentTarget.textContent = paused ? "继续" : "暂停";
 });
 
@@ -261,12 +280,16 @@ async function poll() {
     const response = await fetch("/api/state", { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const state = await response.json();
+    latestState = state;
+    updateWarning(state);
     if (!paused) {
-      latestState = state;
       updateDiagnostics(state);
       updateSkeleton(state);
     }
   } catch (_error) {
+    const warning = document.querySelector("#data-warning");
+    warning.hidden = false;
+    warning.textContent = "骨架服务连接失败；画面保留最后一帧。";
     document.querySelector("#status-dot").className = "status-dot stale";
     document.querySelector("#status-text").textContent = "调试服务断开";
   }

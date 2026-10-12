@@ -1,635 +1,85 @@
-# ESROBO 移动仿人形双臂机器人平台
+# ESROBO 移动双臂机器人
 
-本仓库是 ESROBO 移动双臂机器人 ROS 2 工作空间，运行环境以 Ubuntu 22.04 + ROS 2 Humble 为主。系统包含移动底盘、双 NERO 七轴机械臂、三轴腰部关节、头部云台舵机、双五指灵巧手、头部/腕部相机、激光雷达和双六维力传感器。
+本仓库包含 ESROBO 移动双臂机器人的 ROS 2 工作空间、底层设备驱动，以及 PICO 遥操作程序。机器人主机运行 CAN/ROS 驱动和运动执行网关；本机采集 PICO Body 与 Hand 数据，完成标定、重定向和逆运动学（IK），再将关节目标发送给机器人。主要环境为 Ubuntu 22.04 与 ROS 2 Humble。
 
-本文档根据当前代码和现场调试记录整理，重点服务于真机逐部件调试。第一次上电调试时不要直接启动整机总 launch，建议按本文档顺序逐项验证。
+**当前日常入口**是 [`laptop_teleop`](laptop_teleop/README.md) 的网页控制台；[`robot_link`](robot_link/README.md) 负责两机通信和机器人端执行。[`teleoperation`](teleoperation/README.md) 保留模型、运动控制组件及较早的一体式运行入口。第一次接触真机，请先按[逐部件调试记录](HARDWARE_BRINGUP.md)核对设备，再按[部署文档](laptop_teleop/docs/README.md)操作。
 
-笔记本/本机计算端入口见 [`laptop_teleop/README.md`](laptop_teleop/README.md)：在本机采集 PICO、SenseGlove，执行重定向与 IK，通过 UDP 16000 向 `192.168.10.100` 上的 [`robot_link`](robot_link/README.md) 网关发送目标。首次安装、SSH 配置和每日启动指令见 [`laptop_teleop/docs/`](laptop_teleop/docs/README.md)。SSH 用于机器人端操作，CAN/ROS 底层驱动继续运行在机器人主机。
+## 系统如何工作
 
-本机统一网页入口：在仓库根目录运行 `./laptop_teleop/scripts/run_dashboard.sh`，打开 `http://127.0.0.1:8080`。页面集中管理机器人/本机程序、模式与标定，可在相机和 PICO 骨架间切换，并提供运动停止及左臂、右臂、双手、头部的独立失能。具体步骤见 [网页操作文档](laptop_teleop/docs/05_WEB_CONSOLE.md)。
+```mermaid
+flowchart LR
+    P[PICO Body + Hand] --> L[本机 laptop_teleop<br/>采集、标定、重定向、IK、网页]
+    L <-->|HMAC 认证的 UDP 16000<br/>目标与实测反馈| G[机器人 robot_link 网关<br/>会话、安全检查、轨迹与停止]
+    G --> D[CAN / ROS 驱动]
+    D --> R[NERO 双臂、LinkerHand 双手]
+    C[机器人相机] -->|独立图像服务，经 SSH 转发| L
+```
 
-## 硬件组成
-
-| 部件 | 型号/说明 | ROS 包 |
+| 层次 | 主要职责 | 入口 |
 | --- | --- | --- |
-| 移动底盘 | 松灵 Ranger Mini 3 | `ranger_bringup`, `ranger_base`, `ugv_sdk` |
-| 左/右机械臂 | 松灵 NERO 七轴机械臂 | `agx_arm_ctrl`, `pyAgxArm-master` |
-| 腰部关节 | 零差 3 关节，CANopen 风格驱动 | `erob_canopen` |
-| 灵巧手 | 灵心巧手，双手 CAN；当前整机 URDF 使用 L20Lite 左/右手模型 | `linker_hand_ros2_sdk` |
-| 头部相机 | Orbbec Gemini 435Le | `orbbec_camera` |
-| 腕部相机 | RealSense D435，左右各一台 | `realsense2_camera` |
-| 头部舵机 | 飞特 SM40，RS485 | `servo_driver` |
-| 六维力传感器 | 坤维 KW65/KW56B，RS422 | `kw_ft_sensor_ros2` |
-| 激光雷达 | RoboSense Fairy | `rslidar_sdk` |
+| 本机计算与界面 | PICO 身体及五指采集、输入时效检查、标定、IK、目标生成、状态显示 | [`laptop_teleop/README.md`](laptop_teleop/README.md) |
+| 机器人执行 | 认证与配置合同、最新目标缓存、反馈校验、限速轨迹、故障停止、驱动调用 | [`robot_link/README.md`](robot_link/README.md)、[执行流程](robot_link/ROBOT_EXECUTION.md) |
+| 模型与运动组件 | URDF、运动学、机械臂和灵巧手适配器、安全回零等；也保留原一体式遥操作 | [`teleoperation/README.md`](teleoperation/README.md) |
+| ROS 2 设备层 | 底盘、双臂、腰部、灵巧手、相机、雷达、头部舵机和力传感器驱动 | [`src/`](src/) |
 
-## 目录说明
+运动目标走 UDP 16000；SSH 用于机器人端程序管理和图像服务转发。网页和人体 IK 在本机运行，CAN 与硬件驱动在机器人主机运行。网络包被接收不等于机器人已执行或到位，实际状态以新鲜反馈为准。协议细节见 [`robot_link/PROTOCOL.md`](robot_link/PROTOCOL.md)。
 
-主要目录如下：
+## 硬件范围
 
-```text
-src/agx_arm_ros2             NERO/Piper 机械臂 ROS2 控制包
-src/pyAgxArm-master          机械臂底层 Python SDK
-src/erob_can_joints          腰部关节驱动，包名 erob_canopen
-src/ranger_ros2              Ranger 底盘 ROS2 驱动
-src/ugv_sdk                  底盘底层 SDK
-src/linkerhand-ros2          灵巧手 ROS2 SDK
-src/ros2_rs485_servo         头部 RS485 舵机驱动
-src/ros2_rs422_ftsensor      六维力传感器驱动
-src/OrbbecSDK_ROS2           Orbbec 头部相机驱动
-src/realsense-ros            RealSense 腕部相机驱动
-src/rslidar_sdk-main         RoboSense 激光雷达驱动
-src/esrobo_system            系统集成相关代码，目前不建议作为首轮调试入口
-model/urdf/esrobo_waist_with_head
-                              当前整机 URDF 描述包，含底盘、腰部、头部、双 NERO 机械臂和 L20Lite 双手模型
-document                     随仓库整理的设备和整机操作手册 PDF
-debug_cmd.txt                原始现场调试命令备忘
-start_can.sh                 当前真机 CAN 命名和波特率初始化脚本
-99-fixed-can.rules           当前真机 USB/CAN/串口 udev 规则参考
-```
-
-本地模型整理时还使用了以下源文件目录：
-
-```text
-../agx_arm_urdf/nero         NERO 机械臂原始 URDF/Xacro 和 meshes
-../linkerhand-urdf/l20lite   LinkerHand L20Lite 左/右手原始 URDF 和 meshes
-```
-
-## 参考文档
-
-`document/` 目录集中存放当前真机调试和日常操作会用到的 PDF 手册：
-
-| 文件 | 内容 |
+| 部件 | 当前使用的设备或驱动 |
 | --- | --- |
-| `document/移动仿人形双臂机器人平台操作手册.pdf` | ESROBO 移动仿人形双臂机器人平台整机操作说明，适合作为上电、基础操作和安全注意事项的总入口。 |
-| `document/RANGER MINI 3.0_用户手册.pdf` | 松灵 Ranger Mini 3 底盘用户手册，包含底盘规格、接口、通信和使用注意事项。 |
-| `document/NERO_用户手册.pdf` | 松灵 NERO 七轴机械臂用户手册，包含机械臂安装、上电、控制方式和常规使用说明。 |
+| 移动底盘 | Ranger Mini 3；`ranger_ros2`、`ugv_sdk` |
+| 双臂 | 两台 NERO 七轴机械臂；`agx_arm_ros2`、`pyAgxArm-master` |
+| 腰部与头部 | 三轴腰部 CAN 关节、RS485 头部舵机 |
+| 双手 | LinkerHand 灵巧手；`linkerhand-ros2` |
+| 视觉与测距 | Orbbec 头部相机、RealSense 腕部相机、RoboSense 雷达 |
+| 力觉 | 双侧 RS422 六维力传感器 |
 
-## 整机 URDF 模型
+整机操作说明和厂家手册位于 [`document/`](document/)。遥操作当前使用 PICO Body 的肩、肘、腕数据和独立的 PICO Hand 五指追踪；SenseGlove 相关代码与文档用于旧设备维护，当前本机遥操作流程不需要启动手套软件。
 
-当前整机模型主文件：
-
-```text
-model/urdf/esrobo_waist_with_head/urdf/esrobo_waist_with_head.urdf
-```
-
-该文件以原始 ESROBO 腰部/头部/底盘 URDF 为主体，补充了左右 NERO 七轴机械臂、NERO 末端法兰、左右力传感器安装件和 LinkerHand L20Lite 双手。模型资源已经复制到当前描述包内部，主要 mesh 目录为：
+## 仓库导航
 
 ```text
-model/urdf/esrobo_waist_with_head/meshes/nero
-model/urdf/esrobo_waist_with_head/meshes/nero/dae
-model/urdf/esrobo_waist_with_head/meshes/linkerhand_l20lite/left
-model/urdf/esrobo_waist_with_head/meshes/linkerhand_l20lite/right
+.
+├── README.md                      项目总览与文档导航
+├── HARDWARE_BRINGUP.md            逐部件真机调试记录
+├── laptop_teleop/                 本机 PICO 计算、网页与操作文档
+├── robot_link/                    双机通信协议、客户端和机器人网关
+├── teleoperation/                 运动模型、控制组件及原一体式入口
+│   ├── config/teleop_config.yaml  机器人运动与安全配置
+│   └── urdf/                      当前遥操作使用的整机 URDF
+├── src/                           ROS 2 工作空间源码与第三方驱动
+├── document/                      整机及设备 PDF 手册
+├── start_can.sh                   机器人端 CAN 接口初始化
+└── 99-fixed-can.rules             机器人端设备命名规则参考
 ```
 
-命名约定：
+`build/`、`install/`、`log/` 是本机生成的构建或运行目录；外部 SDK 与本机标定文件也可能只存在于已部署机器上。新机器部署时按[环境安装](laptop_teleop/README.md#环境安装与配置)和[两机连接](laptop_teleop/docs/02_ROBOT_CONNECTION.md)准备，不能仅凭克隆源码推断设备已就绪。
 
-```text
-腰部和头部：保留原始 joint/link 命名，例如 waist_joint1、head_joint1
-左臂：NERO link/joint 使用 left_nero_ 前缀
-右臂：NERO link/joint 使用 right_nero_ 前缀
-机械臂第 1 轴：沿用原总 URDF 的 leftArm_joint、rightArm_joint 名称
-灵巧手：左右手 link/joint 分别使用 left_、right_ 前缀
-```
+## 从哪里开始
 
-当前左右 NERO 机械臂的关键零位约定如下：
+1. **首次部署**：阅读[环境安装](laptop_teleop/README.md#环境安装与配置)和[网络、SSH、共享密钥及网关](laptop_teleop/docs/02_ROBOT_CONNECTION.md)。本机与机器人端需使用相匹配的协议、配置和 URDF。
+2. **真机上电或排障**：核对[逐部件调试记录](HARDWARE_BRINGUP.md)及[厂家手册](document/移动仿人形双臂机器人平台操作手册.pdf)，先确认 CAN、反馈、急停和运动空间。整机总 launch 会同时启动多个设备，不作为首次调试入口。
+3. **日常遥操作**：在已安装本机环境后，从仓库根目录运行：
 
-| 关节 | origin rpy | limit |
-| --- | --- | --- |
-| `leftArm_joint` | `1.5708 0 0` | `[-2.70526, 2.70526]` |
-| `rightArm_joint` | `1.5708 0 0` | `[-2.70526, 2.70526]` |
-| `left_nero_joint2` | `1.5707963 1.5707963 0` | `[-3.3107963, 0.1692037]` |
-| `right_nero_joint2` | `1.5707963 1.5707963 0` | `[-3.3107963, 0.1692037]` |
+   ```bash
+   ./laptop_teleop/scripts/run_dashboard.sh
+   ```
 
-其中 `left_nero_joint2` 和 `right_nero_joint2` 的初始姿态相对 NERO 原始 `joint2` 绕关节轴线正向偏移了 90 度；为了保持物理运动范围不变，limit 已整体减去 `1.5707963 rad`，换算回原始 NERO 关节坐标仍为 `[-1.74, 1.74]`。
+   打开 `http://127.0.0.1:8080`，按[网页操作文档](laptop_teleop/docs/05_WEB_CONSOLE.md)连接机器人、选模式、检查输入、预览、标定并人工使能。命令行逐终端流程见[日常运行手册](laptop_teleop/docs/03_OPERATION_RUNBOOK.md)。启动网页本身不会使能机器人。
+4. **先做只读或离线检查**：本机环境检查可用 `./laptop_teleop/scripts/run_laptop.sh check`；已启动网关时可用 `./laptop_teleop/scripts/run_laptop.sh inspect` 查看合同与反馈。无硬件通信模拟见 [`robot_link/README.md`](robot_link/README.md)。
 
-校验 URDF 语法：
+模式包括双臂双手、单臂带同侧手、纯单臂和仅单侧灵巧手。各模式所需 PICO 输入和网关参数见 [`laptop_teleop/README.md`](laptop_teleop/README.md#运行模式)。当前双臂模式缺少两臂互碰的完整扫掠检查，网关会拒绝双臂自动回零与自动准备；不可把单臂回零流程直接组合用于双臂。现场运行还需以机器人控制器反馈确认停止、失能和故障状态。
 
-```bash
-xmllint --noout model/urdf/esrobo_waist_with_head/urdf/esrobo_waist_with_head.urdf
-```
+## 文档索引
 
-当前模型结构检查结果为 72 个 link、71 个 joint、单一 root link `base_link`，无重复 link/joint，parent/child 引用完整。
+| 需求 | 文档 |
+| --- | --- |
+| 本机结构、数据流、模式 | [`laptop_teleop/README.md`](laptop_teleop/README.md) |
+| 安装、连接、每日操作、故障排查、网页 | [`laptop_teleop/docs/README.md`](laptop_teleop/docs/README.md) |
+| PICO Body/Hand 输入和计算细节 | [PICO 输入](laptop_teleop/docs/06_PICO_HAND_INPUT.md)、[代码与计算](laptop_teleop/docs/08_CODE_AND_COMPUTATION.md) |
+| 通信协议与机器人收到目标后的行为 | [协议](robot_link/PROTOCOL.md)、[执行流程](robot_link/ROBOT_EXECUTION.md) |
+| 原一体式遥操作及其运行记录 | [`teleoperation/README.md`](teleoperation/README.md)、[旧运行手册](teleoperation/TELEOPERATION_RUNBOOK.md) |
+| 设备逐项调试和现场命令 | [`HARDWARE_BRINGUP.md`](HARDWARE_BRINGUP.md) |
 
-## 基础环境
-
-每个新终端先执行：
-
-```bash
-cd /home/esrobo/Projects/esrobo
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-```
-
-重新构建单个包示例：
-
-```bash
-colcon build --packages-select kw_ft_sensor_ros2
-source install/setup.bash
-```
-
-系统依赖建议确认：
-
-```bash
-sudo apt install ethtool can-utils
-```
-
-## CAN 和串口设备
-
-当前现场 USB 根总线号可能在 `1-*` 和 `3-*` 之间变化。`start_can.sh` 会按稳定的 USB 端口路径后缀把 CAN 口重命名并设置波特率。
-
-当前映射：
-
-| 设备名 | USB 地址 | 波特率 | 用途 |
-| --- | --- | --- | --- |
-| `can_waist` | `*-7:1.0` | 1000000 | 腰部关节 |
-| `can_car` | `*-8:1.0` | 500000 | Ranger 底盘 |
-| `can_piper1` | `*-5.3:1.0` | 1000000 | 左 NERO 机械臂 |
-| `can_piper2` | `*-5.4:1.0` | 1000000 | 右 NERO 机械臂 |
-| `can_hand1` | `*-5.1.2:1.0` | 1000000 | 灵巧手 1 |
-| `can_hand2` | `*-5.1.1:1.0` | 1000000 | 灵巧手 2 |
-
-初始化 CAN：
-
-```bash
-cd /home/esrobo/Projects/esrobo
-./start_can.sh
-ip -br link show type can
-```
-
-正常应看到以上 6 个 CAN 口均为 `UP`。如果接口名丢失，例如右臂又变成 `can2`，重新运行 `./start_can.sh`。
-
-检查 USB/CAN 物理映射：
-
-```bash
-for iface in $(ip -br link show type can | awk '{print $1}'); do
-  printf '%-14s ' "$iface"
-  ethtool -i "$iface" 2>/dev/null | awk '/driver:/ {driver=$2} /bus-info:/ {bus=$2} END {print "driver=" driver, "bus=" bus}'
-done
-```
-
-串口当前映射：
-
-| 别名 | 当前物理口 | 用途 |
-| --- | --- | --- |
-| `/dev/rs422_ft1` | `/dev/ttyUSB0` 对应 `*-5.1.3:1.0` | 左力传感器 |
-| `/dev/rs422_ft2` | `/dev/ttyUSB1` 对应 `*-5.1.4:1.0` | 右力传感器 |
-| `/dev/rs485_servo` | `/dev/ttyACM0` 对应 `*-5.2:1.0` | 头部舵机 |
-
-安装 udev 规则：
-
-```bash
-sudo cp 99-fixed-can.rules /etc/udev/rules.d/99-fixed-can.rules
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-```
-
-## 不建议直接使用的总启动
-
-存在整机总 launch：
-
-```text
-src/ros2_rs485_servo/launch/start_esrobo_system_launch.py
-```
-
-它会同时启动腰部、双臂、底盘、雷达、头部舵机、双手和力传感器。首次调试时不要直接运行，因为多个驱动存在启动即使能或启动即运动行为。
-
-建议先逐部件调试，确认每个链路稳定后再考虑整机集成。
-
-## 推荐逐部件调试顺序
-
-推荐顺序：
-
-```text
-1. CAN/串口枚举
-2. 力传感器
-3. 头部相机、腕部相机、激光雷达
-4. 腰部关节
-5. 机械臂，先左后右，单臂测试
-6. 头部舵机
-7. 灵巧手
-8. 底盘，最后测试
-```
-
-调试执行机构前确认：
-
-```text
-整机急停已弹起
-机械臂/腰部/头部/灵巧手周围无遮挡
-底盘测试时架空或放在空旷区域
-旁边有人观察，发现异常立即急停或断电
-```
-
-## 力传感器测试
-
-启动：
-
-```bash
-ros2 launch kw_ft_sensor_ros2 ft_sensor.launch.py
-```
-
-检查连接状态和数据：
-
-```bash
-ros2 topic echo /left/ft_sensor/connected
-ros2 topic echo /right/ft_sensor/connected
-ros2 topic echo /left/ft_sensor/data
-ros2 topic echo /right/ft_sensor/data
-```
-
-如果 `/dev/rs422_ft1`、`/dev/rs422_ft2` 不存在，当前 launch 会自动回退到 `/dev/ttyUSB0`、`/dev/ttyUSB1`。
-
-## 头部 Orbbec Gemini 435Le 相机
-
-启动：
-
-```bash
-ros2 launch orbbec_camera gemini435_le.launch.py
-```
-
-验证：
-
-```bash
-ros2 topic list | grep camera
-ros2 topic hz /camera/color/image_raw
-ros2 topic hz /camera/depth/image_raw
-```
-
-当前 launch 已将 image transport 发布插件收敛为 `raw`，避免缺少 `compressedDepth` 插件导致终端误报。大分辨率图像和点云会使 `ros2 topic hz` 测得偏低，调试阶段可关闭点云：
-
-```bash
-ros2 launch orbbec_camera gemini435_le.launch.py enable_point_cloud:=false
-```
-
-也可降低分辨率：
-
-```bash
-ros2 launch orbbec_camera gemini435_le.launch.py \
-  color_width:=640 color_height:=400 \
-  depth_width:=640 depth_height:=400 \
-  color_fps:=10 depth_fps:=10 \
-  enable_point_cloud:=false
-```
-
-## 腕部 RealSense 相机
-
-左相机：
-
-```bash
-ros2 launch realsense2_camera rs_left_launch.py
-```
-
-右相机：
-
-```bash
-ros2 launch realsense2_camera rs_right_launch.py
-```
-
-查看话题：
-
-```bash
-ros2 topic list | grep left
-ros2 topic list | grep right
-```
-
-## 激光雷达
-
-启动：
-
-```bash
-ros2 launch rslidar_sdk start.py
-```
-
-该 launch 会启动雷达节点和 RViz。确认点云话题和 RViz 显示是否正常。
-
-## 腰部关节
-
-启动腰部驱动：
-
-```bash
-ros2 run erob_canopen erob_driver_node
-```
-
-查看状态：
-
-```bash
-ros2 topic echo /erobo/joint_states
-ros2 topic echo /erobo/joint_errors
-```
-
-`/erobo/joint_states` 是 `Float32MultiArray`，每 5 个数一组：
-
-```text
-[关节ID, 位置角度deg, 速度, 电流, 温度]
-```
-
-此前使用的腰部编码器参考值（已不对应当前竖直姿态，不可作为机械臂使能目标）：
-
-```text
-31号 120°
-32号 260°
-33号 170°
-```
-
-当前网页腰部每次调整以该轴最新反馈（按页面显示的 0.01° 精度）为中心，单次最多 ±5°，并限制在单圈 0°～360°。实机已调整到与 URDF 零位相符的竖直姿态；该姿态下 31/32/33 号实测约 `138.98° / 214.98° / 143.97°`，机械臂使能基准取 `139° / 215° / 144°`（各轴 ±0.2°）。使能前会重新读取三轴位置、速度和错误码。使用前仍需核验实际机械姿态和编码器零点；编码器维修或零点变化后需重新标定基准。`/erobo/joint_errors` 返回完整 32 位错误码；`0x0C26`（3110）表示多圈编码器备用电池电压低。腰部设计为单圈范围内运动，因此该码保留显示但不单独禁止腰部使能与调整；每次上电须核对实际机械姿态与反馈一致，其他非零错误码仍禁止运动。
-
-使能：
-
-```bash
-ros2 topic pub /erobo/enable std_msgs/msg/Bool "{data: true}" -1
-```
-
-小幅位置测试：先请求腰部使能；仅在反馈有效、无其他阻断错误码、实际姿态已核验且机械臂失能后，从当前约 144° 测试 33 号到 145°：
-
-```bash
-ros2 topic pub /erobo/pos_target std_msgs/msg/Float32MultiArray "{data: [33.0, 145.0, 10.0, 20.0]}" -1
-```
-
-回到当前调整基准：
-
-```bash
-ros2 topic pub /erobo/pos_target std_msgs/msg/Float32MultiArray "{data: [33.0, 144.0, 10.0, 20.0]}" -1
-```
-
-减速停止运动（保留电机使能）：
-
-```bash
-ros2 topic pub /erobo/stop std_msgs/msg/Empty "{}" -1
-```
-
-`/erobo/pos_target` 数据含义：
-
-```text
-[关节ID, 目标位置角度, 加速度, 速度]
-```
-
-注意：手册中把后两个字段描述成“速度、力矩”，但当前源码实际使用第三个数作为加速度，第四个数作为速度。
-
-## 机械臂测试
-
-机械臂必须先确认 CAN：
-
-```bash
-./start_can.sh
-ip -br link show type can
-candump can_piper1
-candump can_piper2
-```
-
-正常情况下，机械臂 CAN 会持续刷出 `251/252/2A1/2A5` 等帧。若接口处于 `ERROR-PASSIVE` 或 `candump` 无输出，先排查电源、急停、线缆和控制器状态，不要启动驱动。
-
-### 左臂启动
-
-```bash
-ros2 launch agx_arm_ctrl start_single_agx_arm.launch.py \
-  namespace:=left \
-  can_port:=can_piper1 \
-  arm_type:=nero \
-  effector_type:=none \
-  auto_enable:=false \
-  control_enabled:=false \
-  fast_mode:=false \
-  speed_percent:=5
-```
-
-查看反馈：
-
-```bash
-ros2 topic echo /left/feedback/joint_states
-ros2 topic echo /left/feedback/arm_status
-```
-
-使能并打开控制：
-
-```bash
-ros2 service call /left/enable_agx_arm std_srvs/srv/SetBool "{data: true}"
-ros2 service call /left/control_enable std_srvs/srv/SetBool "{data: true}"
-```
-
-小幅测试建议从当前反馈复制完整 7 关节位置，只改变一个末端关节约 `0.02 rad`。不要只发单个关节，当前驱动对缺失关节处理不够安全，`move_j` 必须一次给全 7 个关节。
-
-基于 `debug_cmd.txt` 参考姿态的小幅 `joint7` 测试：
-
-```bash
-ros2 topic pub /left/control/move_j sensor_msgs/msg/JointState "{header: {stamp: {sec: 0, nanosec: 0}, frame_id: ''}, name: ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'joint7'], position: [-0.5427973973702365, 1.5582474094730574, 0.3045425011804906, 0.06129596333004085, -1.5061144247159868, 0.015271630954950384, -0.5038954815711379], velocity: [0.1], effort: []}" -1
-```
-
-回位：
-
-```bash
-ros2 topic pub /left/control/move_j sensor_msgs/msg/JointState "{header: {stamp: {sec: 0, nanosec: 0}, frame_id: ''}, name: ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'joint7'], position: [-0.5427973973702365, 1.5582474094730574, 0.3045425011804906, 0.06129596333004085, -1.5061144247159868, 0.015271630954950384, -0.5238954815711379], velocity: [0.1], effort: []}" -1
-```
-
-停止/关闭：
-
-```bash
-ros2 service call /left/emergency_stop std_srvs/srv/Empty "{}"
-ros2 service call /left/control_enable std_srvs/srv/SetBool "{data: false}"
-ros2 service call /left/enable_agx_arm std_srvs/srv/SetBool "{data: false}"
-```
-
-### 右臂启动
-
-```bash
-ros2 launch agx_arm_ctrl start_single_agx_arm.launch.py \
-  namespace:=right \
-  can_port:=can_piper2 \
-  arm_type:=nero \
-  effector_type:=none \
-  auto_enable:=false \
-  control_enabled:=false \
-  fast_mode:=false \
-  speed_percent:=5
-```
-
-使能：
-
-```bash
-ros2 service call /right/enable_agx_arm std_srvs/srv/SetBool "{data: true}"
-ros2 service call /right/control_enable std_srvs/srv/SetBool "{data: true}"
-```
-
-参考小幅 `joint7` 测试：
-
-```bash
-ros2 topic pub /right/control/move_j sensor_msgs/msg/JointState "{header: {stamp: {sec: 0, nanosec: 0}, frame_id: ''}, name: ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'joint7'], position: [-0.330268654354887, 1.477089599255321, 1.325682286644813, 0.9649925434276648, 0.24741787476271615, -0.06649704450098395, 0.1358568798587192], velocity: [0.1], effort: []}" -1
-```
-
-回位：
-
-```bash
-ros2 topic pub /right/control/move_j sensor_msgs/msg/JointState "{header: {stamp: {sec: 0, nanosec: 0}, frame_id: ''}, name: ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'joint7'], position: [-0.330268654354887, 1.477089599255321, 1.325682286644813, 0.9649925434276648, 0.24741787476271615, -0.06649704450098395, 0.1158568798587192], velocity: [0.1], effort: []}" -1
-```
-
-停止/关闭：
-
-```bash
-ros2 service call /right/emergency_stop std_srvs/srv/Empty "{}"
-ros2 service call /right/control_enable std_srvs/srv/SetBool "{data: false}"
-ros2 service call /right/enable_agx_arm std_srvs/srv/SetBool "{data: false}"
-```
-
-### 当前右臂已知问题
-
-现场调试中右臂出现过：
-
-```text
-Failed to get firmware version
-agx_arm_ctrl_single process has died
-```
-
-同时观测到：
-
-```text
-can_piper1 左臂：candump 有持续 CAN 帧，状态 ERROR-ACTIVE
-can_piper2 右臂：曾出现 candump 无输出，状态 ERROR-PASSIVE
-```
-
-这说明右臂驱动在初始化读取固件版本阶段失败。若再次出现，先确认：
-
-```bash
-ip -br link show type can
-ip -details link show dev can_piper2
-candump can_piper2
-```
-
-如果报 `Cannot find device "can_piper2"`，说明接口名丢失，运行：
-
-```bash
-./start_can.sh
-```
-
-如果 `can_piper2` 存在但 `ERROR-PASSIVE` 且 `candump` 无输出，则优先检查右臂电源、急停、CAN 线、终端电阻、控制器状态或联系供应商。
-
-## 头部舵机
-
-启动：
-
-```bash
-ros2 launch servo_driver start_servo.py
-```
-
-默认只读，不自动使能或移动；使用 `ros2 topic echo /head/state --once` 检查反馈。
-旧 `/servo/ctrl` 接口已移除。需要调整时按
-[操作手册第 13.3 节](teleoperation/TELEOPERATION_RUNBOOK.md#133-网页调试头部相机视角)
-先托稳头部，使用 `allow_motion:=true` 启动驱动，通过 PICO 网页的“头部相机”页
-查看实时图像、开启调整、设置目标和锁定姿态。成功到位后可以连续调整，无需逐次调用 ROS 命令。
-ID1 俯仰范围 1000～2700，ID2 左右范围 2000～5000，单位为原始计数；
-单步最多 20，速度参数 1～5。正负物理方向需要现场小步确认。
-“锁定调整”只关闭新目标，不卸力；需要释放头部时先托稳，再使用网页“舵机失能”或调用
-`ros2 service call /head/torque_enable std_srvs/srv/SetBool "{data: false}"`。服务会对 ID1、ID2
-分别写入并回读扭矩关闭状态；任一侧无法确认时返回失败。该服务拒绝 `data: true`，重新启用必须走
-`/head/adjust_enable` 的反馈、限位和心跳门禁。退出不自动回零；采集期间保持头部固定，只运行彩色＋深度 20 Hz 图像采集。
-
-## 灵巧手
-
-启动双手：
-
-```bash
-ros2 launch linker_hand_ros2_sdk linker_hand_double.launch.py
-```
-
-状态：
-
-```bash
-ros2 topic echo /cb_left_hand_state
-ros2 topic echo /cb_right_hand_state
-```
-
-控制话题：
-
-```text
-/cb_left_hand_control_cmd
-/cb_right_hand_control_cmd
-```
-
-消息类型为 `sensor_msgs/msg/JointState`，L10 需要一次给完整 10 个位置值。当前驱动启动时会设置速度/力矩并移动到预设姿态，第一次测试前确认手指无遮挡。
-
-手册参考左手命令：
-
-```bash
-ros2 topic pub /cb_left_hand_control_cmd sensor_msgs/msg/JointState "{header: {stamp: {sec: 0, nanosec: 0}, frame_id: ''}, name: ['thumb_cmc_pitch','thumb_cmc_yaw','index_mcp_pitch','middle_mcp_pitch','ring_mcp_pitch','pinky_mcp_pitch','index_mcp_roll','ring_mcp_roll','pinky_mcp_roll','thumb_cmc_roll'], position: [200.0, 200.0, 254.0, 254.0, 254.0, 254.0, 179.0, 180.0, 179.0, 30], velocity: [50, 50, 50, 50, 50, 50, 50.0, 50.0, 50.0, 50.0], effort: []}" -1
-```
-
-第一次建议从当前状态复制 10 个位置值，只微调一个手指 3-5 个单位。
-
-## 底盘
-
-启动：
-
-```bash
-ros2 launch ranger_bringup ranger_mini_v3.launch.py
-```
-
-键盘控制：
-
-```bash
-ros2 run teleop_twist_keyboard teleop_twist_keyboard
-```
-
-初次测试建议先短脉冲，再立即发 0。底盘代码当前没有明确的命令 watchdog，测试时必须有人观察。
-
-前进小脉冲：
-
-```bash
-ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.05, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}" -r 10
-```
-
-停止：
-
-```bash
-ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}" -1
-```
-
-## 常用诊断命令
-
-ROS 图：
-
-```bash
-ros2 node list
-ros2 topic list
-ros2 topic info -v <topic>
-ros2 topic hz <topic>
-```
-
-CAN：
-
-```bash
-ip -br link show type can
-ip -details link show dev can_piper1
-ip -details link show dev can_piper2
-candump can_piper1
-candump can_piper2
-```
-
-串口：
-
-```bash
-ls -l /dev/ttyUSB* /dev/ttyACM* /dev/rs422* /dev/rs485* 2>/dev/null
-udevadm info -q path -n /dev/ttyUSB0
-udevadm info -q path -n /dev/ttyUSB1
-udevadm info -q path -n /dev/ttyACM0
-```
-
-## 已知风险和注意事项
-
-1. `start_esrobo_system_launch.py` 会同时启动多个执行机构，不适合首轮调试。
-2. 头部舵机驱动默认只读；显式开启调整才可能使能/运动，退出不会自动卸力。
-3. 灵巧手驱动启动时会设置较高力矩/速度并移动到预设姿态。
-4. 机械臂 `move_j` 必须给完整 7 关节位置，避免缺失关节被错误处理。
-5. 底盘 `/cmd_vel` 测试后必须主动发送 0 速度。
-6. 腰部 `/erobo/enable` 只接受 `true`，作用于扫描到的全部腰部关节；驱动忽略 `false`，不提供 `/erobo/brake` 入口。腰部不得通过软件失能。
-7. `debug_cmd.txt` 中部分命令幅度较大，第一次真机调试不要直接照抄。
-
-## 通过标准
-
-每个部件建议满足以下条件再进入下一项：
-
-```text
-传感器：话题存在，数据持续输出，无明显异常跳变
-CAN：接口 UP，状态 ERROR-ACTIVE，有预期 CAN 帧
-腰部：状态能读，小幅目标能到达并回位
-机械臂：能读 firmware 和 joint_states，小幅单关节运动能回位
-头部舵机：小幅运动方向正确，无卡滞
-灵巧手：状态能读，单指小幅运动正常
-底盘：低速短脉冲方向正确，停止命令有效
-```
+修改代码或配置后，按现场安全流程停止并重启相关进程；已运行的 Python 进程不会自动加载工作区变更。软件回归入口为 `./laptop_teleop/scripts/test.sh`，它需要先完成本机环境安装；软件测试不代替实机验收。

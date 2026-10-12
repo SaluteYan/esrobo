@@ -11,7 +11,7 @@ from esrobo_laptop.acquisition import annotate
 from esrobo_laptop.config import ROOT, read_settings, read_robot_config
 from esrobo_laptop.inputs import FreshBodyDevice, InputUnavailable
 from esrobo_laptop.mapping import hand_units
-from esrobo_laptop.pico_hand import PicoHands, retarget_hand
+from esrobo_laptop.pico_hand import PicoHands, retarget_hand, palm_basis
 
 
 def skeleton(curl=0.):
@@ -40,6 +40,22 @@ def test_finger_curl_is_bounded_and_pose_independent():
     assert np.allclose(retarget_hand(closed), b)
     with pytest.raises(ValueError):
         retarget_hand(np.zeros((26, 7)))
+
+
+@pytest.mark.parametrize("mirror", [1., -1.])
+def test_palm_landmarks_define_right_handed_world_vectors(mirror):
+    poses = skeleton()
+    poses[:, 0] *= mirror
+    basis = palm_basis(poses)
+    assert np.linalg.det(basis) == pytest.approx(1.)
+    np.testing.assert_allclose(basis[:, 2], [0., 1., 0.])
+    np.testing.assert_allclose(basis[:, 1], [mirror, 0., 0.])
+    whole = Rotation.from_euler("xyz", [40., -25., 12.], degrees=True).as_matrix()
+    poses[:, :3] = poses[:, :3] @ whole.T + [3., -2., 1.]
+    np.testing.assert_allclose(palm_basis(poses), whole @ basis, atol=1e-7)
+    poses[22, :3] = poses[7, :3]
+    with pytest.raises(ValueError):
+        palm_basis(poses)
 
 
 @pytest.mark.parametrize('side', ['left', 'right'])
@@ -92,6 +108,21 @@ def test_hand_cache_and_unrelated_xr_updates_never_renew_sample():
     assert reader.poll(sdk) == {}
 
 
+def test_static_complete_hand_packets_advance_without_pose_change(monkeypatch):
+    current = dict(sample(), timestamp_ns=0, packet_timestamp_ns=100,
+                   freshness_source='component-packet')
+    sdk = SimpleNamespace(get_left_hand_sample=lambda: current,
+                          get_right_hand_sample=lambda: dict(current, active=False))
+    monkeypatch.setattr('esrobo_laptop.pico_hand.time.monotonic', lambda: 10.)
+    reader = PicoHands()
+    assert reader.poll(sdk)['left']['sample_monotonic'] == pytest.approx(9.999)
+    assert reader.poll(sdk) == {}
+    current.update(sequence=2, packet_timestamp_ns=101)
+    assert 'left' in reader.poll(sdk)
+    current.update(sequence=3, packet_timestamp_ns=102, age_s=.101)
+    assert reader.poll(sdk) == {}
+
+
 @pytest.fixture
 def device():
     cfg = copy.deepcopy(read_robot_config(read_settings(ROOT/'config/laptop.yaml')).retarget)
@@ -102,7 +133,7 @@ def device():
 
 
 def packet(side, seq=1, stamp=None):
-    return annotate(dict(pico_hands={side: dict(joints=[0.]*10, sequence=seq)}),
+    return annotate(dict(pico_hands={side: dict(joints=[0.]*10, sequence=seq, palm_basis=np.eye(3).tolist())}),
                     'pico_hand', {side: time.monotonic() if stamp is None else stamp}, [side])
 
 
@@ -119,6 +150,85 @@ def test_independent_sides_and_missing_required_inputs(device):
     before = dict(device.stamps)
     device._handle_packet(packet('right', 2, time.monotonic()-1))
     assert device.stamps == before
+
+
+@pytest.mark.parametrize("palm", [None, np.zeros((3, 3)).tolist(), np.diag([1., 1., -1.]).tolist()])
+def test_arm_hand_packets_need_valid_anatomical_palm_without_fallback(device, palm):
+    msg = json.loads(packet("right"))
+    if palm is None:
+        del msg["pico_hands"]["right"]["palm_basis"]
+    else:
+        msg["pico_hands"]["right"]["palm_basis"] = palm
+    device._handle_packet(json.dumps(msg).encode())
+    assert not device.stamps
+    assert not device.palm_history["right"]
+
+
+def test_palm_calibration_checks_pair_age_stability_transform_and_reset(device):
+    from esrobo_teleop import math_utils as mu
+    now = time.monotonic()
+    # Body's transformed forearm is X, palm normal is Z.
+    points = dict(shoulder=np.array([0., 1., 0.]), elbow=np.zeros(3), wrist=np.array([1., 0., 0.]))
+    device._current_arm_points = lambda _: points
+    device._cfg.auto_start_reference_require_waist = True
+    waist = Rotation.from_euler("y", 20., degrees=True).as_matrix()
+    device._frames["waist"] = np.r_[np.zeros(3), mu.matrix_to_quat_wxyz(waist)]
+    desired = Rotation.from_euler("y", 90., degrees=True).as_matrix()
+    raw = device._rotation.T @ waist @ desired
+    device.incoming_body_stamps = {"right_arm": now-.005}
+    device.palm_history["right"].extend((now-.2+i*.01, raw.copy(), i+1) for i in range(20))
+    transformed, stamp, seq = device._calibration_palm("right", now)
+    np.testing.assert_allclose(transformed, desired, atol=1e-6)
+    assert abs(stamp-device.incoming_body_stamps["right_arm"]) <= .04
+    device.incoming_body_stamps["right_arm"] = now+.06
+    with pytest.raises(ValueError, match="不同步"):
+        device._calibration_palm("right", now)
+    device.incoming_body_stamps["right_arm"] = now-.005
+    device.palm_history["right"].append((now-.001, raw @ Rotation.from_euler("x", 10., degrees=True).as_matrix(), 21))
+    with pytest.raises(ValueError, match="仍在移动"):
+        device._calibration_palm("right", now)
+    device.restart_preparation()
+    assert not device.palm_history["right"]
+    with pytest.raises(ValueError, match="12"):
+        device._calibration_palm("right", now)
+
+
+def test_absolute_palm_diagnostics_are_frozen_with_control_frame(device):
+    from esrobo_teleop import math_utils as mu
+    from esrobo_laptop.orientation import AbsoluteHandOrientation, ForearmFrame, ANATOMICAL_NEUTRAL
+    from esrobo_laptop.inputs import SourceExpired
+    now=time.monotonic()
+    points=dict(shoulder=np.array([0., 1., 0.]), elbow=np.zeros(3), wrist=np.array([1., 0., 0.]))
+    carrier=ForearmFrame().update(points)
+    palm_reference=carrier @ ANATOMICAL_NEUTRAL
+    device.wrist_references['right']=AbsoluteHandOrientation(points,np.eye(3),palm_rotation=palm_reference)
+    device._current_arm_points=lambda _: points
+    current=np.eye(4);current[:3,:3]=Rotation.from_euler('x',35.,degrees=True).as_matrix()
+    device._current_wrist_matrix=lambda _: (current,'wrist')
+    waist=Rotation.from_euler('xyz',[23.,-17.,6.],degrees=True).as_matrix()
+    device._cfg.auto_start_reference_require_waist=True
+    device._frames['waist']=np.r_[np.zeros(3),mu.matrix_to_quat_wxyz(waist)]
+    device.stamps['right_arm']=now-.01
+    # Hand gives 50 degrees while the diagnostic Body gives only 35.
+    palm=Rotation.from_euler('x',50.,degrees=True).as_matrix() @ palm_reference
+    raw=device._rotation.T @ waist @ palm
+    device.palm_history['right'].append((now-.012,raw,51))
+    device._compose_wrist_rotation('right',None,full_target=True)
+    np.testing.assert_allclose(device.wrist_rotations['right'],carrier.T @ palm,atol=1e-6)
+    held=device.wrist_rotations['right'].copy()
+    device._frames['waist'][3:]=mu.matrix_to_quat_wxyz(Rotation.from_euler('z',90.,degrees=True).as_matrix())
+    values=device.wrist_diagnostics(now)['right']
+    assert values['orientation_mode']=='forearm_absolute'
+    assert values['requested_roll_deg']==pytest.approx(50.,abs=1e-5)
+    assert values['body_absolute_roll_deg']==pytest.approx(35.,abs=1e-5)
+    assert values['body_palm_disagreement_deg']==pytest.approx(15.,abs=1e-5)
+    assert values['palm_pair_gap_ms']==pytest.approx(2.)
+    np.testing.assert_array_equal(device.wrist_rotations['right'],held)
+    assert device.wrist_diagnostics(now+.2)['right']['palm_comparison_status']=='unavailable'
+    device.palm_history['right'].clear()
+    device.palm_history['right'].append((now-.08,raw,52))
+    with pytest.raises(SourceExpired,match='不同步'):
+        device._compose_wrist_rotation('right',None)
 
 
 def test_hand_only_requires_one_selected_pico_hand_without_body_reference():
@@ -167,21 +277,28 @@ def test_hand_packets_cannot_change_body_or_inject_imu(device):
 
 
 @pytest.mark.parametrize('side', ['left', 'right'])
-def test_pico_wrist_zero_and_rotation_apply_to_both_sides(device, side):
-    initial = Rotation.from_euler('xyz', [.3, -.2, .5]).as_matrix()
-    initial_pose = np.eye(4)
-    initial_pose[:3, :3] = initial
-    setattr(device, f'_initial_{side}_pose_matrix', initial_pose)
-    ref = Rotation.from_euler('xyz', [-.1, .5, -.2]).as_matrix()
-    device._reference_wrist_rotations[side] = ref
-    current = np.eye(4)
-    current[:3, :3] = ref
-    device._current_wrist_matrix = lambda _: (current, 'wrist')
-    assert np.allclose(device._compose_wrist_rotation(side, None), initial)
-    delta = Rotation.from_rotvec([0, 0, .02]).as_matrix()
-    current[:3, :3] = delta @ ref
-    assert np.allclose(device._compose_wrist_rotation(side, None), delta @ initial)
-    current[:3, :3] = Rotation.from_rotvec([0, 0, 2.]).as_matrix() @ ref
-    previous = device.wrist_rotations[side].copy()
-    result = device._compose_wrist_rotation(side, None)
+def test_absolute_palm_targets_and_step_filter_apply_to_both_sides(device,side):
+    from esrobo_teleop import math_utils as mu
+    from esrobo_laptop.orientation import AbsoluteHandOrientation, ForearmFrame, ANATOMICAL_NEUTRAL
+    points=dict(shoulder=np.array([0.,1.,0.]),elbow=np.zeros(3),wrist=np.array([1.,0.,0.]))
+    carrier=ForearmFrame().update(points)
+    initial=Rotation.from_euler('x',-120.,degrees=True).as_matrix() @ ANATOMICAL_NEUTRAL
+    device.wrist_references[side]=AbsoluteHandOrientation(points,np.eye(3),palm_rotation=carrier @ initial)
+    device._current_arm_points=lambda _:points
+    device._current_wrist_matrix=lambda _:(np.eye(4),'wrist')
+    device._frames['waist']=np.r_[np.zeros(3),mu.matrix_to_quat_wxyz(np.eye(3))]
+    def sample(angle):
+        now=time.monotonic();device.stamps[f'{side}_arm']=now
+        local=Rotation.from_euler('x',angle,degrees=True).as_matrix() @ ANATOMICAL_NEUTRAL
+        device.palm_history[side].append((now,device._rotation.T @ carrier @ local,1))
+        return local
+    local=sample(-120.)
+    device._compose_wrist_rotation(side,None,full_target=True)
+    np.testing.assert_allclose(device.wrist_rotations[side],local,atol=1e-6)
+    local=sample(100.)
+    previous=device.wrist_references[side].filtered.copy()
+    device._compose_wrist_rotation(side,None)
+    result=device.wrist_rotations[side]
     assert Rotation.from_matrix(result @ previous.T).magnitude() <= np.deg2rad(2.01)
+    device._compose_wrist_rotation(side,None,full_target=True)
+    np.testing.assert_allclose(device.wrist_rotations[side],local,atol=1e-6)

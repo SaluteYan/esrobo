@@ -3,7 +3,7 @@ import secrets
 import socket
 import time
 
-from .protocol import MAX_PACKET, ProtocolError, key_from_file, pack, unpack, validate_hold, validate_target
+from .protocol import MAX_PACKET, ProtocolError, key_from_file, pack, unpack, validate_hold, validate_target, validate_entry_keepalive
 
 
 class RobotClient:
@@ -67,7 +67,7 @@ class RobotClient:
         self.socket.send(pack(dict(type=kind, session=self.latest["session"], seq=self.seq,
                                    lease=self.latest["lease"], **payload), self.key))
 
-    def send_target(self, arm_urdf_rad, hand_unit=None):
+    def send_target(self, arm_urdf_rad, hand_unit=None, *, entry=None):
         """Call once per NEW solved input frame, never on stale PICO/glove data."""
         if self.latest is None:
             raise RuntimeError("connect first")
@@ -77,15 +77,28 @@ class RobotClient:
         payload = dict(side=c["side"], contract_id=c["id"],
                        arm_urdf_rad=list(arm_urdf_rad),
                        hand_unit=None if hand_unit is None else list(hand_unit))
+        if entry is not None:
+            payload["entry"] = entry
         validate_target(payload, c)
         self._command("target", **payload)
 
-    def send_hold(self):
-        """Renew a fresh arm-only lease and ask the robot to brake/hold."""
+    def send_entry_keepalive(self, plan_token):
+        """Keep an accepted fixed plan alive without claiming fresh PICO input."""
+        if self.latest is None:
+            raise RuntimeError("connect first")
+        c = self.latest["contract"]
+        payload = dict(side=c["side"], contract_id=c["id"], plan_token=plan_token)
+        validate_entry_keepalive(payload, c)
+        self._command("entry_keepalive", **payload)
+
+    def send_hold(self, *, reason="input"):
+        """Renew a fresh lease and ask the robot to brake/hold without a target."""
         if self.latest is None:
             raise RuntimeError("connect first")
         c = self.latest["contract"]
         payload = dict(side=c["side"], contract_id=c["id"])
+        if reason != "input":
+            payload["reason"] = reason
         validate_hold(payload, c)
         self._command("hold", **payload)
 

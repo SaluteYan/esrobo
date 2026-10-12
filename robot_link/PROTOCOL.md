@@ -72,13 +72,20 @@ ACTIVE/ARMING 在旧流过期后先故障闭锁，再处理后来包，禁止迟
 
 ## 5. 受控保持 hold 与停止 stop
 
-单臂纯机械臂模式在已进入 `ACTIVE` 后，若 IK 确认是可恢复的关节位置限位，可发送 `hold`：
+已进入 `ACTIVE` 后，客户端可发送无位置目标的 `hold`。合同 `input_hold_protocol=2` 区分两种保持原因：
 
 ```json
-{"v":1,"type":"hold","session":"<会话>","seq":2,"lease":"<有效令牌>","contract_id":"<已核对合同摘要>","side":"right"}
+{"v":1,"type":"hold","session":"<会话>","seq":2,"lease":"<有效令牌>","contract_id":"<已核对合同摘要>","side":"right","reason":"position"}
 ```
 
-`hold` 不含关节角或手部目标，网关调用机械臂驱动的受检减速保持。它沿用递增序号、独占会话和 200 ms 令牌有效期；本机只在每个全新、完整且未过期的 PICO 帧计算后发送，输入丢失仍会触发故障。双臂、带灵巧手和仅灵巧手模式拒绝 `hold`。回到可达范围并连续满足几何误差阈值后，客户端重新发送 `target`。
+`hold` 不含关节角或手部目标，网关调用机械臂驱动的受检减速保持；带手端点以新鲜实测手指位置保持。它沿用递增序号、独占会话、此前必须已有新鲜目标的要求和 200 ms 令牌有效期。
+
+- `reason: "position"`：单臂正式跟随中，全新、完整、未过期 PICO 帧经 IK 后请求位置暂停；持续有新鲜包时可保持超过 500 ms。客户端不能缓存重发此包来掩盖 PICO 断流。双臂和仅灵巧手端点拒绝位置暂停。
+- `reason: "input"` 或省略 `reason`：缺少新 PICO 数据的短时保持，连续时长最多 500 ms；反复刷新网络租约不能重置该计时。双臂、带手和仅手端点支持这一路径。
+
+收到新鲜位置暂停包或有效目标会结束输入中断计时；客户端从输入恢复等待转入位置暂停前，仍需连续三个新鲜周期。位置暂停转为输入暂停会重新开始 500 ms 输入计时。两类保持都不会重置已过期租约，网络断流、过期反馈和驱动故障仍闭锁。状态与日志包含 `hold_reason`、`position_hold_age_s` 和仅计输入缺失的 `input_hold_age_s`。
+
+旧合同 `input_hold_protocol=1` 仍可接收输入保持；拒绝 `reason: "position"`。新版本机要求能力 2，以防两端代码不一致再次误停。内部包封装仍为 `v:1`。
 
 ```json
 {"v":1,"type":"stop","session":"<会话>","seq":2,"lease":"<有效令牌>"}
@@ -169,3 +176,16 @@ IDLE 接收目标但不运动 → 机器人终端 `e` → ARMING 本机预检查
 现有单臂回零碰撞检查未覆盖对侧机械臂和手，双侧网关因此在接收本机 `z` 时立即拒绝，状态不进入 RETURNING，
 不发送回零目标；不将两条单臂避碰路径组合后冒充双臂安全回零。故障不因重连解锁；须现场排障后重启。
 双侧遥操作本身不新增双臂之间实时碰撞检查，保留原有限位、反馈、力矩和躯干检查策略。
+
+## 绝对姿态接管扩展（entry_protocol=6）
+
+线格式继续使用 v1 的 candidate/ready/active 与冻结 reference_source。协议 6 的初始接近只规划 J1–J5，目标包中 J6/J7 必须是实测保持值；机器人在接近起点再次核对，超过既有 0.2° 静止容差则拒绝并要求重新标定，不能把旧客户端的腕部目标静默改成保持值。路径搜索和最终区间认证采用 entry_arm 模型，排除灵巧手掌体和手指几何及固定手部包络。运动中仅复用完整区间证书。到位核验后从实测姿态开始完整实时跟随，保留原实时和受检回零保护。客户端/网页要求协议 6，拒绝协议 5；双臂和仅手模式不改变。
+
+
+## Fixed-entry keepalive extension (2026-10-08)
+
+Single-arm fixed-entry endpoints advertise `entry_keepalive_protocol: 1` alongside entry protocol 6. Each accepted local `g` creates a new 32-character `entry_plan_token`, included in authenticated state packets. Stop/fault/preparation/activation invalidates it.
+
+`entry_keepalive` carries only the existing `v`, `type`, `session`, `seq`, `lease`, `side`, `contract_id` fields and `plan_token`. It is accepted only in CHECKING_ENTRY, APPROACHING, or WAITING_FOR_ACTIVE_TARGET for the current plan and a still-valid command lease. Target/sensor fields, wrong sessions/tokens, replayed sequences and expired leases are rejected without renewal.
+
+It renews communication to the robot-issued lease deadline and updates `entry_keepalive_age_s`, without changing the frozen target or the target/ready acknowledgment's separate deadline. It cannot renew expired ready eligibility, activate an arm, or extend the two-second arrival barrier. ACTIVE rejects it. The laptop must still supply fresh input for `ready` and use existing live target/hold semantics after activation.

@@ -2,7 +2,7 @@
 from collections import OrderedDict
 import secrets
 
-from .protocol import ProtocolError, validate_hold, validate_target
+from .protocol import ProtocolError, validate_hold, validate_target, validate_entry_keepalive
 
 
 class SessionGate:
@@ -17,7 +17,11 @@ class SessionGate:
         self.leases = OrderedDict()
         self.target = None
         self.deadline = 0.0
+        self.target_deadline = 0.0
+        self.last_entry_keepalive_at = None
         self.last_seen = 0.0
+        self.hold_started_at = None
+        self.position_hold_started_at = None
 
     def hello(self, msg, peer, now, busy):
         nonce = msg.get("client_nonce")
@@ -34,7 +38,11 @@ class SessionGate:
         self.leases.clear()
         self.target = None
         self.deadline = 0.0
+        self.target_deadline = 0.0
+        self.last_entry_keepalive_at = None
         self.last_seen = now
+        self.hold_started_at = None
+        self.position_hold_started_at = None
 
     def state(self, now, status):
         lease = secrets.token_hex(12)
@@ -48,7 +56,7 @@ class SessionGate:
                     target_remaining_s=max(0.0, self.deadline - now),
                     contract=self.contract, **status)
 
-    def accept(self, msg, peer, now):
+    def accept(self, msg, peer, now, *, entry_plan_token=None):
         if self.session is None or peer != self.peer or msg.get("session") != self.session:
             raise ProtocolError("wrong session or peer")
         seq = msg.get("seq")
@@ -58,18 +66,46 @@ class SessionGate:
         if issued is None or not 0 <= now - issued < self.max_age:
             raise ProtocolError("expired robot-issued lease")
         kind = msg.get("type")
+        if kind == "entry_keepalive":
+            token = validate_entry_keepalive(msg, self.contract)
+            if not entry_plan_token or token != entry_plan_token:
+                raise ProtocolError("entry keepalive requires the current plan and entry phase")
+            if not self.fresh(now):
+                raise ProtocolError("entry keepalive cannot revive an expired plan")
+            self.sequence, self.last_seen = seq, now
+            self.deadline = issued + self.max_age
+            self.last_entry_keepalive_at = now
+            return kind  # Do not modify target, ready validity, or input-hold state.
         if kind == "target":
             target = validate_target(msg, self.contract)
+            self.hold_started_at = None
+            self.position_hold_started_at = None
         elif kind == "hold":
             target = validate_hold(msg, self.contract)
+            if self.target is None or not self.fresh(now):
+                raise ProtocolError("hold requires a preceding fresh target")
+            if target.get("hold_reason") == "position":
+                # The client has consumed a complete fresh input frame and
+                # deliberately pauses its unreachable position target. The
+                # ordinary robot-issued lease still expires if packets stop.
+                self.hold_started_at = None
+                if self.position_hold_started_at is None:
+                    self.position_hold_started_at = now
+            else:
+                self.position_hold_started_at = None
+                if self.hold_started_at is None:
+                    self.hold_started_at = now
         elif kind == "stop":
             target = None
+            self.hold_started_at = None
+            self.position_hold_started_at = None
         else:
             raise ProtocolError("only target, hold and stop accepted; enable/return are local")
         self.sequence, self.last_seen = seq, now
         self.target = target
         # A packet delayed in flight gets only its remaining lease, NOT a new TTL.
         self.deadline = issued + self.max_age if target is not None else 0.0
+        self.target_deadline = self.deadline
         return kind
 
     def fresh(self, now):

@@ -49,6 +49,18 @@ def test_search_cancel_and_budget():
     assert not result.path
 
 
+def test_locked_wrist_stays_fixed_through_rrt_detour():
+    start = np.array([-.5, 0., 0., 0., 0., .17, -.13])
+    goal = start.copy()
+    goal[0] = .5
+    def check(a, b):
+        lo, hi = np.minimum(a, b), np.maximum(a, b)
+        return not (lo[0] <= .1 and hi[0] >= -.1 and lo[1] <= .1 and hi[1] >= -.1)
+    plan = planner(check, locked_joints=(5, 6), seed=7, timeout=2).plan(start, goal)
+    assert plan.path, plan.reason
+    assert all(np.array_equal(q[5:], start[5:]) for q in plan.path)
+
+
 def calibration():
     return {'left': {'thumb_cmc_roll': dict(raw=[10,210], rad=[0,1], error_rad=.01,
                 max_velocity_rad_s=.2, verified=True)}}
@@ -81,9 +93,38 @@ def make_driver(side='left', initial=None):
         return feedback.copy()
     def send(q):
         feedback[:] = q
+    from esrobo_teleop.robot.nero_driver import JointFeedbackSnapshot
+    def entry_snapshot(**kwargs):
+        values = d.read_joints()
+        if values is None:
+            return None
+        return JointFeedbackSnapshot(values, d._arm.last_feedback_timestamp,
+                                     d._return_feedback_received, 'verified-test-source')
+    d._arm.runtime_feedback.side_effect = entry_snapshot
     d.read_joints = mock.Mock(side_effect=read)
     d._arm.move_j.side_effect = send
     return d, feedback, zero
+
+
+def test_release_unstarted_return_preserves_cancel_and_allows_new_request():
+    d, _, _ = make_driver()
+    request_id = d.prepare_return()
+    assert request_id is not None and d.prepare_return() is None
+    d.cancel_return()
+    d.release_return_request(request_id)
+    assert not d._return_pending and d._return_cancel.is_set()
+    following = d.prepare_return()
+    assert following == request_id + 1 and not d._return_cancel.is_set()
+    d.release_return_request(request_id)
+    assert d._return_pending
+
+
+def test_release_reservation_cannot_end_running_return():
+    d, _, _ = make_driver()
+    request_id = d.prepare_return()
+    d._return_active = True
+    d.release_return_request(request_id)
+    assert d._return_active and d._return_pending
 
 
 @pytest.mark.parametrize('side', ['left','right'])
@@ -96,6 +137,52 @@ def test_complete_simulated_return_verifies_stationary_before_disable(side):
     assert np.max(abs(d._return_start_state.velocity)) < 1e-8
     d._arm.disable.assert_called_once()
     assert d._arm.move_j.call_count > 10
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+def test_return_execution_uses_verified_snapshot_without_two_sample_wait(side):
+    from esrobo_teleop.robot.nero_driver import JointFeedbackSnapshot
+    d, feedback, zero = make_driver(side, np.ones(7)*.04)
+    clock = [10.]
+    def snapshot(**kwargs):
+        clock[0] += .02
+        d._arm.last_feedback_timestamp = clock[0]
+        return JointFeedbackSnapshot(feedback.copy(), clock[0], time.monotonic(), 'verified')
+    d._arm.runtime_feedback.side_effect = snapshot
+    d.read_joints.side_effect = AssertionError('blocking startup reader used during execution')
+    with mock.patch('esrobo_teleop.robot.nero_driver.time.sleep'):
+        assert d._execute_return_group(np.zeros(14), np.arange(7), zero,
+                                      np.deg2rad(1.5), 2.)
+    d.read_joints.assert_not_called()
+    assert d._arm.runtime_feedback.call_count > 10
+    assert np.max(abs(feedback-zero)) <= np.deg2rad(1.5)
+
+
+@pytest.mark.parametrize('failure', [None, 'cancel', 'exception'])
+def test_return_full_geometry_cache_lifetime_and_context(failure):
+    from test_entry_execution import guard
+    g = guard()
+    d, _, _ = make_driver(initial=np.ones(7)*.04)
+    d.configure_collision_guard(g)
+    original = d._return_group_to_zero
+    def execute(*args, **kwargs):
+        assert g._entry_certificates is not None
+        assert not g._entry_arm_geometry_only
+        assert not g._entry_coverage_only
+        if failure == 'exception':
+            raise RuntimeError('test cancellation cleanup')
+        if failure == 'cancel':
+            d._return_cancel.set()
+            return False
+        return original(*args, **kwargs)
+    d._return_group_to_zero = execute
+    with mock.patch('esrobo_teleop.robot.nero_driver.time.sleep'):
+        result = d.safe_return()
+        assert result.returned == (failure is None)
+        if failure == 'exception':
+            assert 'test cancellation cleanup' in result.reason
+    assert g._entry_certificates is None
+    assert not g._entry_coverage_only
 
 
 @pytest.mark.parametrize('side', ['left', 'right'])
@@ -194,14 +281,85 @@ def test_operator_estop_is_never_auto_reset_by_recovery_return():
     d._arm.move_j.assert_not_called()
 
 
-def test_explicit_recovery_clears_verified_inherited_estop_and_returns():
-    d, feedback, zero = make_driver(initial=np.array([.01, -.02, .01, .02, 0, 0, 0]))
+@pytest.mark.parametrize('side', ['left', 'right'])
+@pytest.mark.parametrize('estop', [True, False])
+def test_disabled_controller_recovery_is_stationary_and_clears_only_after_verification(side, estop):
+    d, _, _ = make_driver(side)
+    d._arm.get_joint_enable_states.return_value = [False]*7
+    d._safety_fault_reason = 'operator emergency stop; explicit recovery required'
+    pending = [estop]
+    def fault(**kw):
+        return ({'category': 'controller_fault', 'arm_status': 1, 'err_code': 0, 'ctrl_mode': 1}
+                if pending[0] and not kw.get('allow_estop') else None)
+    d._arm.controller_fault.side_effect = fault
+    d._arm.reset.side_effect = lambda: pending.__setitem__(0, False)
+    with mock.patch('esrobo_teleop.robot.nero_driver.time.sleep'):
+        r = d.recover_disabled_controller()
+    assert r == dict(disabled=True, reset_sent=estop, verified_samples=3)
+    assert d._safety_fault_reason is None and not d._enabled
+    assert d._arm.reset.call_count == int(estop)
+    d._arm.enable.assert_not_called()
+    d._arm.move_j.assert_not_called()
+
+
+@pytest.mark.parametrize('failure', ['enabled', 'mixed', 'geometry', 'missing', 'driver', 'cancel', 'drift', 'duplicate'])
+def test_disabled_controller_recovery_rejects_unverified_state(failure):
+    d, feedback, _ = make_driver()
+    d._arm.get_joint_enable_states.return_value = [False]*7
+    d._safety_fault_reason = 'latched'
+    d._arm.controller_fault.return_value = None
+    if failure == 'enabled': d._arm.get_joint_enable_states.return_value = [True]*7
+    if failure == 'mixed': d._arm.get_joint_enable_states.return_value = [False]*6+[True]
+    if failure == 'geometry': d._check_physical_path = mock.Mock(return_value=False)
+    if failure == 'missing': d.read_joints.return_value = None; d.read_joints.side_effect = None
+    if failure == 'driver': d._arm.controller_fault.return_value = {'category': 'driver_fault'}
+    if failure == 'drift':
+        d.read_joints.side_effect = [feedback.copy(), feedback.copy()+.01]
+    if failure == 'duplicate':
+        d.read_joints.side_effect = None
+        d.read_joints.return_value = feedback.copy()
+        d._arm.last_feedback_timestamp = 1.
+    with mock.patch('esrobo_teleop.robot.nero_driver.time.sleep'), \
+            mock.patch('esrobo_teleop.robot.nero_driver.time.monotonic', side_effect=np.arange(0., 20., .1)):
+        with pytest.raises(RuntimeError):
+            d.recover_disabled_controller(lambda: failure == 'cancel')
+    assert d._safety_fault_reason == 'latched'
+    d._arm.reset.assert_not_called()
+    d._arm.enable.assert_not_called()
+    d._arm.move_j.assert_not_called()
+
+
+@pytest.mark.parametrize('failure', ['enabled_after_reset', 'driver_after_reset', 'cancel_after_reset'])
+def test_disabled_reset_never_commits_failed_hardware_recovery(failure):
+    d, _, _ = make_driver()
+    d._safety_fault_reason = 'latched'
+    reset = [False]
+    d._arm.get_joint_enable_states.side_effect = lambda: [reset[0] and failure == 'enabled_after_reset']*7
+    def fault(**kw):
+        if reset[0]:
+            return {'category': 'driver_fault'} if failure == 'driver_after_reset' else None
+        return (None if kw.get('allow_estop') else
+                {'category': 'controller_fault', 'arm_status': 1, 'err_code': 0, 'ctrl_mode': 1})
+    d._arm.controller_fault.side_effect = fault
+    d._arm.reset.side_effect = lambda: reset.__setitem__(0, True)
+    with pytest.raises(RuntimeError):
+        d.recover_disabled_controller(lambda: reset[0] and failure == 'cancel_after_reset')
+    assert d._safety_fault_reason == 'latched'
+    assert d._arm.disable.call_count == int(failure == 'enabled_after_reset')
+    d._arm.enable.assert_not_called()
+    d._arm.move_j.assert_not_called()
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+@pytest.mark.parametrize('marker_known', [True, False])
+def test_explicit_recovery_clears_verified_inherited_estop_and_returns(side, marker_known):
+    d, feedback, zero = make_driver(side, initial=np.array([.01, -.02, .01, .02, 0, 0, 0]))
     enabled = {'value': False}
     reset = {'value': False}
     d._enabled = False
     d._return_inhibited = True
     d._safety_fault_reason = 'inherited emergency stop'
-    d._inherited_estop_recovery_pending = True
+    d._inherited_estop_recovery_pending = marker_known
     d._arm.get_joint_enable_states.side_effect = lambda: [enabled['value']] * 7
 
     def controller_fault(*, allow_disabled=False, allow_estop=False):
@@ -220,13 +378,37 @@ def test_explicit_recovery_clears_verified_inherited_estop_and_returns():
     d._capture_arm_torque_baseline = mock.Mock(return_value=True)
 
     with mock.patch('esrobo_teleop.robot.nero_driver.time.sleep'):
-        result = d.safe_return(recover=True)
+        result = d.safe_return(recover=True, recognize_inherited_stop=not marker_known)
 
     assert result.returned and result.disabled
     d._arm.reset.assert_called_once_with()
     assert not d._inherited_estop_recovery_pending
     assert not d._software_estop_recovery_pending
     assert np.max(np.abs(feedback-zero)) <= np.deg2rad(1.5)
+
+
+@pytest.mark.parametrize('failure', ['automatic', 'enabled', 'mixed', 'other_fault', 'geometry', 'missing_pose'])
+def test_new_process_estop_recognition_never_bypasses_prechecks(failure):
+    d, _, _ = make_driver()
+    d._inherited_estop_recovery_pending = False
+    d._software_estop_recovery_pending = False
+    d._arm.get_joint_enable_states.return_value = (
+        [True] * 7 if failure == 'enabled' else
+        [False] * 6 + [True] if failure == 'mixed' else [False] * 7)
+    def fault(*, allow_disabled=False, allow_estop=False):
+        if allow_estop:
+            return {'category': 'driver_fault', 'joint': 2} if failure == 'other_fault' else None
+        return {'category': 'controller_fault', 'arm_status': 1, 'err_code': 0, 'ctrl_mode': 1}
+    d._arm.controller_fault.side_effect = fault
+    if failure == 'geometry':
+        d._check_physical_path = lambda a, b: False
+    if failure == 'missing_pose':
+        d.read_joints = mock.Mock(return_value=None)
+    result = d.safe_return(recover=True, recognize_inherited_stop=failure != 'automatic')
+    assert not result.returned
+    d._arm.reset.assert_not_called()
+    d._arm.enable.assert_not_called()
+    d._arm.move_j.assert_not_called()
 
 
 def test_inherited_estop_recovery_rechecks_driver_fault_before_reset():
@@ -378,12 +560,31 @@ def model_guards():
     solver = IkSolver(cfg.ik)
     guards = {}
     for side in ('left','right'):
-        g = TorsoCollisionGuard(solver,side)
+        # These recorded detour fixtures were certified at the former 30 mm
+        # margin; do not silently change their meaning with the runtime default.
+        g = TorsoCollisionGuard(solver, side, margin=.03)
         # Synthetic bounded finger pose; not a real hardware calibration.
         g.hand_state_provider = lambda horizon, side=side: HandGeometryState(time.monotonic(),
             {side+'_'+n:(0,.01) for n in ACTIVE_HAND_JOINTS},tuple(ACTIVE_HAND_JOINTS),True)
         guards[side] = g
     return cfg, solver, guards
+
+
+def test_entry_arm_only_profile_keeps_arm_clearance_without_hand_feedback(model_guards):
+    from esrobo_teleop.robot.hand_geometry import HandGeometryState
+    guard = model_guards[2]['right']
+    original = guard.hand_state_provider
+    try:
+        guard.hand_state_provider = lambda horizon: HandGeometryState(
+            None, {}, (), False, "stale hand geometry")
+        q = np.zeros(14)
+        assert not guard(q, q)
+        assert guard.last_diagnostics['category'] == 'hand_geometry_unavailable'
+        assert guard.check_arm_only(q, q)
+        assert guard.last_diagnostics['collision_profile'] == 'arm_wrist_palm'
+        assert guard.last_diagnostics['clearance_m'] >= guard.last_diagnostics['required_m']
+    finally:
+        guard.hand_state_provider = original
 
 
 # Synthetic model poses: safe starts whose distal-first intermediate is unsafe.
@@ -543,6 +744,126 @@ def test_recovery_enable_refreshes_feedback_after_collision_configuration():
     assert d.read_joints.call_count == 2
     d._arm.move_j.assert_called_once()
     assert d._last_return_enable_failure is None
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+@pytest.mark.parametrize('fault', [
+    {'category': 'controller_feedback_stale'},
+    {'category': 'motion_mode_mismatch', 'expected': 'j', 'mode_feedback': 0},
+    {'category': 'driver_fault', 'joint': 3, 'flags': ['stall_status'], 'enabled': True},
+])
+def test_post_enable_rejection_survives_gateway_emergency_stop(side, fault):
+    d, _, _ = make_driver(side)
+    enabled = {'value': False}
+    d._enabled = False
+    d._arm.get_joint_enable_states.side_effect = lambda: [enabled['value']] * 7
+    d._arm.controller_fault.side_effect = lambda **_: fault if enabled['value'] else None
+    d._configure_arm_collision_safety = mock.Mock(return_value=True)
+    d._capture_arm_torque_baseline = mock.Mock(return_value=True)
+
+    def enable(**_kwargs):
+        enabled['value'] = True
+        return True
+
+    d._arm.enable.side_effect = enable
+    with mock.patch('esrobo_teleop.robot.nero_driver.time.sleep'):
+        result = d.safe_return(recover=True)
+    assert result.stage == 'enabling' and not result.returned and not result.disabled
+    assert 'controller safety check failed after enable' in result.reason
+    assert str(fault) in result.reason
+    original = d.safety_fault_reason
+    d.emergency_stop()
+    assert d.safety_fault_reason == original
+    assert str(fault) in d.last_return_result.reason
+    d._arm.emergency_stop.assert_called_once()
+    d._arm.move_j.assert_called_once()  # Only measured-pose preload.
+    d._capture_arm_torque_baseline.assert_not_called()
+    d._arm.disable.assert_not_called()
+
+
+def test_explicit_emergency_stop_without_prior_fault_keeps_operator_reason():
+    d, _, _ = make_driver()
+    d.emergency_stop()
+    assert d.safety_fault_reason == 'operator emergency stop; explicit recovery required'
+    d._arm.emergency_stop.assert_called_once()
+
+
+def brake_pending():
+    return dict(category='controller_fault', arm_status=6, err_code=0, ctrl_mode=1)
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+def test_enable_waits_for_brake_release_without_sending_targets(side):
+    d, _, _ = make_driver(side)
+    faults = iter([brake_pending(), None, None])
+    d._arm.controller_fault.side_effect = lambda **_: next(faults)
+    with mock.patch.object(d._return_cancel, 'wait', return_value=False) as wait:
+        assert d._wait_return_controller_ready()
+    wait.assert_called_once_with(.005)
+    assert d.safety_fault_reason is None
+    d._arm.move_j.assert_not_called()
+    d._arm.enable.assert_not_called()
+    d._arm.reset.assert_not_called()
+
+
+@pytest.mark.parametrize('fault', [
+    dict(category='controller_fault', arm_status=1, err_code=0, ctrl_mode=1),
+    dict(category='controller_fault', arm_status=6, err_code=1, ctrl_mode=1),
+    dict(category='controller_fault', arm_status=6, err_code=0, ctrl_mode=0),
+    dict(category='controller_feedback_stale'),
+    dict(category='motion_mode_mismatch', expected='j', mode_feedback=0),
+])
+def test_enable_transition_rejects_other_faults_immediately(fault):
+    d, _, _ = make_driver()
+    d._arm.controller_fault.return_value = fault
+    with mock.patch.object(d._return_cancel, 'wait') as wait:
+        assert not d._wait_return_controller_ready()
+    wait.assert_not_called()
+    assert str(fault) in d.safety_fault_reason
+
+
+def test_enable_brake_wait_checks_driver_faults_and_enable_bits():
+    for residual, states in [
+        (dict(category='driver_fault', joint=3, flags=['collision_status']), [True]*7),
+        (None, [True]*6+[False]),
+        (dict(category='driver_feedback_stale', joint=1), [True]*7),
+    ]:
+        d, _, _ = make_driver()
+        d._arm.controller_fault.side_effect = [brake_pending(), residual]
+        d._arm.get_joint_enable_states.return_value = states
+        with mock.patch.object(d._return_cancel, 'wait') as wait:
+            assert not d._wait_return_controller_ready()
+        wait.assert_not_called()
+
+
+@pytest.mark.parametrize('outcome', ['timeout', 'cancel', 'scheduler_late'])
+def test_enable_brake_wait_is_bounded_and_cancellable(outcome):
+    d, _, _ = make_driver()
+    clock = [0.]
+    d._arm.controller_fault.side_effect = lambda **kw: None if kw.get('allow_disabled') else brake_pending()
+    def wait(delay):
+        clock[0] += delay
+        if outcome == 'cancel':
+            d._return_cancel.set()
+        elif outcome == 'scheduler_late':
+            clock[0] += 1.
+            d._arm.controller_fault.side_effect = None
+            d._arm.controller_fault.return_value = None
+    with mock.patch('esrobo_teleop.robot.nero_driver.time.monotonic', side_effect=lambda: clock[0]), \
+            mock.patch.object(d._return_cancel, 'wait', side_effect=wait):
+        assert not d._wait_return_controller_ready()
+    if outcome != 'cancel':
+        assert 'brake_release_timeout' in d.safety_fault_reason
+    d._arm.move_j.assert_not_called()
+    d._arm.enable.assert_not_called()
+
+
+def test_runtime_status_six_still_rejects_without_transition_wait():
+    d, _, _ = make_driver()
+    d._arm.controller_fault.return_value = brake_pending()
+    with mock.patch.object(d._return_cancel, 'wait') as wait:
+        assert not d._controller_is_safe()
+    wait.assert_not_called()
 
 
 @pytest.mark.parametrize('side',['left','right'])

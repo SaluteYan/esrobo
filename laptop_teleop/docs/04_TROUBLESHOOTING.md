@@ -1,184 +1,100 @@
-# 检查与故障排查
+# 故障排查与独立测试
 
-当前使用 PICO Body + Hand 输入。缺少 `*_arm` / `*_wrist` 时检查全身追踪，缺少 `*_hand` 时检查头显 Hand Tracking、双手可见性及新版 SDK。SenseCom/手套话题不再参与本机遥操作，以下手套排障仅供旧设备维护。具体命令见 [文档 06](06_PICO_HAND_INPUT.md)。
+先根据发生阶段和第一条拒绝原因定位。网页中的毫秒数通常是样本年龄，不是网络延迟。故障后读新鲜反馈，不能根据旧日志推断机械臂已失能。
 
-## 一次性状态检查
+## 基本检查
 
 ```bash
-cd /home/ddc/DualArmTeleoperation
-./laptop_teleop/scripts/check_environment.sh
-./laptop_teleop/scripts/run_laptop.sh check
+./laptop_teleop/scripts/run_laptop.sh check --side left
+./laptop_teleop/scripts/run_laptop.sh inspect --side left
 ./laptop_teleop/scripts/xrobotoolkit_service.sh status
-ping -c 3 192.168.10.100
+ss -lunp | rg '15050|15051|15052|16000'
+ss -lntp | rg '60061|63901|8080|8765|8766'
 ```
 
-## Conda 或 Python 包错误
+`inspect` 会占用一个短会话，退出后等会话释放；不要与正式计算同时运行。端口占用先确认进程所有者，不直接抢占正在运行的采集端口。环境依赖和 SDK 重建见 [本机 README](../README.md#环境安装与配置)。
 
-确认使用项目环境且禁用用户 site-packages：
+## PICO 骨架不动、数据超时
+
+按链路区分：头显 → PC Service → SDK 组件提交 → Body/Hand 转发 → UDP 接收 → 配对/计算 → 网页。
+
+- 头显佩戴亮屏、追踪应用在前台，Body 和 Hand Tracking 均启用。手部 `inactive` 时即使 Body 正常，也不能生成带手模式的完整目标。
+- PC Service TCP 63901 收到数据不代表 SDK gRPC 60061 已收到 Body/Hand。查看 SDK 组件计数、序号和真实年龄，不能只看进程是否存在。
+- 比较 SDK Body 更新与 Body 实际转发频率。均匀 60/74/90 Hz 模拟输入的转发目标为至少 95%；突发只发送最新有效帧，合并计数增加是正常现象，不补发历史包。
+- 本机转发正常而计算等待完整帧时，检查同侧 Body、Hand、掌面有效性和 40 ms 同步条件。100 ms 时效依据原接收时刻，映射或读取缓存不会刷新时间。
+- 骨架“原始采集”“固定映射”层来自采集；重定向、IK、输出及机器人反馈层需要预览/正式计算发布。固定映射的“固定”指坐标变换，不代表静态模型。
+- 网页骨架按 50 ms 轮询，即约 20 Hz 显示；不能用动画刷新率代替 SDK 或转发的新帧频率。选择计算层但计算未运行时，页面会显示等待原因。
+- SDK 提交本身存在停顿时记录为上游空档；SDK 及时提交而转发停顿才属于本机处理问题。不要提高超时阈值或给缓存重标时间。
+
+仅在计算已停止并确认无重复订阅后重启采集；若 PC Service 到 SDK 停滞，可按现场操作重启 PC Service 和唯一采集。旧 SDK 缺少通知接口会明确要求 `install_pico.sh` 重建。
+
+## 标定未完成、预览没有 IK
+
+带手标定需要真实有效的 26 点 Hand、非退化掌面、至少 12 帧稳定数据和同步 Body。让所选手在摄像头内自然张开，肩肘腕稳定；日志出现 calibrated 后还要确认计算计数、目标及 IK 图层更新。右/左手不能互相代替来源。仅手模式不要求 Body 或掌面参考。
+
+## 合同或协议不匹配
+
+`config/URDF fingerprint mismatch` 表示本机和网关使用不同配置/模型；接管协议不匹配常见于机器人仍运行旧 Python 进程。同步双方源码、YAML、URDF 和 SDK 配套修改，在确认停止和失能后加载新进程。不要降低协议版本或跳过认证；旧网页资源可刷新，旧 Python 进程须重启。
+
+## 控制器急停与准备失败
+
+`session preparation failed` 的 `stage=...` 指出回零或使能失败位置。`controller safety check failed after enable` 不等于 PICO 超时；核对首个控制器状态、七轴使能、模式、错误码、碰撞等级读回和力矩。控制器故障、软件 FAULT 和 CAN 接口状态是三层信息。
+
+“关闭服务并初始化 CAN”不清除控制器电子急停。退出网关的 `q` 包含电子急停，重启后的 `IDLE` 也可能继承它。单臂显式恢复仅在新鲜七轴失能、当前姿态和几何有效、确认孤立电子急停且无其他控制器/驱动故障时复位；真实超力矩、实体急停、接触/卡阻和未知状态不应靠反复复位处理。
+
+受检恢复流程及使能限制见 [网页操作](05_WEB_CONSOLE.md#停止与受检恢复)。手部阶段失败且机械臂已验证健康失能时，保持软件 FAULT，不额外重锁急停；显式停止和状态不明仍执行原停止流程。
+
+## 接近、七轴回零与反馈间隔
+
+错误 `feedback interval ... since last committed command state` 表示当前反馈时间与上次已发送、已提交轨迹状态的差，不一定是相邻 CAN 帧间隔。重复反馈、超期候选丢弃、发送失败或几何认证耗时都可能让它增长。相邻反馈间隔与轨迹状态间隔分别检查。
+
+初始接近按 20 ms 固定期限运行，超期跳过错过的时刻，未发送候选不提交轨迹状态；读取已验证来源的非阻塞快照。几何认证只复用完整请求被单个有效区间盒覆盖的证书；上下文变化或越界必须拒绝/重规划，不能拼接证书或扩大证明范围。
+
+当前标定后规划只移动 J1–J5、保持 J6/J7 和手指，使用仅臂/腕碰撞配置；七轴受检回零另有完整几何检查。`planning` 阶段失败意味着规划未通过，不说明实际发生碰撞。模型间隙和认证预算需用相同实测姿态离线复现。
+
+## J6/J7、手指首次接管与恢复
+
+J6/J7 首次接管从实测位置限速过渡；已跟随后输入中断恢复仍检查目标连续性。日志 `J7 target delta ... > 5deg` 是恢复目标与上次有效目标的差，不能自动把它当作首次接管。
+
+`initial hand handover exceeded 10 s` 表示固定首次手目标未在期限内完成反馈核验。`goal` 是首次到位目标，`command` 是本机限步候选，`feedback` 是实测手状态。三个值应分别比较：
+
+- 命令迟迟达不到 goal：检查步长、速度、领先量、反向等待及输入保持。
+- 已发布命令达标但实测反馈落后：检查 ROS/UDP/CAN、电机或机构响应及该侧反馈标定。
+- `feedback diverged from command`：对应物理索引的反馈与已提交命令偏差超过保护，不能以放大容差代替原因分析。
+
+L10 物理索引：0 拇指屈曲，1 拇指侧摆，2–5 食/中/无名/小指屈曲，6–8 侧摆，9 拇指旋转。左右共享映射增益和过渡代码，反馈标定及右拇指硬止点仍分侧。历史右拇指出现过反馈基本不动；这类硬件响应不能归因于 PICO 新帧转发，也不能据此忽略其他关节的拒绝。
+
+网页区分首次目标、实时输入、本机命令、网关发布命令和实测反馈。L10 启动速度寄存器设为厂商接口最大值 255，软件仍限制 400 单位/s、单步 18 及反馈领先量；255 不是实测关节速度。
+
+## 控制频率不足与输入保持
+
+本机上限 50 Hz，配置要求 40 Hz、允许 5 Hz 容差，两秒窗口低于 35 Hz 会停止；有效目标间隔上限 80 ms。ACTIVE 输入间隙进入短时保持，最多 500 ms；持续缺失或无法满足连续 3 帧恢复条件会 FAULT。网关独立检查目标 lease 和机器人反馈。
+
+控制频率指成功完整目标发送频率，不是网页轮询频率。用独立工具区分 SDK 空档、Hand 无效、UDP 积压、Body/Hand 配对、IK 和发送；不能靠重复发送旧样本提高有效频率。
+
+## 独立测试与耗时测量
+
+正式运行不加载性能装饰器、逐周期耗时或分位数统计。测量工具在 `tests` 中运行时包装函数，结束恢复；记录进入有界异步队列。先停止正式计算，真实采集测试还须确认新鲜七轴失能反馈和唯一 SDK 订阅；不占用他人的 UDP 端口。
 
 ```bash
-source /home/ddc/miniforge3/etc/profile.d/conda.sh
-conda activate esrobo_laptop
-PYTHONNOUSERSITE=1 python -c 'import numpy, scipy, yaml, pinocchio; print(pinocchio.__version__)'
+export PYTHONPATH="$PWD/laptop_teleop/src:$PWD/laptop_teleop/tests:$PWD/robot_link:$PWD/teleoperation/src:$PWD/teleoperation:$PWD/teleoperation/tests"
+PY=/home/ddc/miniforge3/envs/esrobo_laptop/bin/python
+"$PY" laptop_teleop/tests/profile_runtime.py preview --synthetic --seconds 60 --output /tmp/esrobo-preview.jsonl
 ```
 
-缺包或环境被修改时重新同步：
+真实采集测量需要停止普通采集，并加载 SDK 库路径：
 
 ```bash
-./laptop_teleop/scripts/install_env.sh
+export LD_LIBRARY_PATH="$PWD/laptop_teleop/external/XRoboToolkit-PC-Service-Pybind/lib:/home/ddc/miniforge3/envs/esrobo_laptop/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+"$PY" laptop_teleop/tests/profile_runtime.py acquisition --seconds 60 --output /tmp/esrobo-acquisition.jsonl
 ```
 
-`run_laptop.sh`、`run_pico.sh` 和 `test.sh` 会直接选择 `esrobo_laptop`，不会使用旧 `.venv`。
+真实预览使用 `preview`，不加 `--synthetic`；它连接独立模拟网关，不调用物理运动接口，输入端口仍要求唯一接收者。验收必须有实际 arm/wrist IK 调用和有效目标，未完成参考不算计算负载通过。`benchmark_pico_forwarding.py` 可用同一模拟输入比较转发比例、慢手部计算和阻塞日志；其他 `benchmark_*.py` 是离线反馈/几何对照工具，参数用 `--help` 查看。
 
-## PICO 服务或 SDK
+同机延迟用单调时钟；跨机器只比较各自间隔和序号，不直接相减时间戳。输出属于本机测试结果，不提交运行日志或临时报告。
 
-```bash
-./laptop_teleop/scripts/xrobotoolkit_service.sh restart
-ss -lnt | grep 60061
-tail -n 100 laptop_teleop/log/xrobotoolkit_pc_service.log
-./laptop_teleop/scripts/run_pico.sh
-```
+## 日志与网页连接
 
-如果 `run_laptop.sh check` 显示 `xrobotoolkit_sdk: false`，重新运行：
+本机日志在 `laptop_teleop/log/`，包括采集、计算 JSONL、参考及控制台状态；机器人日志在 `robot_link/log/`。异步日志保留队列丢弃数、错误和必要故障事件；队列拥堵不应阻塞实时路径。
 
-```bash
-./laptop_teleop/scripts/install_pico.sh
-```
-
-若服务正常但无人体帧，检查头显和本机是否同网、头显配置的是否为本机局域网 IP、全身追踪应用是否运行。`192.168.10.100` 是机器人地址，不能当成本机 PICO Service 地址。
-
-## SenseGlove 无话题
-
-```bash
-source /opt/ros/humble/setup.bash
-source laptop_teleop/external/senseglove_ros_ws/install/setup.bash
-ros2 pkg prefix senseglove_msgs
-ros2 pkg prefix senseglove_bringup
-ros2 topic list | grep senseglove
-```
-
-先区分系统蓝牙连接与 SenseCom SDK 连接：
-
-```bash
-ros2 run senseglove_api sg_tester
-```
-
-如果系统蓝牙能看到 Nova 2，但这里显示 `No SenseGloves detected`，关闭 GNOME 蓝牙设置页及其它扫描程序，重启 SenseCom，然后从 SenseCom 左上角菜单进入 **Pair Devices**，在 **Nearby Devices** 中配对两只手套。`Player.log` 中出现 `org.bluez.Error.Busy` 表示其它程序占用了蓝牙扫描；系统设置中的“已连接”本身不能代替 SenseCom 内部配对。
-
-如果 SenseGlove ROS 日志出现 `std::invalid_argument`、`what(): stof`，随后只剩 `robot_state_publisher` 节点，表示 SGCore 在解析损坏或不完整的 Nova 2 BLE 帧时抛出了异常。当前工作空间的硬件适配层会丢弃该帧并继续运行；修改源码或重新安装后要重新执行 `install_senseglove.sh`，使本项目的异常保护重新编译生效。恢复现场进程时依次停止手套输入桥和 SenseGlove ROS，重启 SenseCom，确认两只手套连接后再启动 SenseGlove ROS。
-
-无包时重建：
-
-```bash
-./laptop_teleop/scripts/install_senseglove.sh
-```
-
-有话题但数值全零时，按顺序处理：
-
-1. SenseCom 的 **Paired Devices** 中确认两只实体手套均显示 `Connected`。
-2. 核对 `gloves.yaml` 中型号、左右侧和序列号。
-3. Nova 2 v1.x 检查 `/dev/rfcomm*`；v2.x 检查 BLE 配对。
-4. 停止手套 ROS、重启 SenseCom、重新启动 ROS launch。
-5. 用 `ros2 topic echo <topic> --once` 确认 `hand_position`、IMU 和包速率不是占位数据。
-
-如果串口无权限：
-
-```bash
-sudo usermod -aG dialout "$USER"
-```
-
-注销并重新登录后再试。
-
-## 无法连接机器人
-
-```bash
-ping -c 3 192.168.10.100
-nc -zvu 192.168.10.100 16000
-ssh esrobo@192.168.10.100
-```
-
-UDP 的 `nc` 结果不能证明网关一定应答；最终以 `run_laptop.sh inspect` 为准。检查机器人网关是否绑定 `192.168.10.100`、防火墙是否允许 UDP 16000、两端密钥是否一致。
-
-合同不匹配时比较双方代码提交和配置：
-
-```bash
-git rev-parse HEAD
-sha256sum teleoperation/config/teleop_config.yaml teleoperation/urdf/esrobo_waist_with_head.urdf
-```
-
-不要绕过合同检查。应把本机和机器人配置同步到同一版本后重启网关与客户端。
-
-## 输入或反馈过期
-
-本机默认人体输入最长 100 ms、机器人反馈最长 150 ms，并预留 20 ms 网络预算。出现 `stale`、`waiting for next complete source frame` 或会话退出时分别检查：
-
-```bash
-# PICO/手套采样频率
-ros2 topic hz /senseglove/glove<序列号>/lh/senseglove_states
-
-# 网络往返与抖动
-ping -c 20 192.168.10.100
-
-# 本机会话拒绝原因
-ls -1t laptop_teleop/log/session_*.jsonl | head -1
-python3 -m json.tool "$(ls -1t laptop_teleop/log/session_*.jsonl | head -1)" 2>/dev/null || tail -n 20 "$(ls -1t laptop_teleop/log/session_*.jsonl | head -1)"
-```
-
-JSONL 应逐行查看，通常直接使用：
-
-```bash
-tail -n 20 "$(ls -1t laptop_teleop/log/session_*.jsonl | head -1)"
-```
-
-不要先放宽超时来掩盖掉线。先确认采样率、CPU 负载、网络和机器人反馈链路。
-
-若显示 `control rate … Hz below required 40.0 Hz`，表示 `ARMING`/`ACTIVE` 中目标生成平均频率低于门槛，本机会停止发送并请求网关停止。机械臂与仅灵巧手模式均采用最近两秒、35 Hz 的停止线（40 Hz 配置值分别减去 `arm_rate_tolerance_hz: 5` 或 `hand_only_rate_tolerance_hz: 5`），容纳短时采样与调度波动；配置校验不允许将停止线降到 35 Hz 以下。80 ms 无目标间隔门禁、100 ms 输入新鲜度和机器人网关目标租约不变。先看最新 `session_*.jsonl` 中的 `rates.loop_hz`、`rates.compute_hz`、`rates.deadline_misses`、`source_hz` 和 `sent` 增量。`source_hz` 正常而 `sent` 掉速时，继续核对网关状态回包节拍；本机每轮须先收到新的网关状态才会计算和发送目标。网关状态发送使用固定 20 ms 节拍的修复需要在机器人上更新并重启网关进程，刷新网页不会更新已运行的网关。若更新后再次停止，应分别记录故障前两秒的目标数、PICO 输入率、网关日志和两端 CPU 负载。
-
-灵巧手反馈应在机器人端保持约 59 Hz：
-
-```bash
-source /opt/ros/humble/setup.bash
-source ~/Projects/esrobo/install/setup.bash
-ros2 topic hz /cb_left_hand_state --window 100
-ros2 topic hz /cb_right_hand_state --window 100
-```
-
-`hand_ros_bridge` 日志应周期性显示左右约 59 Hz。网页中的“状态距今”还包含网关 5 Hz 日志、SSH 轮询和浏览器刷新，通常为数百毫秒；它不表示手反馈进入底层控制器的延迟。
-
-## 端口占用
-
-```bash
-ss -lunp | grep -E ':15050|:16000'
-ss -lntp | grep -E ':60061|:8765|:8766|:18080'
-```
-
-本机 15050 由计算端接收 PICO/手套适配输入；机器人 16000 由网关监听；PICO PC Service 使用 TCP 60061。重复启动同一进程会产生端口冲突。
-
-## 日志位置
-
-- `laptop_teleop/log/xrobotoolkit_pc_service.log`：PICO PC Service。
-- `laptop_teleop/log/pico_reference_*.jsonl`：PICO 参考采集。
-- `laptop_teleop/log/session_*.jsonl`：约 5 Hz 的客户端状态、目标、状态新鲜度和输入拒绝原因。
-- 机器人网关日志：见机器人端 `robot_link/README.md`。
-
-会话日志中的 `targets` 是本机期望值，不代表机器人已经到位。故障后先停止所有运动入口、检查机器人实际状态和急停，再按机器人端手册恢复；客户端不会自动清故障或回零。
-
-## 网页控制台
-
-- 启动：`./laptop_teleop/scripts/run_dashboard.sh`，打开 `http://127.0.0.1:8080`。提示“控制台已在运行”时直接访问已有页面；若端口被其他程序占用，可用 `--port 8081`。旧版的 `Address already in use` 通常是控制台已在运行，新版会识别并提示，不会终止已有进程。
-- SSH 连接失败：确认网线、机器人 IP 与密码，未知主机密钥按文档 02 验证；不要删除校验逻辑。
-- 状态显示离线但 SSH 可连接：查看“机器人网关”日志，确认网关 Python 进程及 JSONL 日志持续更新。页面不靠反复 `inspect` 争抢控制会话。
-- 相机无画面：依次启动机器人“头部两轴驱动”“RGB / 深度相机”“相机网页服务”；检查对应日志。相机与头部的 HTTP 通过 SSH 访问机器人 `127.0.0.1:8766`。
-- PICO 骨架页显示“调试服务断开”：启动本机“PICO 数据采集”，确认头显全身追踪在产生新帧，并检查 `127.0.0.1:8765` 是否监听。相机页和骨架页的切换不会自动启动采集。
-- 使能按钮不可用：检查是否已开始正式计算、输入/参考是否有效、当前是否为 `IDLE`、是否有 `EMERGENCY_STOP`，以及是否由另一个浏览器页面拥有会话。
-- 独立失能提示已提交但状态未变：查看网关日志的 `disable_verified` 和对应臂的七轴 `enable_states`。`false` 或反馈过期表示无法证明硬件已失能，应继续托稳并排查 CAN/控制器；按钮请求完成不等于失能确认。
-- 头部失能后位置发生变化：扭矩关闭后属于自由受力状态。操作前必须托稳相机，并以两轴 `torque_enabled=0` 为确认依据；需要重新调整时使用“开启调整”，不要尝试从失能服务启用。
-- 标定停在提示：选择手套输入桥日志，按动作准备后点“姿态就绪 / 下一步”；ROS 的 SenseCom 提示使用独立的“ROS 继续”按钮。
-- 显示模式不匹配：结束计算并关闭机器人网关，再使用所选模式启动网关；下拉框不会修改正在运行的进程。
-- 启动脚本成功但服务没就绪：以实际反馈与进程日志为准。PICO PC Service 启动脚本正常退出属于预期，页面单独显示服务进程状态。
-- 关闭/刷新控制页面导致停止：属于页面所有权和心跳机制；须检查机器人状态并按文档 05 显式恢复。
-# 点击“使能并准备”后报告 `current pose unsafe/unverified`
-
-若网关日志同时显示 `calibrated_hand_joints: 0`，这不是 PICO 输入或控制频率故障。它表示机器人仍加载旧的空 `hand.geometry_feedback_calibration`，安全模块只能按手指全运动范围检查。全范围包络可能与腰部模型相交，因此回零规划会在任何电机重新使能之前拒绝执行。
-
-当前 L20Lite/L10 十轴映射加载成功后，网页显示 `10/10`。若仍为 `0/10`，同步 `teleoperation/config/teleop_config.yaml` 到机器人并重启网关；完成前可选择“仅左/右臂”或“仅左/右灵巧手”分别调试。不要通过降低碰撞间隙或关闭碰撞检查绕过该门禁。
+相机 SSH `Connection refused` 常表示机器人 8766 图像服务未启动；PICO 骨架断开检查本机 8765。它们与运动 UDP 16000 独立。控制台或网关“已提交”只说明操作请求已发送，执行结果仍看状态和新鲜反馈。

@@ -69,7 +69,7 @@ class ProtocolTests(Fixture):
         with self.assertRaises(ProtocolError):
             validate_target(dict(message, arm_urdf_rad=None), contract)
 
-    def test_hold_is_only_for_one_arm_without_hand_and_has_no_position(self):
+    def test_hold_has_no_position_and_requires_new_protocol_for_hands(self):
         contract = MockBackend('right', False).contract
         hold = dict(side='right', contract_id=contract['id'])
         self.assertEqual(validate_hold(hold, contract), {'hold': True})
@@ -77,8 +77,34 @@ class ProtocolTests(Fixture):
                         dict(hand_unit=None)):
             with self.subTest(invalid=invalid), self.assertRaises(ProtocolError):
                 validate_hold(dict(hold, **invalid), contract)
+        hand_contract = MockBackend('right', True).contract
+        hand_hold = dict(side='right', contract_id=hand_contract['id'])
+        self.assertEqual(validate_hold(hand_hold, hand_contract), {'hold': True})
+        old_contract = dict(hand_contract)
+        old_contract.pop('input_hold_protocol')
+        with self.assertRaises(ProtocolError, msg='old hand gateway must reject hold'):
+            validate_hold(hand_hold, old_contract)
+        dual_contract = MockDualBackend().contract
+        self.assertEqual(validate_hold(dict(side='both', contract_id=dual_contract['id']), dual_contract),
+                         {'hold': True})
         with self.assertRaises(ProtocolError):
             validate_hold(hold, MockBackend('right', True).contract)
+
+    def test_position_hold_requires_v2_and_a_single_arm(self):
+        contract = MockBackend('right', True).contract
+        msg = dict(side='right', contract_id=contract['id'], reason='position')
+        self.assertEqual(validate_hold(msg, contract), {'hold': True, 'hold_reason': 'position'})
+        # Legacy packets retain their finite input-gap semantics.
+        self.assertEqual(validate_hold(dict(msg, reason='input'), dict(contract, input_hold_protocol=1)),
+                         {'hold': True})
+        for invalid in (dict(contract, input_hold_protocol=1),
+                        dict(contract, input_hold_protocol=None),
+                        dict(contract, hand_only=True), dict(contract, side='both')):
+            with self.subTest(invalid=invalid), self.assertRaises(ProtocolError):
+                validate_hold(dict(msg, side=invalid['side']), invalid)
+        for reason in ('unknown', None, True, [], {}):
+            with self.subTest(reason=reason), self.assertRaises(ProtocolError):
+                validate_hold(dict(msg, reason=reason), contract)
 
 
 class SessionTests(Fixture):
@@ -86,10 +112,17 @@ class SessionTests(Fixture):
         gate = SessionGate(MockBackend('right', False).contract)
         gate.hello(dict(client_nonce='h'*32), PEER, 10., False)
         state = gate.state(10., {})
-        hold = dict(type='hold', session=gate.session, seq=1,
+        hold = dict(type='hold', session=gate.session, seq=2,
                     lease=state['lease'], contract_id=gate.contract['id'], side='right')
+        with self.assertRaisesRegex(ProtocolError, 'preceding fresh target'):
+            gate.accept(hold, PEER, 10.005)
+        target = dict(type='target', session=gate.session, seq=1,
+                      lease=state['lease'], contract_id=gate.contract['id'],
+                      side='right', arm_urdf_rad=[.1] * 7)
+        gate.accept(target, PEER, 10.005)
         self.assertEqual(gate.accept(hold, PEER, 10.01), 'hold')
         self.assertEqual(gate.target, {'hold': True})
+        self.assertEqual(gate.hold_started_at, 10.01)
         self.assertTrue(gate.fresh(10.19))
         self.assertFalse(gate.fresh(10.21))
 
@@ -177,6 +210,86 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.gw.mode, 'ACTIVE')
         self.assertEqual(self.backend.q, before)
 
+    def test_hold_limit_trips_even_with_fresh_lease(self):
+        self.start()
+        self.gw.gate.target = {'hold': True}
+        self.gw.gate.hold_started_at = self.now - .501
+        self.gw.gate.deadline = self.now + .2
+        self.gw.watchdog()
+        self.assertEqual(self.gw.mode, 'FAULT')
+        self.assertIn('input hold exceeded 500 ms', self.gw.reason)
+
+    def hold_packet(self, reason):
+        self.seq += 1
+        state = self.gw.gate.state(self.now, {})
+        return dict(type='hold', seq=self.seq, session=state['session'], lease=state['lease'],
+                    side='left', contract_id=self.backend.contract['id'], reason=reason)
+
+    def test_position_pause_exceeds_500ms_with_fresh_leases_but_still_expires(self):
+        self.start()
+        before = list(self.backend.q)
+        for _ in range(60):
+            self.now += .02
+            self.gw.gate.accept(self.hold_packet('position'), PEER, self.now)
+            self.gw.tick()
+            self.assertEqual(self.gw.mode, 'ACTIVE')
+            self.assertIsNone(self.gw.gate.hold_started_at)
+            self.assertEqual(self.backend.q, before)
+        self.assertGreater(self.now-self.gw.gate.position_hold_started_at, 1.)
+        self.gw.record()
+        entry = json.loads(self.gw.journal.getvalue().splitlines()[-1])
+        self.assertEqual(entry['hold_reason'], 'position')
+        self.assertGreater(entry['position_hold_age_s'], 1.)
+        self.now += .21
+        self.gw.watchdog()
+        self.assertEqual(self.gw.mode, 'FAULT')
+        self.assertIn('lease expired', self.gw.reason)
+
+    def test_switch_from_position_to_input_starts_500ms_timer_without_renewing_it(self):
+        self.start()
+        for _ in range(35):
+            self.now += .02
+            self.gw.gate.accept(self.hold_packet('position'), PEER, self.now)
+            self.gw.tick()
+        self.now += .02
+        self.gw.gate.accept(self.hold_packet('input'), PEER, self.now)
+        started = self.gw.gate.hold_started_at
+        self.assertIsNone(self.gw.gate.position_hold_started_at)
+        for _ in range(24):
+            self.now += .02
+            self.gw.gate.accept(self.hold_packet('input'), PEER, self.now)
+            self.gw.watchdog()
+            self.assertEqual(self.gw.mode, 'ACTIVE')
+            self.assertEqual(self.gw.gate.hold_started_at, started)
+        self.now += .03
+        self.gw.watchdog()
+        self.assertEqual(self.gw.mode, 'FAULT')
+        self.assertIn('input hold exceeded 500 ms', self.gw.reason)
+
+    def test_fresh_position_pause_clears_input_timer_and_target_clears_pause(self):
+        self.start()
+        self.now += .02
+        self.gw.gate.accept(self.hold_packet('input'), PEER, self.now)
+        self.now += .1
+        self.gw.gate.accept(self.hold_packet('position'), PEER, self.now)
+        self.assertIsNone(self.gw.gate.hold_started_at)
+        self.assertIsNotNone(self.gw.gate.position_hold_started_at)
+        self.now += .02
+        self.target()
+        self.assertIsNone(self.gw.gate.position_hold_started_at)
+
+    def test_invalid_position_hold_cannot_renew_lease_or_clear_input_timer(self):
+        self.start()
+        self.gw.gate.accept(self.hold_packet('input'), PEER, self.now)
+        started, deadline = self.gw.gate.hold_started_at, self.gw.gate.deadline
+        msg = self.hold_packet('position')
+        for change in (dict(lease='invalid'), dict(arm_urdf_rad=[0.]*7),
+                       dict(session='invalid'), dict(seq=self.seq-1)):
+            with self.subTest(change=change), self.assertRaises(ProtocolError):
+                self.gw.gate.accept(dict(msg, **change), PEER, self.now)
+            self.assertEqual(self.gw.gate.hold_started_at, started)
+            self.assertEqual(self.gw.gate.deadline, deadline)
+
     def test_timeout_latches_and_requires_explicit_recovery(self):
         self.start()
         self.now += .21
@@ -234,6 +347,17 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.gw.mode, 'IDLE')
         self.assertEqual(self.gw.last_return['returned'], True)
 
+    def test_restarted_idle_gateway_allows_explicit_controller_fault_recovery(self):
+        self.gw.feedback = {'controller_fault': {'arm_status': 1, 'status_name': 'EMERGENCY_STOP'}}
+        self.gw.request('r')
+        self.assertEqual(self.gw.mode, 'RETURNING')
+        self.gw.tick()
+        self.assertEqual(self.gw.mode, 'IDLE')
+
+    def test_healthy_idle_gateway_does_not_admit_fault_recovery(self):
+        with self.assertRaises(RuntimeError):
+            self.gw.request('r')
+
     def test_q_stops_without_return(self):
         self.start()
         q = list(self.backend.q)
@@ -289,6 +413,74 @@ class GatewayTests(unittest.TestCase):
         self.assertNotIn(self.gw.gate.session, text)
         self.assertNotIn(KEY.decode(), text)
         self.assertIn('feedback', entry)
+
+    def test_arm_and_hand_hold_brakes_without_replaying_position_and_still_expires(self):
+        backend = MockBackend('right', True)
+        gateway = Gateway(backend, KEY, port=0)
+        self.addCleanup(gateway.socket.close)
+        backend.enabled = backend.hand_enabled = True
+        backend.q[0], backend.hand[0] = .3, 177
+        gateway.mode = 'ACTIVE'
+        gateway.gate.target = {'hold': True}
+        gateway.gate.deadline = self.now + .2
+        gateway.tick()
+        self.assertEqual(gateway.mode, 'ACTIVE')
+        self.assertEqual((backend.q[0], backend.hand[0]), (.3, 177))
+        self.now += .21
+        gateway.watchdog()
+        self.assertEqual(gateway.mode, 'FAULT')
+        self.assertIn('lease expired', gateway.reason)
+
+    def test_hardware_arm_and_hand_hold_uses_fresh_measured_hand_position(self):
+        backend = HardwareBackend.__new__(HardwareBackend)
+        backend.side = 'right'
+        backend.hand_only = False
+        backend.arm = Mock()
+        backend.arm.read_control_cycle_joints.return_value = [0.] * 14
+        backend.arm.hold_command_trajectory.return_value = True
+        backend.hand = Mock()
+        backend.hand.feedback_snapshot.return_value = {'position_unit': [137.] * 10}
+        backend.hand.feedback_ready.return_value = True
+        backend.hand.command_physical.return_value = True
+        backend.step({'hold': True}, lambda: False)
+        backend.arm.hold_command_trajectory.assert_called_once_with()
+        backend.hand.command_physical.assert_called_once_with('right', [137.] * 10)
+        backend.arm.hold_command_trajectory.reset_mock()
+        backend.hand.feedback_ready.return_value = False
+        with self.assertRaisesRegex(RuntimeError, 'hand feedback missing'):
+            backend.step({'hold': True}, lambda: False)
+        backend.arm.hold_command_trajectory.assert_not_called()
+
+    def test_first_trajectory_fault_is_preserved_after_stop(self):
+        context = dict(failed_joints=[7], feedback_dt_s=.0252,
+                       target_physical_rad=[0.0] * 7,
+                       previous_command_physical_rad=[0.0] * 7,
+                       feedback_physical_rad=[0.0] * 7,
+                       feasible_velocity_lower_rad_s=[0.0] * 7,
+                       feasible_velocity_upper_rad_s=[0.0] * 7,
+                       lead_rad=[0.0] * 7, lead_limit_rad=[.026] * 7)
+        context['target_physical_rad'][6] = -.275
+        context['feasible_velocity_lower_rad_s'][6] = -.0157
+        context['feasible_velocity_upper_rad_s'][6] = -.0302
+        diagnostics = {'fault': 'right command trajectory', 'fault_context': context}
+        self.backend.fault_diagnostics = lambda: diagnostics
+        self.gw.mode = 'ACTIVE'
+        reason = 'executor: RuntimeError: right command trajectory: no acceleration-consistent command'
+        self.gw.trip(reason)
+        context['target_physical_rad'][6] = 99.0  # The captured frame must be immutable.
+        self.gw.trip('laptop requested stop')
+        self.assertEqual(self.gw.reason, reason)
+        self.gw.record()
+        self.now += .21
+        self.gw.record()
+        records = [json.loads(line) for line in self.gw.journal.getvalue().splitlines()]
+        events = [row for row in records if row.get('record_type') == 'first_fault']
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['reason'], reason)
+        self.assertEqual(events[0]['diagnostics']['fault_context']['target_physical_rad'][6], -.275)
+        self.assertEqual(records[-1]['first_fault_reason'], reason)
+        self.assertEqual(records[-1]['first_fault_summary']['failed_joints'], [7])
+        self.assertEqual(records[-1]['first_fault_summary']['feasible_velocity_upper_rad_s'], -.0302)
 
     def test_owned_arm_can_be_disabled_independently(self):
         self.start()
@@ -428,6 +620,12 @@ class NetworkTests(unittest.TestCase):
             try:
                 state = client.connect()
                 self.assertEqual(state['mode'], 'IDLE')
+                for _ in range(4):
+                    client.receive()
+                    if client.latest['state_send_gap_s'] is not None:
+                        break
+                self.assertIsNotNone(client.latest['state_send_gap_s'])
+                self.assertGreater(client.latest['state_send_gap_max_s'], 0)
                 client.send_target([0.]*7)
                 until = time.monotonic()+1.
                 while time.monotonic() < until:

@@ -1,8 +1,9 @@
 """Conservative arm/torso swept-volume checks using URDF collision geometry.
 
-Arm mesh boxes and torso convex hulls enclose meshes; this rejects some paths
-that exact mesh distance would accept. No guessed torso dimensions or network
-access at runtime. All non-arm joints are assumed stationary at URDF zero.
+Arm mesh boxes, NERO link3 convex hulls, and torso convex hulls enclose meshes;
+this can reject some paths that exact mesh distance would accept. No guessed
+torso dimensions or network access at runtime. All non-arm joints are assumed
+stationary at URDF zero.
 """
 import threading
 import time
@@ -14,8 +15,65 @@ from pathlib import Path
 import numpy as np
 
 
+_ENVELOPE_DIRECTIONS = np.asarray([
+    direction for direction in itertools.product((-1., 0., 1.), repeat=3)
+    if any(direction)
+])
+_ENVELOPE_DIRECTIONS /= np.linalg.norm(_ENVELOPE_DIRECTIONS, axis=1)[:, None]
+
+
+def _compact_enclosing_vertices(points):
+    """Bound complexity with 26 outward support planes, never an inner hull.
+
+    Every supplied point satisfies every support plane. Intersecting those
+    halfspaces therefore encloses their entire convex hull, with at most 48
+    vertices. This also keeps rebuilding and GJK distance checks bounded.
+    """
+    from scipy.spatial import HalfspaceIntersection
+    points = np.asarray(points, dtype=float)
+    support = np.full(len(_ENVELOPE_DIRECTIONS), -np.inf)
+    # STL files repeat vertices per triangle. Stream the support reduction to
+    # avoid a mesh-size-by-26 temporary or threaded BLAS startup stalls.
+    for start in range(0, len(points), 8192):
+        projections = np.einsum('ij,kj->ik', points[start:start+8192],
+                                _ENVELOPE_DIRECTIONS, optimize=False)
+        support = np.maximum(support, projections.max(axis=0))
+    support += 1e-10
+    planes = np.column_stack((_ENVELOPE_DIRECTIONS, -support))
+    return HalfspaceIntersection(planes, points.mean(axis=0)).intersections
+
+
+def _sweep_convex_vertices(points, axis, lower, upper):
+    """Enclose every rotation, including between angular subdivision endpoints.
+
+    Each vertex traces a circular arc. For each arc of at most 15 degrees,
+    its two endpoints and the intersection of their tangents enclose the
+    *whole* arc. Convexity then covers every interior mesh point as well.
+    Unlike a sampled hull, this does not miss an intermediate orientation;
+    unlike repeated axis-aligned boxes, it retains the finger's shape.
+    """
+    axis = np.asarray(axis, dtype=float)
+    axis = axis / np.linalg.norm(axis)
+    points = np.asarray(points, dtype=float)
+    base = np.outer(points @ axis, axis)
+    cosine = points - base
+    sine = np.cross(axis, points)
+    count = max(1, int(np.ceil((upper-lower) / np.deg2rad(15))))
+    angles = np.linspace(lower, upper, count+1)
+    values = [base + cosine*np.cos(t) + sine*np.sin(t) for t in angles]
+    for a, b in zip(angles[:-1], angles[1:]):
+        middle, half = (a+b)/2, (b-a)/2
+        values.append(base + (cosine*np.cos(middle) + sine*np.sin(middle))/np.cos(half))
+    return _compact_enclosing_vertices(np.concatenate(values))
+
+
 class TorsoCollisionGuard:
-    def __init__(self, solver, side, package_dirs=(), margin=0.03,
+    _entry_certificates = None
+    _entry_certificate_context = None
+    _entry_coverage_only = False
+    _entry_arm_geometry_only = False
+
+    def __init__(self, solver, side, package_dirs=(), margin=0.02,
                  shoulder_margin=0.005, *, include_fingers=True):
         import pinocchio as pin
         try:
@@ -31,6 +89,7 @@ class TorsoCollisionGuard:
         self.lock = threading.Lock()
         self.hand_state_provider = None
         self.include_fingers = bool(include_fingers)
+        self.thumb_envelope = "mesh_convex_arc_hull"
         self.hand_motion_horizon_s = 0.5
         self._hand_interval_key = None
         self._hand_diagnostics = {}
@@ -39,13 +98,16 @@ class TorsoCollisionGuard:
             raise ValueError("invalid shoulder attachment clearance")
         self.shoulder_margin = float(shoulder_margin)
         self.last_diagnostics = {}
+        self._entry_certificates = None
+        self._entry_certificate_context = None
         roots = [str(Path(p).expanduser().resolve()) for p in package_dirs]
         roots.append(str(Path(__file__).resolve().parents[4] / "model" / "urdf"))
         roots.append(str(Path(__file__).resolve().parents[3] / "assets"))
         # Build enclosing boxes directly from STL vertices. Avoid building
         # several million-triangle BVHs just to read their local bounds.
         root = ET.parse(solver._cfg.urdf_path).getroot()
-        torso_hulls = {}
+        collision_hulls = {}
+        finger_mesh_vertices = {}
         collision_links = {id(c): link.attrib["name"] for link in root.findall("link") for c in link.findall("collision")}
         for collision in root.findall(".//collision"):
             mesh = collision.find("geometry/mesh")
@@ -72,14 +134,24 @@ class TorsoCollisionGuard:
             if not np.all(np.isfinite(extent)) or np.any(extent <= 0):
                 raise ValueError(f"invalid mesh bounds: {path}")
             link_name = collision_links[id(collision)]
-            if not link_name.startswith(("left", "right")):
+            if link_name.startswith(tuple(f"{side}_{finger}_" for finger in
+                    ("thumb", "index", "middle", "ring", "pinky"))):
+                # Repeated axis-aligned boxes around bent fingers
+                # can enter the waist clearance even when an enclosing mesh
+                # arc hull proves the same uncertain posture has room.
+                finger_mesh_vertices[link_name] = _compact_enclosing_vertices(vertices.astype(float) * scale - center)
+            # A convex hull still encloses the original STL. The NERO link3
+            # box can spuriously reject a measured pose next to waist_link3;
+            # use its tighter enclosing hull without relaxing the configured margin.
+            if (not link_name.startswith(("left", "right"))
+                    or link_name in ("left_nero_link3", "right_nero_link3")):
                 from scipy.spatial import ConvexHull
                 points = vertices.astype(float) * scale - center
                 hull = ConvexHull(points)
                 cloud = coal.StdVec_Vec3s()
                 for point in points[hull.vertices]:
                     cloud.append(point)
-                torso_hulls[link_name] = coal.Convex.convexHull(cloud, True, "Qt")
+                collision_hulls[link_name] = coal.Convex.convexHull(cloud, True, "Qt")
             origin = collision.find("origin")
             if origin is None:
                 origin = ET.SubElement(collision, "origin")
@@ -142,7 +214,7 @@ class TorsoCollisionGuard:
             extent = np.asarray(box.max_) - np.asarray(box.min_)
             if not np.all(np.isfinite(extent)) or np.any(extent <= 0):
                 raise ValueError(f"invalid collision geometry: {frame_name}")
-            shape = torso_hulls.get(frame_name, coal.Box(*extent))
+            shape = collision_hulls.get(frame_name, coal.Box(*extent))
             self.shapes.append((shape, center))
             self.motion_weights.append(motion_weights(obj.parentJoint, obj.placement.translation,
                                                        np.linalg.norm(center) + np.linalg.norm(extent)/2))
@@ -180,7 +252,10 @@ class TorsoCollisionGuard:
                         points = points @ placement.rotation.T + placement.translation
                         joint = self.model.parents[joint]
                     if joint == hand_joint and visited:
-                        finger_specs.append((initial_points, initial_joint, frame_name))
+                        mesh_points = finger_mesh_vertices.get(frame_name)
+                        if mesh_points is not None:
+                            mesh_points = mesh_points @ obj.placement.rotation.T + obj.placement.translation
+                        finger_specs.append((initial_points, initial_joint, frame_name, mesh_points))
                         lo, hi = points.min(axis=0), points.max(axis=0)
                         fingers.append((coal.Box(*(hi-lo)), (hi+lo)/2, frame_name,
                                         motion_weights(hand_joint, (hi+lo)/2, np.linalg.norm(hi-lo)/2)))
@@ -188,6 +263,12 @@ class TorsoCollisionGuard:
         if not moving or not torso or (self.include_fingers and not fingers):
             raise ValueError("URDF lacks complete active arm, hand or torso collision geometry")
         self.pairs = [(a, b) for a in moving for b in torso]
+        # Initial approach excludes the entire dexterous hand, including its
+        # palm mount. Normal checks and checked return retain all these pairs.
+        self._entry_arm_pairs = tuple((a, b) for a, b in self.pairs
+            if not self.model.frames[self.geometry.geometryObjects[a].parentFrame].name.startswith(side + "Hand"))
+        if not self._entry_arm_pairs:
+            raise ValueError("URDF lacks initial approach arm collision geometry")
         self.pair_margins = {(a, b): (
             self.shoulder_margin if self.model.frames[self.geometry.geometryObjects[a].parentFrame].name == side + "_nero_link2"
             and self.model.frames[self.geometry.geometryObjects[b].parentFrame].name == "waist_link3"
@@ -216,36 +297,53 @@ class TorsoCollisionGuard:
                         raise ValueError("hand feedback outside URDF limits: " + name)
                 return lo, hi
             result = []
-            for initial_points, initial_joint, name in finger_specs:
-                points, joint = initial_points.copy(), initial_joint
+            for initial_points, initial_joint, name, mesh_points in finger_specs:
+                # The selected side's fingers use enclosing mesh hulls and
+                # conservative arc hulls. Missing feedback still uses the full
+                # URDF interval; no joint or calibration uncertainty is omitted.
+                use_hull = mesh_points is not None
+                points, joint = (mesh_points if use_hull else initial_points).copy(), initial_joint
                 while joint != hand_joint:
                     joint_name = self.model.names[joint]
                     lo, hi = limits(joint_name, self.model.idx_qs[joint])
-                    points = sweep_axis(points, joint_axes[joint_name], lo, hi)
+                    points = (_sweep_convex_vertices if use_hull else sweep_axis)(
+                        points, joint_axes[joint_name], lo, hi)
                     placement = self.model.jointPlacements[joint]
                     points = points @ placement.rotation.T + placement.translation
                     joint = self.model.parents[joint]
                 lo, hi = points.min(axis=0), points.max(axis=0)
-                result.append((coal.Box(*(hi-lo)), (hi+lo)/2, name,
+                shape = coal.Box(*(hi-lo))
+                if use_hull:
+                    cloud = coal.StdVec_Vec3s()
+                    for point in points - (hi+lo)/2:
+                        cloud.append(point)
+                    shape = coal.Convex.convexHull(cloud, True, "Qt")
+                result.append((shape, (hi+lo)/2, name,
                     motion_weights(hand_joint, (hi+lo)/2, np.linalg.norm(hi-lo)/2)))
             return result
         self._build_fingers = build_fingers
 
-    def _refresh_hand(self):
-        if not getattr(self, "include_fingers", True):
-            self._hand_diagnostics = {"collision_profile": "arm_wrist_palm"}
+    def _refresh_hand(self, *, include_fingers=True, state=None):
+        if not include_fingers or not getattr(self, "include_fingers", True):
+            self._hand_diagnostics = {"collision_profile": (
+                "entry_arm" if self._entry_arm_geometry_only else "arm_wrist_palm")}
             return True
-        if getattr(self, "hand_state_provider", None) is None:
+        if state is None and getattr(self, "hand_state_provider", None) is None:
             return True  # Legacy/offline use retains all-pose envelopes.
-        state = self.hand_state_provider(self.hand_motion_horizon_s)
+        if state is None:
+            state = self.hand_state_provider(self.hand_motion_horizon_s)
         if not state.valid:
             self.last_diagnostics = dict(reason=state.reason, hand_stamp=state.stamp)
             return False
         self._hand_diagnostics = dict(hand_feedback_age_s=time.monotonic()-state.stamp,
-            calibrated_hand_joints=len(state.calibrated))
+            calibrated_hand_joints=len(state.calibrated),
+            thumb_envelope=self.thumb_envelope)
         # Round OUTWARDS to cache conservative envelopes across control ticks.
+        intervals = dict(state.intervals)
         intervals = {name: (float(np.floor(lo/.02)*.02), float(np.ceil(hi/.02)*.02))
-                     for name, (lo, hi) in state.intervals.items()}
+                     for name, (lo, hi) in intervals.items()}
+        self._hand_diagnostics['thumb_joint_intervals_rad'] = {
+            name: bound for name, bound in intervals.items() if '_thumb_' in name}
         key = tuple(sorted(intervals.items()))
         try:
             if key != self._hand_interval_key:
@@ -256,77 +354,293 @@ class TorsoCollisionGuard:
             return False
         return True
 
-    def _clearance(self, full, halfwidth=None):
+    def _clearance(self, full, halfwidth=None, *, include_fingers=True,
+                   active_pairs=None):
         self._box_certified = True
         halfwidth = np.zeros(14) if halfwidth is None else halfwidth
         q = np.zeros(self.model.nq)
         q[self.indices] = full
         self.pin.forwardKinematics(self.model, self.data, q)
         self.pin.updateGeometryPlacements(self.model, self.data, self.geometry, self.geometry_data)
-        transforms = []
-        for placement, (_, center) in zip(self.geometry_data.oMg, self.shapes):
-            transforms.append(self.coal.Transform3s(placement.rotation,
-                                                   placement.translation + placement.rotation @ center))
+        # Only construct transforms used by the remaining collision pairs.
+        # FK and geometry placements still use this node's actual midpoint.
+        transforms = {}
+        def transform(index):
+            if index not in transforms:
+                placement = self.geometry_data.oMg[index]
+                center = self.shapes[index][1]
+                transforms[index] = self.coal.Transform3s(placement.rotation,
+                    placement.translation + placement.rotation @ center)
+            return transforms[index]
+        unresolved_arm, unresolved_fingers = [], []
+        arm_pairs = self.pairs if active_pairs is None else active_pairs[0]
+        if self._entry_arm_geometry_only:
+            retained = getattr(self, '_entry_arm_pairs', self.pairs)
+            arm_pairs = tuple(pair for pair in arm_pairs if pair in retained)
         minimum, pair, required, actual = float("inf"), None, self.margin, float("inf")
-        for a, b in self.pairs:
+        limiting_slack, split_weights = float("inf"), None
+        for a, b in arm_pairs:
             result = self.coal.DistanceResult()
-            d = self.coal.distance(self.shapes[a][0], transforms[a], self.shapes[b][0],
-                                   transforms[b], self.distance_request, result)
+            d = self.coal.distance(self.shapes[a][0], transform(a), self.shapes[b][0],
+                                   transform(b), self.distance_request, result)
             margin = self.pair_margins[a, b]
-            if d - margin <= self.motion_weights[a] @ halfwidth:
+            slack = d - margin - self.motion_weights[a] @ halfwidth
+            if not np.isfinite(d) or not np.isfinite(slack):
                 self._box_certified = False
+                self.last_diagnostics = dict(reason='nonfinite arm collision distance/bound',
+                                             **self._hand_diagnostics)
+                return float('nan')
+            if slack <= 0:
+                self._box_certified = False
+                unresolved_arm.append((a, b))
+            if slack < limiting_slack:
+                limiting_slack, split_weights = slack, self.motion_weights[a]
             if d - margin < minimum:
                 minimum, pair = d - margin, [self.geometry.geometryObjects[k].name for k in (a, b)]
                 required, actual = margin, d
-        for shape, center, name, weights in self.fingers:
+        finger_pairs = ([(i, b) for i in range(len(self.fingers)) for b in self.torso]
+                        if active_pairs is None and include_fingers else
+                        active_pairs[1] if active_pairs is not None and include_fingers else ())
+        finger_transforms = {}
+        for i, b in finger_pairs:
+            shape, center, name, weights = self.fingers[i]
             hand = self.data.oMi[self.hand_joint]
-            transform = self.coal.Transform3s(hand.rotation, hand.translation + hand.rotation @ center)
-            for b in self.torso:
-                result = self.coal.DistanceResult()
-                d = self.coal.distance(shape, transform, self.shapes[b][0], transforms[b],
-                                       self.distance_request, result)
-                if d - self.margin <= weights @ halfwidth:
-                    self._box_certified = False
-                if d - self.margin < minimum:
-                    minimum, pair = d - self.margin, [name + "_finger_envelope", self.geometry.geometryObjects[b].name]
-                    required, actual = self.margin, d
+            if i not in finger_transforms:
+                finger_transforms[i] = self.coal.Transform3s(
+                    hand.rotation, hand.translation + hand.rotation @ center)
+            result = self.coal.DistanceResult()
+            d = self.coal.distance(shape, finger_transforms[i], self.shapes[b][0], transform(b),
+                                   self.distance_request, result)
+            slack = d - self.margin - weights @ halfwidth
+            if not np.isfinite(d) or not np.isfinite(slack):
+                self._box_certified = False
+                self.last_diagnostics = dict(reason='nonfinite finger collision distance/bound',
+                                             **self._hand_diagnostics)
+                return float('nan')
+            if slack <= 0:
+                self._box_certified = False
+                unresolved_fingers.append((i, b))
+            if slack < limiting_slack:
+                limiting_slack, split_weights = slack, weights
+            if d - self.margin < minimum:
+                minimum, pair = d - self.margin, [name + "_finger_envelope", self.geometry.geometryObjects[b].name]
+                required, actual = self.margin, d
         self.last_diagnostics = dict(clearance_m=float(actual), required_m=required, pair=pair,
                                      **self._hand_diagnostics)
+        self._split_weights = split_weights
+        self._uncertified_pairs = (tuple(unresolved_arm), tuple(unresolved_fingers))
         return minimum + self.margin
 
+    def check_arm_only(self, start, end):
+        """Certify arm, wrist and palm while the fingers receive no commands."""
+        return self._check(start, end, include_fingers=False)
+
     def __call__(self, start, end):
+        return self._check(start, end, include_fingers=True)
+
+    def check_hand_return(self, start, end, hand_state):
+        """Certify a bounded hand sweep with the stopped arm in a small box."""
+        return self._check_once(start, end, include_fingers=True, hand_state=hand_state)
+
+    def begin_entry_certificates(self, *, arm_geometry_only=False):
+        with self.lock:
+            self._entry_arm_geometry_only = bool(arm_geometry_only)
+            self._entry_coverage_only = False
+            self._entry_frozen_provider = None
+            self._entry_certificates = []
+            self._entry_certificate_context = None
+
+    def end_entry_certificates(self):
+        with self.lock:
+            self._entry_arm_geometry_only = False
+            self._entry_coverage_only = False
+            self._entry_frozen_provider = None
+            self._entry_certificates = None
+            self._entry_certificate_context = None
+
+    def invalidate_entry_certificates(self):
+        with self.lock:
+            if self._entry_certificates is not None:
+                self._entry_certificates.clear()
+            self._entry_certificate_context = None
+
+    def freeze_entry_certificates(self, *, include_fingers=True):
+        """Finish planning. Misses can no longer perform geometry until end/begin.
+
+        Invalidating a frozen session leaves this gate CLOSED: a later fresh
+        frame cannot silently rebuild certificates while the arm is moving.
+        """
+        with self.lock:
+            self._entry_coverage_only = True
+            self._entry_frozen_provider = getattr(self, 'hand_state_provider', None)
+            return bool(self._entry_certificates and
+                        self._entry_certificate_context == self._certificate_context(include_fingers))
+
+    def check_entry_coverage(self, start, end, *, include_fingers=True):
+        """Explicit execution API: even an ended session cannot do geometry."""
         start, end = np.asarray(start, float), np.asarray(end, float)
         if any(q.shape != (14,) or not np.all(np.isfinite(q)) for q in (start, end)):
             raise ValueError("invalid collision-check joints")
+        with self.lock:
+            if not self._entry_coverage_only:
+                self.last_diagnostics = dict(certified=False, category='entry_certificate_invalid',
+                    reason='no frozen planning certificates', entry_cache_hit=False, checked_boxes=0)
+                return False
+            return self._entry_coverage_locked(start, end, include_fingers)
+
+    def _entry_coverage_locked(self, start, end, include_fingers):
+        """Scalar/interval checks only; never refresh meshes, run FK or distance."""
+        lo, hi = np.minimum(start, end), np.maximum(start, end)
+        def reject(category, reason, *, invalidate=False):
+            if invalidate:
+                self._entry_certificates = []
+                self._entry_certificate_context = None
+            self.last_diagnostics = dict(certified=False, category=category,
+                reason=reason, entry_cache_hit=False, entry_coverage_only=True,
+                checked_boxes=0, checked_lower_urdf_rad=lo.tolist(),
+                checked_upper_urdf_rad=hi.tolist())
+            return False
+        if (not self._entry_certificates or
+                self._entry_certificate_context != self._certificate_context(include_fingers)):
+            return reject('entry_certificate_invalid', 'entry certificate context changed or invalidated',
+                          invalidate=True)
+        hand = {}
+        if include_fingers and self.include_fingers:
+            provider = getattr(self, 'hand_state_provider', None)
+            if provider is not self._entry_frozen_provider:
+                return reject('entry_certificate_invalid', 'hand feedback provider changed', invalidate=True)
+            if provider is not None:
+                state = provider(self.hand_motion_horizon_s)
+                if not state.valid:
+                    return reject('hand_geometry_unavailable', state.reason, invalidate=True)
+                bounds = dict(self._hand_interval_key or ())
+                if (bounds.keys() != state.intervals.keys() or
+                        any(not np.all(np.isfinite([a, b])) or a > b or
+                            a < bounds[n][0] or b > bounds[n][1]
+                            for n, (a, b) in state.intervals.items())):
+                    return reject('entry_hand_envelope_changed',
+                                  'fresh hand uncertainty exceeds the planned envelope', invalidate=True)
+                hand = dict(hand_feedback_age_s=time.monotonic()-state.stamp,
+                            calibrated_hand_joints=len(state.calibrated))
+        for a, b, certificate in self._entry_certificates:
+            if np.all(lo >= a) and np.all(hi <= b):
+                self.last_diagnostics = dict(certificate, **hand)
+                self.last_diagnostics.update(certified=True, category='certified_cache',
+                    entry_cache_hit=True, entry_coverage_only=True, checked_boxes=0,
+                    checked_lower_urdf_rad=lo.tolist(), checked_upper_urdf_rad=hi.tolist())
+                return True
+        # A candidate/optional lookahead miss must not discard valid stopping
+        # certificates. The trajectory may select a smaller certified proposal.
+        return reject('entry_certificate_miss', 'whole interval is outside every planned certificate')
+
+    def _certificate_context(self, include_fingers):
+        # Geometry/model are immutable during an execution. Identity plus the
+        # concrete envelope, margins, shape offsets and motion bounds bind proofs.
+        return (id(self.model), id(self.geometry), tuple(self.indices),
+                include_fingers, self._entry_arm_geometry_only,
+                (tuple(getattr(self, '_entry_arm_pairs', self.pairs))
+                 if self._entry_arm_geometry_only else None),
+                ((self.include_fingers, self.thumb_envelope, self._hand_interval_key,
+                  self.hand_motion_horizon_s) if include_fingers else None),
+                self.margin, self.shoulder_margin,
+                tuple(sorted(self.pair_margins.items())), tuple(self.pairs),
+                tuple((id(shape), np.asarray(center).tobytes()) for shape, center in self.shapes),
+                tuple(np.asarray(w).tobytes() for w in self.motion_weights))
+
+    def _check(self, start, end, *, include_fingers):
+        return self._check_once(start, end, include_fingers=include_fingers)
+
+    def _check_once(self, start, end, *, include_fingers, hand_state=None):
+        start, end = np.asarray(start, float), np.asarray(end, float)
+        if any(q.shape != (14,) or not np.all(np.isfinite(q)) for q in (start, end)):
+            raise ValueError("invalid collision-check joints")
+        def outcome(ok, category, checks):
+            self.last_diagnostics.update(
+                certified=bool(ok), category=category, checked_boxes=checks,
+                checked_lower_urdf_rad=np.minimum(start,end).tolist(),
+                checked_upper_urdf_rad=np.maximum(start,end).tolist())
+            return ok
         # Certify the whole joint interval box: a MOVE J controller need not
         # interpolate all axes synchronously. Subdivide ONE joint at a time,
         # covering every combination, rather than sampling only a diagonal.
         with self.lock:
-            if not self._refresh_hand():
-                return False
-            pending = [(np.minimum(start, end), np.maximum(start, end))]
+            if hand_state is not None and (not self.include_fingers or self._entry_arm_geometry_only
+                                          or self._entry_certificates is not None):
+                return outcome(False, "hand_return_requires_full_geometry", 0)
+            if self._entry_coverage_only:
+                return self._entry_coverage_locked(start, end, include_fingers)
+            self.last_diagnostics['entry_cache_hit'] = False
+            refreshed = (self._refresh_hand(include_fingers=include_fingers) if hand_state is None
+                         else self._refresh_hand(include_fingers=include_fingers, state=hand_state))
+            if not refreshed:
+                if self._entry_certificates is not None:
+                    self._entry_certificates.clear()
+                self._entry_certificate_context = None
+                return outcome(False, "hand_geometry_unavailable", 0)
+            root_lower, root_upper = np.minimum(start, end), np.maximum(start, end)
+            cache = self._entry_certificates
+            if cache is not None:
+                context = self._certificate_context(include_fingers)
+                if context != self._entry_certificate_context:
+                    cache.clear()
+                    self._entry_certificate_context = context
+                for index, (lo, hi, certificate) in enumerate(cache):
+                    if np.all(root_lower >= lo) and np.all(root_upper <= hi):
+                        cache.append(cache.pop(index))
+                        self.last_diagnostics = dict(certificate, **self._hand_diagnostics,
+                                                     entry_cache_hit=True)
+                        return outcome(True, "certified_cache", 0)
+            pending = [(root_lower, root_upper, None)]
             checks = 0
             worst = None
             while pending:
-                a, b = pending.pop()
+                a, b, active_pairs = pending.pop()
                 middle = (a + b) / 2
-                clearance = self._clearance(middle, (b-a)/2)
+                clearance = self._clearance(middle, (b-a)/2,
+                                            include_fingers=include_fingers,
+                                            **({'active_pairs': active_pairs}
+                                               if active_pairs is not None else {}))
                 checks += 1
+                if checks % 8 == 0:
+                    # A dense offline certificate can occupy the Python thread
+                    # for many state periods. Yield without changing any box,
+                    # margin, or acceptance rule so the gateway can send its
+                    # independent 50 Hz state stream during planning.
+                    time.sleep(0)
                 diag = self.last_diagnostics
                 if 'clearance_m' in diag and (worst is None or
                         diag['clearance_m']-diag['required_m'] < worst['clearance_m']-worst['required_m']):
                     worst = dict(diag)
                 if not np.isfinite(clearance) or clearance <= self.margin:
-                    return False
+                    return outcome(False, "geometry_rejected", checks)
                 if self._box_certified:
                     continue
                 if checks >= 64:
                     self.last_diagnostics["reason"] = "swept path could not be certified within budget"
-                    return False
-                joint = int(np.argmax(b - a))
+                    return outcome(False, "certification_budget_exhausted", checks)
+                # Split the joint contributing most to the least-certifiable
+                # pair's motion envelope. Subdivision still covers the exact
+                # same interval box; this only chooses a more useful order.
+                weights = getattr(self, "_split_weights", None)
+                weighted_width = ((b-a) * weights if weights is not None
+                                  and np.shape(weights) == (14,) else b-a)
+                joint = int(np.argmax(weighted_width))
+                if weighted_width[joint] <= 0:
+                    joint = int(np.argmax(b-a))
                 left_end, right_start = b.copy(), a.copy()
                 left_end[joint] = right_start[joint] = middle[joint]
-                pending.extend(((a, left_end), (right_start, b)))
+                # A pair with d(midpoint)-margin-motion_bound > 0 was
+                # certified for this WHOLE parent box, hence for each child.
+                # Recheck only unresolved pairs during entry. Proofs never
+                # escape this locked request or cross a hand/model change.
+                child_pairs = (getattr(self, '_uncertified_pairs', None)
+                               if cache is not None else None)
+                pending.extend(((a, left_end, child_pairs), (right_start, b, child_pairs)))
             if worst is not None:
                 self.last_diagnostics = worst
-            return True
+            self.last_diagnostics['entry_cache_hit'] = False
+            result = outcome(True, "certified", checks)
+            if cache is not None:
+                cache.append((root_lower.copy(), root_upper.copy(), dict(self.last_diagnostics)))
+                del cache[:-32]
+            return result

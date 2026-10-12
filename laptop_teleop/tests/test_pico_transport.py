@@ -1,0 +1,364 @@
+"""Timing/ownership tests with controlled notification input, no real subscription."""
+import copy
+import json
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from esrobo_laptop.acquisition import load_bridge
+from esrobo_laptop.pico_transport import (PicoForwarder, LatestHands, TransportMetrics,
+                                         require_notifications, summary_times, AsyncRecording)
+from esrobo_laptop.pico_hand import PicoHands
+from esrobo_laptop.diagnostics import RuntimeDiagnostics
+
+
+class FakeSDK:
+    def __init__(self, hz=74):
+        self.hz = hz
+        self.condition = threading.Condition()
+        self.latest = dict(notification_id=0, body=self.sample(0), left=self.hand(0), right=self.hand(0))
+        self.receipts = []
+        self.end = threading.Event()
+        self.thread = None
+
+    @staticmethod
+    def sample(seq, *, age=0.):
+        return dict(valid=seq > 0, active=1, sequence=seq, packet_timestamp_ns=seq,
+                    received_monotonic_ns=time.monotonic_ns()-int(age*1e9), age_s=age,
+                    poses=[[1., 2., 3., 0., 0., 0., 1.]]*24)
+
+    @classmethod
+    def hand(cls, seq, **kw):
+        return dict(cls.sample(seq, **kw), poses=[[0., 0., 0., 0., 0., 0., 1.]]*26,
+                    flags=[15]*26, timestamp_ns=0, freshness_source='component-packet')
+
+    def get_tracking_updates_version(self):
+        return 1
+
+    def close(self):
+        self.end.set()
+        if self.thread:
+            self.thread.join()
+
+    def get_tracking_diagnostics(self):
+        with self.condition:
+            return {s: dict(committed=len(self.receipts), rejected=0, invalid=0, receipts_ns=self.receipts[-200:]) for s in ('body', 'left', 'right')}
+
+    def emit(self, seq, *, age=0., body=None):
+        with self.condition:
+            self.latest = dict(notification_id=seq, body=self.sample(seq, age=age) if body is None else body,
+                               left=self.hand(seq, age=age), right=self.hand(seq, age=age))
+            self.receipts.append(self.latest['body']['received_monotonic_ns'])
+            self.condition.notify_all()
+
+    def wait_tracking_updates(self, after_id, timeout_ms=50):
+        with self.condition:
+            self.condition.wait_for(lambda: self.latest['notification_id'] > after_id, timeout_ms/1000.)
+            return copy.deepcopy(self.latest)
+
+    def start(self):
+        def produce():
+            seq = 0
+            due = time.monotonic()
+            while not self.end.is_set():
+                seq += 1
+                self.emit(seq)
+                due += 1/self.hz
+                self.end.wait(max(0., due-time.monotonic()))
+        self.thread = threading.Thread(target=produce)
+        self.thread.start()
+
+
+class Socket:
+    def __init__(self):
+        self.packets = []
+    def setblocking(self, value):
+        pass
+    def sendto(self, data, destination):
+        self.packets.append((time.monotonic_ns(), json.loads(data)))
+    def close(self):
+        pass
+
+
+class Mapper:
+    def __init__(self, delay=0.):
+        self.delay = delay
+    def map_sample(self, side, sample):
+        time.sleep(self.delay)
+        return dict(joints=[0.]*10, sequence=sample['sequence'],
+                    sample_monotonic=sample['received_monotonic_ns']/1e9, palm_basis=[[1,0,0],[0,1,0],[0,0,1]])
+
+
+def forwarder(sdk, **kwargs):
+    bridge = load_bridge('xrobotoolkit_body_udp_bridge')
+    args = bridge.parse_args(['--samples', '65', '--print-interval', '2'])
+    body, hand = Socket(), Socket()
+    return PicoForwarder(sdk, bridge, args, body_socket=body, hand_socket=hand, **kwargs)
+
+
+def run_profiled(f):
+    from profile_runtime import Profile
+    import tempfile
+    with tempfile.TemporaryDirectory() as temp:
+        prof = Profile(temp+'/profile.jsonl')
+        prof.wrap(f.sdk, 'wait_tracking_updates', 'sdk_wait', prof.tracking)
+        prof.wrap(f, '_send', 'udp_send', lambda a,k,r:prof.packet(a[1],'udp_send') if r else None)
+        try:
+            f.run()
+        finally:
+            f.test_profile = prof.close()
+    return f.test_profile
+
+
+@pytest.mark.parametrize('hz', [60, 74, 90])
+def test_uniform_input_forwards_95_percent_with_low_notification_latency(hz):
+    sdk = FakeSDK(hz)
+    f = forwarder(sdk, mapper=Mapper())
+    sdk.start()
+    try:
+        run_profiled(f)
+    finally:
+        sdk.close()
+    summary = f.snapshot()
+    sequences = [p['body_sample_sequence'] for _, p in f.body_socket.packets]
+    assert len(sequences)/max(sequences) >= .95
+    assert f.test_profile['stages']['notification_to_send']['p95_ms'] <= 10.
+    assert sequences == sorted(set(sequences))
+    for _, packet in f.body_socket.packets:
+        assert packet['laptop_input']['sample_monotonic']['right'] == packet['body_sample_monotonic']
+
+
+@pytest.mark.parametrize('delay', [.02, .1, .5])
+def test_body_does_not_wait_for_hand_computation(delay):
+    sdk = FakeSDK()
+    f = forwarder(sdk, mapper=Mapper(delay))
+    sdk.start()
+    try:
+        run_profiled(f)
+    finally:
+        sdk.close()
+    times = [t for t, _ in f.body_socket.packets]
+    assert max(b-a for a,b in zip(times,times[1:]))/1e6 < 50.
+    assert len(f.hands.slots) <= 2
+    if delay >= .1:
+        assert not f.hand_socket.packets  # Expired during mapping: no fresh-control lie.
+    assert f.metrics.counts['left_coalesced']+f.metrics.counts['right_coalesced'] > 0
+
+
+def test_burst_latest_only_stale_and_duplicate_never_forward():
+    sdk = FakeSDK()
+    sdk.emit(100)
+    f = forwarder(sdk, mapper=Mapper())
+    f.args.samples = 0
+    thread = threading.Thread(target=f.run)
+    thread.start()
+    time.sleep(.04)
+    sdk.emit(101, age=.12)
+    time.sleep(.04)
+    sdk.emit(102, body=dict(FakeSDK.sample(102), packet_timestamp_ns=100))
+    time.sleep(.04)
+    f.stop.set()
+    thread.join(1.)
+    assert not thread.is_alive()
+    assert [p['body_sample_sequence'] for _,p in f.body_socket.packets] == [100]
+    assert f.metrics.counts['body_coalesced'] == 99
+    assert f.metrics.counts['body_stale'] == 1
+    assert f.metrics.counts['body_duplicate'] == 1
+
+
+def test_latest_slots_bounded_and_owned_by_side():
+    metrics = TransportMetrics()
+    slots = LatestHands(metrics)
+    for i in range(1, 1001):
+        slots.offer('right', {'sequence': i})
+    assert slots.slots == {'right': {'sequence': 1000}}
+    assert metrics.counts['right_coalesced'] == 999
+    assert slots.take() == ('right', {'sequence': 1000})
+    slots.offer('right', {'sequence': 1})
+    assert not slots.slots
+    slots.close()
+    assert slots.take() is None
+
+
+def test_old_sdk_fails_before_subscribing():
+    with pytest.raises(RuntimeError, match='rebuild'):
+        require_notifications(SimpleNamespace(init=lambda: pytest.fail('must not subscribe')))
+
+
+def test_native_receipt_survives_packet_build_and_stale_cached_age():
+    bridge = load_bridge('xrobotoolkit_body_udp_bridge')
+    sample = FakeSDK.sample(1, age=.03)
+    received = sample['received_monotonic_ns']/1e9
+    sample['age_s'] = 0.  # Getter age can never hide time spent waiting/mapping.
+    packet, count = bridge._packet_from_sample(sample, 0, False)
+    assert count == 24
+    assert packet['body_sample_monotonic'] == received
+    assert packet['body_sample_age_s'] >= .03
+    sample['received_monotonic_ns'] -= 100_000_000
+    assert bridge._packet_from_sample(sample, 0, False) == (None, 0)
+
+
+def test_hand_expiration_invalid_flags_and_side_independence():
+    mapper = PicoHands()
+    with pytest.raises(ValueError, match='stale'):
+        mapper.map_sample('right', FakeSDK.hand(1, age=.101))
+    hand = FakeSDK.hand(2)
+    hand['flags'][3] = 0
+    with pytest.raises(ValueError, match='invalid/occluded'):
+        mapper.map_sample('right', hand)
+    assert not mapper.last.get('left')
+
+
+def test_blocked_terminal_does_not_block_body(tmp_path):
+    release = threading.Event()
+    class Blocked:
+        def write(self, value):
+            release.wait(5.)
+        def flush(self):
+            pass
+    diagnostics = RuntimeDiagnostics(tmp_path/'pico.jsonl', stdout=Blocked())
+    diagnostics.message('block terminal')
+    sdk = FakeSDK()
+    f = forwarder(sdk, diagnostics=diagnostics, mapper=Mapper(.1))
+    sdk.start()
+    try:
+        run_profiled(f)
+        assert len(f.body_socket.packets) == 65
+        assert f.test_profile['stages']['notification_to_send']['p95_ms'] < 10.
+    finally:
+        sdk.close()
+        release.set()
+        diagnostics.close()
+
+
+def test_recording_backpressure_bounded_and_timestamps_preserved(tmp_path):
+    release = threading.Event()
+    saved = []
+    writer = SimpleNamespace(warmup_discard_s=0.,
+        write_packet=lambda p,n,**kw: (release.wait(2.), saved.append((p, kw))) and (0., 'neutral_start'),
+        write_event=lambda *a,**kw: None, close=lambda: None)
+    diagnostics = RuntimeDiagnostics(tmp_path/'diag.jsonl')
+    metrics = TransportMetrics()
+    recording = AsyncRecording(writer, metrics, diagnostics)
+    packet = {'frames': {'right_hand': [1]}}
+    for _ in range(150):
+        recording.submit(packet, 1)
+    packet['frames']['right_hand'][0] = 9
+    assert len(recording.queue) <= 64
+    assert metrics.counts['record_dropped'] > 0
+    release.set()
+    assert recording.close()
+    diagnostics.close()
+    assert all(p['frames']['right_hand'] == [1] for p,kw in saved)
+    assert all(kw['record_monotonic_ns'] <= time.monotonic_ns() for p,kw in saved)
+
+
+def test_owner_initializes_once_per_start_and_workers_never_subscribe(monkeypatch, tmp_path):
+    import sys
+    import esrobo_laptop.pico_transport as module
+    sdk = FakeSDK()
+    counts = {'init':0, 'deinit':0}
+    original_close = sdk.close
+    def init():
+        counts['init'] += 1
+        sdk.end.clear()
+        sdk.start()
+    def deinit():
+        counts['deinit'] += 1
+        original_close()
+    sdk.init, sdk.close = init, deinit
+    monkeypatch.setitem(sys.modules, 'xrobotoolkit_sdk', sdk)
+    monkeypatch.setattr(module, 'WORKSPACE', tmp_path)
+    bridge = load_bridge('xrobotoolkit_body_udp_bridge')
+    args = bridge.parse_args(['--samples','3'])
+    assert module.run_pico(bridge,args) == 0
+    assert counts == {'init':1, 'deinit':1}
+    sdk.latest['notification_id'] = 0
+    sdk.latest['body'] = sdk.sample(0)
+    assert module.run_pico(bridge,args) == 0
+    assert counts == {'init':2, 'deinit':2}
+
+
+@pytest.mark.parametrize('delay', [.02, .1, .5])
+def test_slow_recording_does_not_hold_forwarder(tmp_path, delay):
+    diagnostics = RuntimeDiagnostics(tmp_path/'diagnostic.jsonl')
+    sdk = FakeSDK()
+    f = forwarder(sdk, mapper=Mapper())
+    release = threading.Event()
+    class Writer:
+        warmup_discard_s = 0.
+        def write_packet(self, *a, **kw):
+            release.wait(delay)
+            return (0.,'neutral_start')
+        def write_event(self,*a,**kw):
+            pass
+        def close(self):
+            pass
+    recording = AsyncRecording(Writer(),f.metrics,diagnostics)
+    f.recording = recording
+    sdk.start()
+    try:
+        run_profiled(f)
+        assert len(f.body_socket.packets) == 65
+        assert len(recording.queue) <= 64
+        assert f.test_profile['stages']['notification_to_send']['p95_ms'] < 10.
+    finally:
+        sdk.close()
+        release.set()
+        recording.close()
+        diagnostics.close()
+
+
+def test_rate_cap_coalesces_fast_source_without_replaying_history():
+    sdk = FakeSDK(300)
+    f = forwarder(sdk, mapper=Mapper())
+    sdk.start()
+    try:
+        run_profiled(f)
+    finally:
+        sdk.close()
+    packets = f.body_socket.packets
+    elapsed = (packets[-1][0]-packets[0][0])/1e9
+    assert (len(packets)-1)/elapsed <= 92.
+    sequences = [p['body_sample_sequence'] for _,p in packets]
+    assert all(b>a for a,b in zip(sequences,sequences[1:]))
+    assert f.metrics.counts['body_coalesced'] > 100
+    assert len(f.hands.slots) <= 2
+
+
+def test_recording_failure_is_reported_without_claiming_persistence(tmp_path):
+    metrics = TransportMetrics()
+    diagnostics = RuntimeDiagnostics(tmp_path/'errors.jsonl')
+    def fail(*a,**kw):
+        raise OSError('disk full')
+    writer = SimpleNamespace(warmup_discard_s=0.,write_packet=fail,close=lambda:None)
+    recording = AsyncRecording(writer,metrics,diagnostics)
+    recording.submit({'frames':{}},10)
+    assert not recording.close()
+    assert metrics.counts['record_errors'] == 1
+    assert metrics.error_snapshot()['recording'] == 'disk full'
+    diagnostics.close()
+
+
+def test_sdk_has_only_vendor_close_name_and_cleanup_failure_does_not_skip_logs(monkeypatch, tmp_path):
+    import sys
+    import esrobo_laptop.pico_transport as module
+    sdk = FakeSDK()
+    native_close = sdk.close
+    calls = []
+    def close():
+        calls.append('close')
+        native_close()
+        raise OSError('simulated close failure')
+    sdk.init, sdk.close = sdk.start, close
+    assert not hasattr(sdk,'deinit')
+    monkeypatch.setitem(sys.modules,'xrobotoolkit_sdk',sdk)
+    monkeypatch.setattr(module,'WORKSPACE',tmp_path)
+    bridge = load_bridge('xrobotoolkit_body_udp_bridge')
+    with pytest.raises(RuntimeError,match='cleanup incomplete'):
+        module.run_pico(bridge,bridge.parse_args(['--samples','2']))
+    assert calls == ['close']
+    assert not sdk.thread.is_alive()
+    assert not any(t.name in ('laptop-log','laptop-console') and t.is_alive() for t in threading.enumerate())

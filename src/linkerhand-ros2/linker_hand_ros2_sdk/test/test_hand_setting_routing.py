@@ -4,8 +4,26 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+import pytest
 
 SOURCE = Path(__file__).parents[1] / 'linker_hand_ros2_sdk/linker_hand.py'
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+def test_l10_initial_speed_maximum_without_startup_motion(side):
+    tree = ast.parse(SOURCE.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'LinkerHand')
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_init_hand')
+    start = next(i for i,n in enumerate(init.body) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == 'pose' for t in n.targets))
+    # Execute the actual startup configuration branch after feedback detection,
+    # with ROS/CAN construction excluded. The remainder is this startup block.
+    node = SimpleNamespace(hand_type=side, hand_joint='L10', move_on_start=False, api=Mock())
+    namespace = dict(self=node, time=SimpleNamespace(sleep=lambda _: None), ColorMsg=lambda **kw: None)
+    exec(compile(ast.Module(body=init.body[start:], type_ignores=[]), str(SOURCE), 'exec'), namespace)
+    node.api.set_speed.assert_called_once_with(speed=[255]*10)
+    node.api.set_torque.assert_called_once_with(torque=[180]*10)
+    node.api.finger_move.assert_not_called()
 
 
 def callback():

@@ -153,33 +153,31 @@ def _rate(values: deque[float], now: float, window_s: float = 1.0) -> float:
     return (len(values) - 1) / max(values[-1] - values[0], 1.0e-9)
 
 
-def _safe_int(getter, default: int = 0) -> int:
-    try:
-        return int(getter())
-    except Exception:
-        return default
-
-
 def _build_packet(xrt, sequence: int, include_full_body_arrays: bool) -> tuple[dict[str, Any] | None, int]:
-    if not xrt.is_body_data_available():
-        return None, 0
+    sample_getter = getattr(xrt, "get_body_sample", None)
+    if sample_getter is None:
+        raise RuntimeError("PICO SDK needs atomic Body samples; rebuild with install_pico.sh")
+    observed = time.monotonic()
+    sample = sample_getter()
+    return _packet_from_sample(sample, sequence, include_full_body_arrays, observed=observed)
 
-    raw_poses = xrt.get_body_joints_pose()
+
+def _packet_from_sample(sample, sequence, include_full_body_arrays, *, observed=None):
+    """Build from an owned native snapshot; never refresh its receipt time."""
+    observed = time.monotonic() if observed is None else observed
+    received_ns = int(sample.get("received_monotonic_ns", 0))
+    age_s = observed - received_ns / 1e9 if received_ns else float(sample["age_s"])
+    if (not sample["valid"] or int(sample["sequence"]) <= 0
+            or not math.isfinite(age_s) or not 0 <= age_s <= .1):
+        return None, 0
+    # Conservative receipt estimate: never stamp the sample after processing.
+    received = received_ns / 1e9 if received_ns else observed - age_s
+    raw_poses = sample["poses"]
     poses = [_as_float_list(row, 7) for row in list(raw_poses or [])]
     if len(poses) < len(BODY_JOINT_NAMES):
         return None, 0
 
-    body_timestamp_ns = _safe_int(xrt.get_body_timestamp_ns)
-    xr_timestamp_ns = _safe_int(xrt.get_time_stamp_ns)
-    joint_timestamps = []
-    try:
-        joint_timestamps = [int(value) for value in list(xrt.get_body_joints_timestamp() or [])]
-    except Exception:
-        joint_timestamps = []
-    # Teleoperation consumes shoulder/elbow/wrist joints 16..21.  A timestamp
-    # left on an unrelated lower-body joint must not keep a frozen arm alive.
-    arm_joint_timestamps = joint_timestamps[16:22] if len(joint_timestamps) >= 22 else []
-    body_joint_timestamp_ns = max(arm_joint_timestamps, default=0)
+    packet_timestamp_ns = int(sample["packet_timestamp_ns"])
     frames: dict[str, Any] = {}
     valid = []
     positions = []
@@ -205,14 +203,11 @@ def _build_packet(xrt, sequence: int, include_full_body_arrays: bool) -> tuple[d
         "source": "xrobotoolkit_body_tracking",
         "source_frame": "pico_tracking",
         "sequence": sequence,
-        "xrt_body_timestamp_ns": body_timestamp_ns,
-        "xrt_body_joint_timestamp_ns": body_joint_timestamp_ns,
-        "xrt_timestamp_ns": xr_timestamp_ns,
-        "body_freshness_source": (
-            "body-timestamp" if body_timestamp_ns > 0
-            else "joint-timestamp" if body_joint_timestamp_ns > 0
-            else "pose-change"
-        ),
+        "xrt_body_packet_timestamp_ns": packet_timestamp_ns,
+        "body_sample_sequence": int(sample["sequence"]),
+        "body_sample_age_s": age_s,
+        "body_sample_monotonic": received,
+        "body_freshness_source": "component-packet",
         "quat_order": "xyzw",
         "frames": frames,
     }
@@ -229,26 +224,7 @@ def _build_packet(xrt, sequence: int, include_full_body_arrays: bool) -> tuple[d
 
 
 def _packet_signature(packet: dict[str, Any]) -> tuple:
-    body_timestamp_ns = int(packet.get("xrt_body_timestamp_ns", 0))
-    joint_timestamp_ns = int(packet.get("xrt_body_joint_timestamp_ns", 0))
-    if body_timestamp_ns > 0:
-        return "body-timestamp", body_timestamp_ns
-    if joint_timestamp_ns > 0:
-        return "joint-timestamp", joint_timestamp_ns
-    frames = packet.get("frames", {})
-    frame_sig = tuple(
-        (
-            name,
-            tuple(float(value) for value in frame.get("pos", [])[:3]),
-            tuple(float(value) for value in frame.get("quat_xyzw", [])[:4]),
-        )
-        for name, frame in sorted(frames.items())
-        if isinstance(frame, dict)
-    )
-    # The vendor's generic XR timestamp advances for head/controller traffic
-    # even when Body is only a stale cache.  With no Body/joint timestamp, only
-    # an actual pose change is evidence of a new body frame.
-    return "pose-change", frame_sig
+    return "component-packet", int(packet["body_sample_sequence"])
 
 
 def _format_pose_summary(packet: dict[str, Any]) -> str:
@@ -307,8 +283,8 @@ class BodyRecordingWriter:
         self._write_json_line(header)
         self._stream.flush()
 
-    def write_packet(self, packet: dict[str, Any], encoded_size: int) -> tuple[float, str]:
-        now_ns = time.monotonic_ns()
+    def write_packet(self, packet: dict[str, Any], encoded_size: int, *, record_monotonic_ns=None) -> tuple[float, str]:
+        now_ns = time.monotonic_ns() if record_monotonic_ns is None else record_monotonic_ns
         if self.first_packet_monotonic_ns is None:
             self.first_packet_monotonic_ns = now_ns
         t_rel_s = (now_ns - self.first_packet_monotonic_ns) / 1.0e9
@@ -329,7 +305,9 @@ class BodyRecordingWriter:
         return t_rel_s, phase
 
     def write_event(self, event: str, **fields: Any) -> None:
-        now_ns = time.monotonic_ns()
+        now_ns = fields.pop("record_monotonic_ns", None)
+        if now_ns is None:
+            now_ns = time.monotonic_ns()
         if self.first_packet_monotonic_ns is None:
             t_rel_s = 0.0
         else:
@@ -438,8 +416,6 @@ def main(argv: list[str]) -> int:
     sent_total = 0
     latest_packet_size = 0
     latest_valid_count = 0
-    latest_frame_names: list[str] = []
-    latest_pose_summary = "none"
     record_started_printed = False
     record_motion_started_printed = False
     record_warmup_started_printed = False
@@ -455,7 +431,7 @@ def main(argv: list[str]) -> int:
 
             if packet is None:
                 if now - last_wait_print >= args.print_interval:
-                    print("[xrobotoolkit_body_bridge] body tracking unavailable; waiting for PICO body data.", flush=True)
+                    print("[xrobotoolkit_body_bridge] no complete Body sample within 100 ms; waiting for fresh PICO body data.", flush=True)
                     last_wait_print = now
             else:
                 signature = _packet_signature(packet)
@@ -463,9 +439,8 @@ def main(argv: list[str]) -> int:
                 if not fresh_body_frame:
                     if now - last_print >= args.print_interval:
                         print(
-                            "[xrobotoolkit_body_bridge] body tracking frozen: cached body pose "
-                            "is unchanged and no advancing body/joint timestamp is available; "
-                            "no UDP frame sent.",
+                            "[xrobotoolkit_body_bridge] waiting for next Body component packet; "
+                            "SDK receipt sequence unchanged; no duplicate UDP frame sent.",
                             flush=True,
                         )
                         last_print = now
@@ -524,20 +499,18 @@ def main(argv: list[str]) -> int:
                 sent_times.append(now)
                 latest_packet_size = len(encoded)
                 latest_valid_count = valid_count
-                frames = packet.get("frames", {})
-                latest_frame_names = sorted(frames.keys()) if isinstance(frames, dict) else []
-                latest_pose_summary = _format_pose_summary(packet)
-
                 if now - last_print >= args.print_interval:
-                    names = ",".join(latest_frame_names) if latest_frame_names else "none"
+                    frames = packet.get("frames", {})
+                    names = ",".join(sorted(frames)) if isinstance(frames, dict) and frames else "none"
                     print(
                         "[xrobotoolkit_body_bridge] "
                         f"send_hz={_rate(sent_times, now):5.1f} "
                         f"xrt_update_hz={_rate(source_change_times, now):5.1f} "
                         f"valid={latest_valid_count:02d}/{len(BODY_JOINT_NAMES)} "
                         f"frames=[{names}] "
-                        f"body_timestamp_ns={packet.get('xrt_body_timestamp_ns', 0)} "
-                        f"body_joint_timestamp_ns={packet.get('xrt_body_joint_timestamp_ns', 0)} "
+                        f"body_packet_timestamp_ns={packet.get('xrt_body_packet_timestamp_ns', 0)} "
+                        f"body_receipt_seq={packet.get('body_sample_sequence', 0)} "
+                        f"body_age_ms={packet.get('body_sample_age_s', 0)*1000.:.1f} "
                         f"freshness={packet.get('body_freshness_source', 'unknown')} "
                         f"bytes={latest_packet_size} "
                         f"recorded={record_writer.packet_count if record_writer is not None else 0} "
@@ -560,7 +533,7 @@ def main(argv: list[str]) -> int:
                             flush=True,
                         )
                     if args.print_poses:
-                        print(f"[xrobotoolkit_body_bridge] arm_poses {latest_pose_summary}", flush=True)
+                        print(f"[xrobotoolkit_body_bridge] arm_poses {_format_pose_summary(packet)}", flush=True)
                     last_print = now
 
             elapsed = time.perf_counter() - loop_start

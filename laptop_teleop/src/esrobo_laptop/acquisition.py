@@ -1,9 +1,7 @@
 """Laptop entrypoints for the existing, calibrated PICO and SenseGlove bridges."""
 import importlib.util
 import json
-import socket
 import sys
-import time
 
 from .config import WORKSPACE
 
@@ -34,36 +32,9 @@ class AnnotatedSocket:
 
 
 def pico(argv):
-    from .pico_hand import PicoHands
+    from .pico_transport import run_pico
     bridge = load_bridge("xrobotoolkit_body_udp_bridge")
-    original = bridge._build_packet
-    args = bridge.parse_args(argv)
-    hands = PicoHands()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    last_print = 0.
-
-    def build(sdk, *positional, **kwargs):
-        nonlocal last_print
-        samples = hands.poll(sdk)
-        stamp = time.monotonic()
-        if samples and not args.record_only:
-            packet = dict(pico_hands=samples)
-            sock.sendto(annotate(packet, "pico_hand", {s: stamp-v["age_s"] for s, v in samples.items()}, samples),
-                        (args.host, args.port))
-        if stamp - last_print > 2:
-            print(f"[pico_hand] {hands.status}", flush=True)
-            last_print = stamp
-        packet, count = original(sdk, *positional, **kwargs)
-        if packet is not None:
-            packet["pico_hand_status"] = dict(hands.status)
-            packet = json.loads(annotate(packet, "pico", dict(left=stamp, right=stamp), ("left", "right")))
-        return packet, count
-
-    bridge._build_packet = build
-    try:
-        return bridge.main(argv)
-    finally:
-        sock.close()
+    return run_pico(bridge, bridge.parse_args(argv))
 
 
 def senseglove(argv):

@@ -1,4 +1,6 @@
 const $ = id => document.getElementById(id);
+// Match contract.py: v2 distinguishes fresh unreachable targets from input gaps.
+const REQUIRED_INPUT_HOLD_PROTOCOL = 2;
 const session = crypto.randomUUID();
 let state = null;
 let selectedLog = 'events';
@@ -194,9 +196,33 @@ $('can-dialog').addEventListener('close', async () => {
     $('can').disabled = !state?.connected || !state?.capabilities?.automatic_can_teardown;
   }
 });
-$('preview').onclick = async () => { await perform('local_start', {name: 'teleop', preview: true}); selectLog('l:teleop'); };
+function gatewayProtocolReady() {
+  const mode = options();
+  const holdProtocol = state?.robot?.input_hold_protocol;
+  if (holdProtocol !== REQUIRED_INPUT_HOLD_PROTOCOL) {
+    notice(`机器人网关输入保持协议为 ${holdProtocol ?? '未知'}，本机需要 ${REQUIRED_INPUT_HOLD_PROTOCOL}（区分不可达目标保持与输入超时）。请同步机器人端代码，并在确认安全后重启网关。`, true);
+    return false;
+  }
+  const protocol = state?.robot?.entry_protocol;
+  if (mode.side !== 'both' && !mode.hand_only && protocol !== 6) {
+    notice(`机器人网关接管协议为 ${protocol ?? '未知'}，本机需要 6。请同步机器人端 robot_link、teleoperation 源码并核对配置，安全退出旧网关后重新启动。`, true);
+    return false;
+  }
+  if (mode.side !== 'both' && !mode.hand_only && state?.robot?.entry_keepalive_protocol !== 1) {
+    notice('机器人网关缺少接近阶段保活协议 1；请同步 robot_link 并重启网关。', true);
+    return false;
+  }
+  return true;
+}
+$('preview').onclick = async () => {
+  if (!gatewayProtocolReady()) return;
+  if (await perform('local_start', {name: 'teleop', preview: true})) selectLog('l:teleop');
+};
 $('pause-preview').onclick = () => perform('pause_preview');
-$('run').onclick = async () => { await perform('local_start', {name: 'teleop', preview: false}); selectLog('l:teleop'); };
+$('run').onclick = async () => {
+  if (!gatewayProtocolReady()) return;
+  if (await perform('local_start', {name: 'teleop', preview: false})) selectLog('l:teleop');
+};
 $('stop').onclick = () => perform('stop');
 $('motion-stop').onclick = () => perform('stop');
 $('stop-compute').onclick = () => perform('local_stop', {name: 'teleop'});
@@ -363,19 +389,23 @@ $('recover').onclick = () => {
   const handOnly = Boolean(state?.mode?.hand_only);
   const message = handOnly
     ? '确认停止计算且机器人周围安全？将核验机械臂七轴失能和手部反馈；不会发送回零运动。'
-    : '确认现场安全且实体急停可触及？单臂故障恢复会执行受检回零，机器人将运动。';
+    : '确认机械臂和手指周围安全且实体急停可触及？单臂故障恢复会执行受检回零；带手模式须先确认机械臂失能，在当前位置受检恢复灵巧手自然张开姿态并核验到位，再执行机械臂七关节回零。机械臂和手指都可能运动。';
   if (confirm(message)) perform('remote_recover', {}, $('recover'));
 };
 $('disable-all').onclick = () => {
   if (confirm('确认停止当前目标流并失能双臂与双手？腰部需在独立控制区处理。')) perform('remote_disable', {name: 'gateway'});
 };
 $('enable').onclick = () => {
-  if (confirm('确认机器人周围安全且实体急停可触及？机器人将先回零并张开灵巧手；随后请按页面提示摆好 PICO 准备姿态，检测通过后自动开始跟随。'))
+  const prompt = state.robot?.entry_protocol === 6
+    ? '确认机器人和手指周围空间清空，实体急停可触及？机器人先受检回零，灵巧手保持当前姿态；首次目标只规划 J1–J5，J6–J7 和手指保持实测位置。到位后才开始完整实时跟随。请保持 PICO 追踪。'
+    : '确认机器人周围安全且实体急停可触及？当前网关仍按原流程让灵巧手张开并核验，然后回零及接管；请核对网关版本和手部状态。';
+  if (confirm(prompt))
     perform('gateway_key', {key: 'e'});
 };
+$('handover').onclick = () => perform('gateway_key', {key: 'g'}, $('handover'));
 for (const button of document.querySelectorAll('[data-key]')) button.onclick = () => {
   const key = button.dataset.key;
-  if (key === 'z' && !confirm('单臂受检回零会产生真实运动。确认现场安全且已按机器人恢复流程检查？')) return;
+  if (key === 'z' && !confirm('单臂受检回零会产生真实运动；带手模式须先确认机械臂失能，先在当前位置受检恢复手部自然张开姿态，再执行机械臂七关节回零。确认现场安全且已按机器人恢复流程检查？')) return;
   perform('gateway_key', {key});
 };
 $('log-source').onchange = () => { selectedLog = $('log-source').value; updateLog(); };
@@ -415,6 +445,8 @@ function renderArm(side, value, fresh) {
   card.append(heading);
   if (value.controller_fault) card.append(element('div', `故障：${value.controller_fault.status_name || value.controller_fault.category || JSON.stringify(value.controller_fault)}`, 'fault'));
   if (value.driver_fault) card.append(element('div', `驱动：${value.driver_fault}`, 'fault'));
+  if (fresh && !Array.isArray(value.arm_urdf_rad) && value.feedback_diagnostic)
+    card.append(element('div', '关节角反馈未通过连续性核验；使能状态可读，但当前姿态尚不可用于运动。', 'fault'));
   const joints = element('div', undefined, 'joint-grid');
   for (let i = 0; i < 7; i++) {
     const valueRad = value.arm_urdf_rad?.[i];
@@ -430,6 +462,24 @@ function renderArm(side, value, fresh) {
   return card;
 }
 
+function renderFirstFault(robot) {
+  const shown = robot.mode === 'FAULT' && Boolean(robot.first_fault_reason);
+  $('first-fault').hidden = !shown;
+  if (!shown) return;
+  $('first-fault-reason').textContent = robot.first_fault_reason;
+  const fault = robot.first_fault_summary || {};
+  const degrees = value => Number.isFinite(value) ? `${(value * 180 / Math.PI).toFixed(2)}°` : '—';
+  const speed = value => Number.isFinite(value) ? `${(value * 180 / Math.PI).toFixed(2)}°/s` : '—';
+  $('first-fault-values').textContent = fault.failed_joints?.length ? [
+    `${fault.side === 'left' ? '左臂' : fault.side === 'right' ? '右臂' : ''} J${fault.failed_joints.join(', J')} · 反馈间隔 ${Number.isFinite(fault.feedback_dt_s) ? (fault.feedback_dt_s * 1000).toFixed(1) + ' ms' : '—'}`,
+    `目标 ${degrees(fault.target_physical_rad)} · 上次命令 ${degrees(fault.previous_command_physical_rad)} · 实测 ${degrees(fault.feedback_physical_rad)}`,
+    `上次命令速度 ${speed(fault.previous_velocity_physical_rad_s)} · 允许速度 ${speed(fault.feasible_velocity_lower_rad_s)} ～ ${speed(fault.feasible_velocity_upper_rad_s)}`,
+    `命令领先实测 ${degrees(fault.lead_rad)} / 上限 ${degrees(fault.lead_limit_rad)}`,
+  ].join('\n') : '';
+  $('first-fault-log').textContent = robot.journal_path
+    ? `完整故障帧已记录于机器人端 ${robot.journal_path}` : '';
+}
+
 function render() {
   const liveGateway = Boolean(state.connected && state.remote?.sessions?.includes('esrobo_gateway')
     && state.remote?.gateway_args?.includes('--side'));
@@ -441,7 +491,17 @@ function render() {
   const robot = state.robot || {};
   const telemetry = state.telemetry || {};
   const fresh = robot.age_s < 1.5 && state.connected && state.remote_age_s < 2;
+  const inputHoldReady = robot.input_hold_protocol === REQUIRED_INPUT_HOLD_PROTOCOL;
   const mode = state.processes.teleop?.running ? state.mode : options();
+  $('entry-flow-hint').textContent = fresh && !inputHoldReady
+    ? `当前网关输入保持协议为 ${robot.input_hold_protocol ?? '未知'}，本机需要 ${REQUIRED_INPUT_HOLD_PROTOCOL}（区分不可达目标保持与输入超时）；同步机器人端代码并在现场确认安全后重启网关，才能启动计算。`
+    : fresh && mode.side !== 'both' && !mode.hand_only && robot.entry_protocol !== 6
+    ? `当前机器人网关接管协议为 ${robot.entry_protocol ?? '未知'}，本机需要 6。预览和正式计算均无法启动；同步机器人端源码、核对配置并重启网关。`
+    : fresh && mode.side !== 'both' && !mode.hand_only && robot.entry_keepalive_protocol !== 1
+    ? '机器人网关缺少接近阶段保活协议 1；请同步 robot_link 并重启网关后启动计算。'
+    : robot.entry_protocol === 6
+    ? '先开始正式计算，再点击“使能并准备”。机器人手部保持原位；启动路径只让 J1–J5 运动，J6、J7 与手保持当前位置。到位后才开始完整实时跟随。启动检查只覆盖机械臂、腕部，不计算灵巧手掌体和手指包络；请确认手指周围实际空间。'
+    : '当前网关尚未加载启动阶段手部及 J6/J7 锁定流程；当前版本仍会要求灵巧手张开。更新机器人端并重启网关后使用新流程。';
   // A dual-arm gateway reports feedback under `sides.left/right`, while a
   // single-arm gateway reports the selected side directly in `feedback`.
   // Preserve the real side name so hand geometry and arm status use the same
@@ -529,6 +589,13 @@ function render() {
   else if (waistFeedbackValid && !liveGateway) $('waist-detail').textContent = '腰部反馈正常；机械臂网关未运行，页面无法确认机械臂七轴失能，因此尚未开放调整按钮。';
   const faults = Object.values(members).filter(value => value.controller_fault || value.driver_fault);
   const sides = mode.side === 'both' ? ['left', 'right'] : [mode.side];
+  const armFeedbackReady = mode.hand_only || sides.every(side => {
+    const arm = members[side];
+    return Array.isArray(arm?.arm_urdf_rad) && arm.arm_urdf_rad.length === 7
+      && arm.arm_urdf_rad.every(Number.isFinite)
+      && Number.isFinite(arm.arm_feedback_age_s) && arm.arm_feedback_age_s <= .1
+      && !arm.feedback_diagnostic;
+  });
   const required = telemetry.required_sources || sides.flatMap(side =>
     (mode.hand_only ? ['hand'] : mode.with_hand ? ['arm', 'hand', 'wrist'] : ['arm'])
       .map(kind => `${side}_${kind}`));
@@ -563,44 +630,154 @@ function render() {
   $('robot-mode').className = 'tag ' + (fresh && robot.mode === 'ACTIVE' ? 'active' : fresh && robot.mode === 'FAULT' ? 'fault' : '');
   const returnFailure = fresh && robot.mode === 'FAULT' && robot.last_return?.returned === false
     ? robot.last_return.reason : '';
+  const returnFailureDetail = returnFailure
+    ? `受检回零未完成（${robot.last_return.stage || '未知阶段'}）：${
+        returnFailure === 'goal pose not certified safe'
+          ? '零位目标未通过几何安全检查；当前手指姿态也参与检查。请查看机器人网关日志中的碰撞部位及间隙，处理原因后再重试。'
+          : returnFailure
+      }${robot.last_return.disabled === true ? ' 已核验失能。' : ' 尚未核验失能，未恢复 IDLE。'}`
+    : '';
   $('robot-reason').textContent = state.remote_error
-    || (returnFailure ? `回零失败：${returnFailure}` : robot.reason)
+    || (state.auto_handover_error && robot.mode === 'CALIBRATING' ? `自动接管暂停：${state.auto_handover_error}` : '')
+    || (returnFailureDetail || robot.reason)
     || '等待网关反馈';
+  renderFirstFault(robot);
   $('feedback-age').textContent = fresh ? `${Math.round((robot.age_s + (robot.feedback_cache_age_s || 0)) * 1000)} ms` : '—';
   $('compute-rate').textContent = Number.isFinite(telemetry.rates?.compute_hz) ? `${telemetry.rates.compute_hz.toFixed(1)} Hz` : '—';
   const loopHz = telemetry.rates?.loop_hz;
-  const p95 = telemetry.rates?.compute_ms_p95;
-  $('compute-detail').textContent = Number.isFinite(loopHz) && Number.isFinite(p95)
-    ? `主循环 ${loopHz.toFixed(1)} Hz · P95 ${p95.toFixed(1)} ms`
-    : '有效目标 / 秒';
+  $('compute-detail').textContent = Number.isFinite(loopHz)
+    ? `主循环 ${loopHz.toFixed(1)} Hz（最近 2 秒）`
+      + (Number.isFinite(telemetry.rates?.control_hz)
+        ? ` · 门禁控制流 ${telemetry.rates.control_hz.toFixed(1)} Hz` : '') : '有效目标 / 秒';
+  const diagnostics = telemetry.diagnostics;
+  const errors = diagnostics ? Object.entries(diagnostics.errors || {}).filter(([, value]) => value) : [];
+  $('diagnostics-status').textContent = diagnostics
+    ? `异步日志 · 待处理 ${(diagnostics.files?.pending || 0) + (diagnostics.console?.pending || 0)}`
+      + ` / 合并 ${(diagnostics.files?.coalesced || 0) + (diagnostics.console?.coalesced || 0)}`
+      + ` / 丢弃 ${(diagnostics.files?.dropped || 0) + (diagnostics.console?.dropped || 0) + (diagnostics.serialization_errors || 0)}`
+      + (errors.length ? ` · 日志错误：${errors.map(([name, value]) => `${name}: ${value}`).join('；')}` : '')
+      + (telemetry.age_s >= 1.5 ? ' · 诊断状态已过期' : '')
+    : '等待异步日志诊断';
+  const visualization = telemetry.visualization;
+  if (visualization) {
+    $('diagnostics-status').textContent += ` · 骨架后台待处理 ${visualization.pending || 0} / 合并 ${visualization.coalesced || 0}`
+      + (visualization.last_error ? ` · 骨架诊断错误：${visualization.last_error}` : '');
+  }
+  $('diagnostics-status').classList.toggle('fault', errors.length > 0 || Boolean(visualization?.last_error));
+  $('diagnostics-status').title = '';
+  const entryExecution = robot.entry_execution;
+  $('entry-execution-status').textContent = entryExecution
+    ? `初始接近${entryExecution.active ? '' : '（已结束）'} · 发送 ${Number.isFinite(entryExecution.send_hz) ? entryExecution.send_hz.toFixed(1) + ' Hz' : '—'}`
+      + ` · 缓存命中 ${entryExecution.cache_hits || 0}`
+      + ` · 超期 ${entryExecution.overruns || 0} / 跳过时刻 ${entryExecution.skipped_ticks || 0}`
+      + ` · 丢弃 ${entryExecution.dropped || 0}`
+      + (entryExecution.error ? ` · 日志错误：${entryExecution.error}` : '')
+      + (!fresh ? ' · 诊断状态已过期' : '')
+    : '等待初始接近诊断';
+  $('entry-execution-status').title = entryExecution?.log_path || '';
   $('sent-count').textContent = `${telemetry.computed || 0} / ${telemetry.sent || 0}`;
   $('runtime-status').textContent = telemetry.age_s < 1.5
-    ? `${telemetry.preview ? '预览 · 不发送目标' : '正式计算'} · ${telemetry.preparation_status || telemetry.status}`
+    ? `${telemetry.preview ? '预览 · 不发送目标' : '正式计算'} · ${telemetry.input_hold_active
+      ? `${telemetry.wrist_handover?.phase === 'waiting_first_input' ? '首次接管等待新鲜输入' : '输入短时中断'}，机器人受控保持（${Math.round((telemetry.input_hold_age_s || 0) * 1000)} / 500 ms）`
+      : telemetry.preparation_status || telemetry.status}`
     : state.processes.teleop?.running ? '正在加载模型 / 等待状态…' : '计算未运行';
+  $('runtime-status').classList.toggle('input-hold', Boolean(telemetry.age_s < 1.5 && telemetry.input_hold_active));
+  if (telemetry.age_s < 1.5 && robot.mode === 'ACTIVE') {
+    if (telemetry.input_hold_active && telemetry.input_resume_diagnostics?.reason) {
+      $('runtime-status').textContent += ` · 恢复检查：${telemetry.input_resume_diagnostics.reason}`;
+    }
+    if (telemetry.wrist_handover?.active) {
+      const wrist = telemetry.wrist_handover;
+      $('runtime-status').textContent += wrist.phase === 'waiting_first_input'
+        ? ' · J6/J7 等待首次新鲜输入'
+        : ` · J6/J7 首次限速接管${wrist.paused ? '（输入暂停）' : ''}`;
+    }
+    if (telemetry.hand_handover?.active) {
+      const hand = telemetry.hand_handover;
+      $('runtime-status').textContent += ` · 手指首次到位过渡 · 拇指过渡目标 ${hand.reference_target?.[0] ?? hand.source_target?.[0] ?? '--'}`
+        + ` / 实时目标 ${hand.source_target?.[0] ?? '--'} / 本机指令 ${hand.command?.[0] ?? '--'}`
+        + ` / 网关已发 ${robot.feedback?.hand?.command_unit?.[0] ?? '--'} / 反馈 ${robot.feedback?.hand?.position_unit?.[0] ?? '--'}（0–255）`;
+    }
+  }
+  if (telemetry.age_s < 1.5 && robot.entry_keepalive_protocol === 1 &&
+      ['CHECKING_ENTRY', 'APPROACHING', 'WAITING_FOR_ACTIVE_TARGET'].includes(robot.mode)) {
+    const ages = required.map(key => telemetry.sources?.[key]);
+    const age = ages.length && ages.every(Number.isFinite) ? `${Math.round(Math.max(...ages) * 1000)} ms` : '暂无完整输入';
+    const keepaliveAge = robot.entry_keepalive_age_s;
+    const communication = Number.isFinite(keepaliveAge) ? `${Math.round(keepaliveAge * 1000)} ms` : '等待确认';
+    $('runtime-status').textContent = (robot.mode === 'WAITING_FOR_ACTIVE_TARGET'
+      ? '已到位保持，等待新鲜输入（最长 2 秒）'
+      : `执行锁定目标${staleInputs.length ? '，PICO 暂无新数据' : ''}`)
+      + ` · PICO 输入年龄 ${age} · 网关保活年龄 ${communication}`;
+  }
+  const wristDetails = mode.with_hand && !mode.hand_only && telemetry.age_s < 1.5
+    ? sides.map(side => {
+      const input = telemetry.pico_wrist_input?.[side];
+      const mapped = telemetry.wrist_mapping?.[side];
+      if (!input || !mapped) return '';
+      const limits = (mapped.at_joint_limit || []).flatMap((hit, index) => hit ? [`J${index + 5} 到达关节限位`] : []);
+      const relative = input.orientation_mode === 'forearm_relative';
+      const absolute = input.orientation_mode === 'forearm_absolute';
+      if (input.source_angle_capped) limits.push('腕部旋转达到映射上限');
+      if (mapped.joint_norm_capped) limits.push('J5–J7 合成偏移达到映射上限');
+      if ((relative || absolute) && input.forearm_plane_observable === false) limits.push('近直臂，前臂方向参考连续保持');
+      if (mapped.orientation_projected) limits.push('姿态超出逐轴可达范围，已投影至边界');
+      if (mapped.entry_wrist_held) limits.push('接近阶段保持腕部');
+      const j5Target = mapped.target_joint_deg?.[0];
+      const j5Feedback = members[side]?.arm_urdf_rad?.[4];
+      const roll = Number.isFinite(input.requested_roll_deg)
+        ? ` · ${absolute ? '绝对翻掌' : '翻掌输入'} ${input.requested_roll_deg.toFixed(1)}°／${absolute ? '限步后' : '限幅限步后'} ${Number(input.filtered_roll_deg).toFixed(1)}°`
+          + (Number.isFinite(j5Target) ? ` · J5 目标 ${j5Target.toFixed(1)}°` : '')
+          + (Number.isFinite(j5Feedback) ? `／实测 ${(j5Feedback * 180 / Math.PI).toFixed(1)}°` : '')
+          + (input.palm_comparison_status === 'paired' && Number.isFinite(input.hand_palm_roll_deg)
+            ? ` · Hand 掌面翻掌 ${input.hand_palm_roll_deg.toFixed(1)}°` : '')
+        : '';
+      return `${side === 'left' ? '左' : '右'}手腕：${absolute ? 'Hand 绝对掌面（前臂坐标）' : relative ? '相对前臂' : 'PICO 参考旋转'} ${Number(input.requested_delta_deg).toFixed(1)}°` +
+        (mapped.anatomical_alignment === true ? ' · 掌面轴已对齐（翻掌 J5／侧摆 J6／弯腕 J7）' : '') +
+        roll +
+        (absolute && Number.isFinite(input.body_palm_disagreement_deg)
+          ? ` · Body/Hand 姿态差 ${input.body_palm_disagreement_deg.toFixed(1)}°（控制采用 Hand）` : '') +
+        ` · 映射剩余朝向误差 ${Number(mapped.mapped_orientation_error_deg).toFixed(1)}°` +
+        (Array.isArray(mapped.joint_lower_deg) && Array.isArray(mapped.joint_upper_deg)
+          ? ` · 范围 ${mapped.joint_lower_deg.map((lo, i) => `J${i + 5} ${lo.toFixed(0)}～${mapped.joint_upper_deg[i].toFixed(0)}°`).join('／')}` : '') +
+        (limits.length ? ` · ${limits.join('、')}` : '');
+    }).filter(Boolean) : [];
+  $('wrist-diagnostics').textContent = wristDetails.join('；') || 'PICO 手腕映射诊断将在预览或正式计算时显示。';
   $('control-owner').textContent = state.owner === session ? '本页面控制中' : state.owner ? '其他页面控制中' : '待启动';
   const running = Boolean(state.processes.teleop?.running);
+  const entryProtocolReady = mode.side === 'both' || mode.hand_only ||
+    (robot.entry_protocol === 6 && robot.entry_keepalive_protocol === 1);
   $('mode').disabled = running || liveGateway;
-  for (const id of ['preview', 'run']) $(id).disabled = running || !fresh || robot.mode !== 'IDLE';
+  for (const id of ['preview', 'run']) $(id).disabled = running || !fresh || !inputHoldReady || !entryProtocolReady
+    || robot.mode !== 'IDLE' || !armFeedbackReady;
+  $('run').disabled ||= faults.length > 0;
   $('pause-preview').disabled = !(running && telemetry.preview);
+  const recoveryNeeded = robot.mode === 'FAULT' || (robot.mode === 'IDLE' && faults.length > 0);
   const canRecover = state.capabilities?.fault_recovery && robot.recovery_supported === true
-    && fresh && liveGateway && robot.mode === 'FAULT' && !running && mode.side !== 'both';
+    && fresh && liveGateway && recoveryNeeded && !running && mode.side !== 'both';
   $('recover').disabled = !canRecover;
   $('recover').textContent = mode.hand_only ? '核验失能并恢复 IDLE' : '受检回零并恢复 IDLE';
-  $('recovery-panel').classList.toggle('fault', fresh && robot.mode === 'FAULT');
+  $('recovery-panel').classList.toggle('fault', fresh && recoveryNeeded);
   $('recovery-detail').textContent = !state.capabilities?.fault_recovery ? '本机控制台尚未加载新版本；重启本机控制台后启用。'
     : !fresh ? '等待新鲜的网关状态后才能恢复。'
     : robot.recovery_supported !== true ? '机器人网关尚未加载恢复功能；同步代码并重启一次网关后启用。'
-    : robot.mode === 'FAULT' && mode.side === 'both' ? '双臂需要现场验证的恢复流程，网页不执行自动回零。'
-      : robot.mode === 'FAULT' && running ? '请先结束本机计算，再执行恢复。'
-        : robot.mode === 'FAULT' && mode.hand_only ? '停止后核验机械臂失能和手部反馈；恢复不发送位置目标。'
-          : robot.mode === 'FAULT' ? '单臂将执行现有受检回零；确认现场安全后操作。'
+    : recoveryNeeded && mode.side === 'both' ? '双臂需要现场验证的恢复流程，网页不执行自动回零。'
+      : recoveryNeeded && running ? '请先结束本机计算，再执行恢复。'
+        : returnFailureDetail ? returnFailureDetail
+        : recoveryNeeded && mode.hand_only ? '停止后核验机械臂失能和手部反馈；恢复不发送位置目标。'
+          : recoveryNeeded ? '控制器故障尚未解除；单臂受检恢复会先核验失能急停，再规划回零运动。'
             : robot.mode === 'RECOVERING' || robot.mode === 'RETURNING' ? '恢复正在执行，等待网关显示 IDLE。'
-              : robot.mode === 'IDLE' ? '网关已就绪；重新开始计算后才能使能。'
+              : robot.mode === 'IDLE' && !armFeedbackReady
+                ? '机械臂已停止，但关节角反馈尚未重新核验；当前不能开始计算。失能不代表已回零。'
+                : robot.mode === 'IDLE' ? '网关已就绪；重新开始计算后才能使能。'
                 : '故障停止后可在这里恢复，无需重启网关。';
   $('can').disabled = canBusy || !state.connected || !state.capabilities?.automatic_can_teardown;
-  const mayEnable = fresh && robot.mode === 'IDLE' && state.owner === session && telemetry.age_s < 1
+  const mayEnable = fresh && armFeedbackReady && robot.mode === 'IDLE' && state.owner === session && telemetry.age_s < 1
     && inputFresh && geometryReady && telemetry.targets && telemetry.sent > 0 && !telemetry.preview && Object.values(members).length && !faults.length;
   $('enable').disabled = !mayEnable;
+  $('handover').textContent = [3, 4, 5].includes(robot.entry_protocol) ? '标定后自动检查并接管' : '检查并接管 g';
+  $('handover').disabled = [3, 4, 5].includes(robot.entry_protocol) || !(fresh && robot.mode === 'CALIBRATING' && robot.entry_ready
+    && state.owner === session && running && !telemetry.preview && inputFresh && geometryReady);
   setStep('step-link', state.connected);
   setStep('step-drivers', fresh);
   setStep('step-reference', telemetry.reference_ready && telemetry.age_s < 1.5);
@@ -616,17 +793,26 @@ function render() {
   $('gate-input').className = running && !inputFresh ? 'bad' : inputFresh ? 'good' : '';
   $('gate-geometry').textContent = !mode.with_hand || mode.hand_only
     ? '✓ 当前模式无需手臂回零手部几何'
-    : geometryReady ? `✓ 灵巧手碰撞几何标定完整：${geometryItems.map(item =>
+    : geometryReady ? `✓ 跟随阶段手部几何标定完整：${geometryItems.map(item =>
         `${item.side === 'left' ? '左' : '右'}手 ${item.geometry.calibrated_joints}/${item.geometry.total_joints}`
       ).join('、')}`
       : `× 几何标定缺失：${geometryItems.map(item =>
           `${item.side === 'left' ? '左' : '右'}手 ${item.geometry.calibrated_joints || 0}/${item.geometry.total_joints || 10}`
         ).join('、')}`;
   $('gate-geometry').className = geometryReady ? 'good' : 'bad';
-  $('gate-enable').textContent = fresh && robot.mode === 'ACTIVE' ? '● 机器人正在运动跟随'
+  $('gate-enable').textContent = fresh && robot.mode === 'ACTIVE' && telemetry.input_hold_active
+    ? '● 输入中断：受控保持，机械臂仍使能'
+    : fresh && robot.mode === 'ACTIVE' ? '● 机器人正在运动跟随'
     : fresh && robot.mode === 'RETURNING' ? '○ 机器人正在受检回零'
-      : fresh && robot.mode === 'CALIBRATING' ? '○ 等待 PICO 准备姿态' : '✓ 机器人未处于跟随状态';
-  $('gate-enable').className = fresh && robot.mode === 'ACTIVE' ? 'active-motion' : 'good';
+    : fresh && robot.mode === 'CALIBRATING' && robot.entry_ready ?
+      ([3, 4, 5].includes(robot.entry_protocol) ? '✓ 标定目标已锁定，等待自动检查路径' : '✓ 接管目标稳定，可点击“检查并接管”')
+      : fresh && robot.mode === 'CALIBRATING' ? '○ 等待标定目标与新鲜 PICO 数据持续 0.5 秒'
+        : fresh && robot.mode === 'CHECKING_ENTRY' ? '○ 失能中：检查完整目标与外展路径'
+          : fresh && robot.mode === 'APPROACHING' ? '● 沿受检路径慢速接近，请保持 PICO 姿态'
+            : fresh && robot.mode === 'WAITING_FOR_ACTIVE_TARGET' ? '○ 接管到位，核验新鲜目标'
+              : '✓ 机器人未处于跟随状态';
+  $('gate-enable').className = fresh && robot.mode === 'ACTIVE'
+    ? telemetry.input_hold_active ? 'hold-motion' : 'active-motion' : 'good';
 
   $('arm-state').replaceChildren();
   for (const [side, value] of Object.entries(members)) $('arm-state').append(renderArm(side, value, fresh));
@@ -639,6 +825,13 @@ function render() {
     const label = `${side === 'left' ? '左' : '右'} · PICO ${{arm:'肩肘腕骨架', hand:'五指追踪', wrist:'手腕整体姿态'}[kind] || kind}`;
     const hz = telemetry.source_hz?.[source];
     row.append(element('span', label), element('span', Number.isFinite(sampleAge) ? `计算采样 ${Math.round(sampleAge * 1000)} ms · ${Number.isFinite(hz) ? hz.toFixed(1) : '—'} Hz` : '未收到'));
+    $('source-state').append(row);
+  }
+  const receiveCounts = telemetry.input_receive_counts;
+  if (receiveCounts) {
+    const row = element('div', undefined, 'source');
+    row.append(element('span', '本机接收合并 / 拒绝'), element('span',
+      `Body ${receiveCounts.body_coalesced || 0} · Hand ${receiveCounts.hand_coalesced || 0} · 拒绝 ${receiveCounts.rejected || 0}`));
     $('source-state').append(row);
   }
   $('can-state').textContent = state.remote.can || '等待 SSH 连接';
@@ -672,8 +865,8 @@ function render() {
   $('calibration-prompt').textContent = telemetry.preparation_status || telemetry.input_rejection || (mode.hand_only
     ? '点击使能后自然张开所选侧人手并保持稳定。'
     : telemetry.reference_ready && telemetry.age_s < 1
-      ? 'PICO 胸前抬臂参考已就绪；保持五指可见。'
-      : '将前臂抬到胸前、肘部自然弯曲并保持双手在头显视野内。');
+      ? 'PICO 手臂参考已就绪；保持所需数据持续可见。'
+      : '保持完整 PICO 追踪，并尽量稳定地保持期望的手臂姿态。');
   const pico = state.pico_input;
   const handStatus = pico?.packet?.pico_hand_status || {};
   const statusLabel = value => ({tracking:'正在追踪', 'PICO hand tracking inactive':'追踪未激活',
@@ -749,6 +942,7 @@ async function poll() {
       $('connection').textContent = '控制台连接中断';
       $('connection-dot').classList.remove('online');
       $('enable').disabled = true;
+      $('handover').disabled = true;
       $('robot-mode').textContent = '状态过期';
       notice(error.message, true);
     }

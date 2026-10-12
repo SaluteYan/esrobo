@@ -22,6 +22,7 @@ def geometry_state(raw, stamp, side, calibration, names, horizon, timeout, now=N
     try:
         if not np.isfinite(horizon) or horizon < 0:
             raise ValueError("invalid hand motion horizon")
+        age = now-stamp
         for i, name in enumerate(names):
             item = calibration.get(side, {}).get(name)
             if item is None:
@@ -37,7 +38,7 @@ def geometry_state(raw, stamp, side, calibration, names, horizon, timeout, now=N
                     or not min(raw0, raw1) <= raw[i] <= max(raw0, raw1)):
                 raise ValueError(f"invalid/out-of-range hand calibration: {name}")
             q = rad0 + (raw[i]-raw0)*(rad1-rad0)/(raw1-raw0)
-            radius = error + speed * (now-stamp+horizon)
+            radius = error + speed * (age+horizon)
             intervals[side+'_'+name] = (float(q-radius), float(q+radius))
     except (KeyError, TypeError, ValueError) as exc:
         return HandGeometryState(stamp, {}, (), False, str(exc))

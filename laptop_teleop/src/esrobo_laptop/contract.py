@@ -6,6 +6,10 @@ from pathlib import Path
 from esrobo_link.protocol import ProtocolError, canonical
 from esrobo_teleop.robot.linker_hand_driver import L10_PHYSICAL_JOINT_NAMES
 
+REQUIRED_ENTRY_PROTOCOL = 6
+REQUIRED_ENTRY_KEEPALIVE_PROTOCOL = 1
+REQUIRED_INPUT_HOLD_PROTOCOL = 2
+
 
 def local_id(cfg, side, with_hand, hand_only=False):
     # Keep byte-for-byte compatible with HardwareBackend's protocol-v1 fingerprint.
@@ -20,11 +24,23 @@ def local_id(cfg, side, with_hand, hand_only=False):
 
 
 def verify_contract(contract, cfg, settings, *, mock=False):
+    if contract.get("input_hold_protocol") != REQUIRED_INPUT_HOLD_PROTOCOL:
+        raise ProtocolError("gateway lacks input hold protocol 2 (separate position/input pauses); "
+                            "update and restart the robot gateway")
     if (contract.get("side") != settings.side
             or contract.get("with_hand") is not settings.with_hand
             or bool(contract.get("hand_only", False)) is not settings.hand_only):
         raise ProtocolError("gateway side/hand mode does not match laptop settings")
+    if (not mock and settings.side != "both" and not settings.hand_only
+            and contract.get("entry_protocol") != REQUIRED_ENTRY_PROTOCOL):
+        raise ProtocolError(
+            f"gateway entry_protocol={contract.get('entry_protocol')!r}; "
+            f"laptop requires {REQUIRED_ENTRY_PROTOCOL}. Synchronize robot_link and teleoperation "
+            "on the robot, then restart the gateway")
     members = contract.get("sides", {}) if settings.side == "both" else {settings.side: contract}
+    if (not mock and settings.side != "both" and not settings.hand_only
+            and contract.get("entry_keepalive_protocol") != REQUIRED_ENTRY_KEEPALIVE_PROTOCOL):
+        raise ProtocolError("gateway lacks entry_keepalive_protocol=1; synchronize robot_link and restart gateway")
     if set(members) != set(settings.sides):
         raise ProtocolError("incomplete gateway contract")
     for side, member in members.items():

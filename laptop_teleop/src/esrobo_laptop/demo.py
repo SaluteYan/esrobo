@@ -11,6 +11,7 @@ import numpy as np
 from esrobo_link.backends import MockDualBackend
 from esrobo_link.client import RobotClient
 from esrobo_link.gateway import Gateway
+from esrobo_teleop import math_utils as mu
 
 from .acquisition import annotate
 from .app import Controller
@@ -33,6 +34,9 @@ class SyntheticSensors:
         self.frames = {name: dict(pos=(rotation.T @ pose[:3]).tolist(), quat_wxyz=[1, 0, 0, 0])
                        for name, pose in poses.items()}
         self.frames["waist"] = dict(pos=[0, 0, 0], quat_wxyz=[1, 0, 0, 0])
+        self.palm_bases = {s: (rotation.T @ mu.quat_wxyz_to_matrix(poses[f"{s}_wrist"][3:])
+                              @ np.diag([-1., -1., 1.] if s == "left" else [1., 1., 1.])).tolist()
+                           for s in ("left", "right")}
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def run(self):
@@ -40,7 +44,8 @@ class SyntheticSensors:
             now = time.monotonic()
             self.socket.sendto(annotate(dict(frames=self.frames), "pico",
                                        dict(left=now, right=now), ("left", "right")), self.address)
-            hand = dict(pico_hands={s: dict(joints=[0.]*10, sequence=time.monotonic_ns())
+            hand = dict(pico_hands={s: dict(joints=[0.]*10, sequence=time.monotonic_ns(),
+                                          palm_basis=self.palm_bases[s])
                                     for s in ("left", "right")})
             self.socket.sendto(annotate(hand, "pico_hand", dict(left=now, right=now),
                                        ("left", "right")), self.address)
@@ -61,9 +66,6 @@ def run_demo():
     cfg.retarget.auto_start_reference_delay_s = .12
     cfg.retarget.auto_start_reference_sample_start_s = 0
     cfg.retarget.auto_start_reference_min_samples = 5
-    cfg.retarget.reference_min_upper_raise_deg = 0
-    cfg.retarget.reference_min_elbow_flexion_deg = 0
-    cfg.retarget.reference_max_elbow_flexion_deg = 180
     backend = MockDualBackend()
     key = b"offline-demo-only-key-not-for-real-robots-123456"
     gateway = Gateway(backend, key, port=0)
