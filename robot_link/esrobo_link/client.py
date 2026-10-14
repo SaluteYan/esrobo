@@ -16,11 +16,13 @@ class RobotClient:
         self.received_at = 0.0
         self.seq = 0
         self.expected_contract_id = expected_contract_id
+        self.recovery_metadata = None
 
     def connect(self, timeout=3.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            self.socket.send(pack(dict(type="hello", client_nonce=self.nonce), self.key))
+            self.socket.send(pack(dict(type="hello", client_nonce=self.nonce,
+                                       input_recovery_protocol=1), self.key))
             try:
                 state = self.receive(min(0.2, max(0.001, deadline - time.monotonic())))
                 if self.expected_contract_id is not None and state["contract"]["id"] != self.expected_contract_id:
@@ -64,6 +66,8 @@ class RobotClient:
         if self.latest is None or time.monotonic() - self.received_at > self.latest["lease_ttl_s"]:
             raise TimeoutError("fresh robot state required before sending")
         self.seq += 1
+        if kind == 'target' and self.recovery_metadata is not None:
+            payload['recovery'] = self.recovery_metadata
         self.socket.send(pack(dict(type=kind, session=self.latest["session"], seq=self.seq,
                                    lease=self.latest["lease"], **payload), self.key))
 
@@ -130,11 +134,14 @@ class RobotClient:
     def stop(self):
         self._command("stop")
 
+    def input_fault(self):
+        self._command('input_fault')
+
     def close(self):
         # Even when this best-effort packet is lost, robot lease expiry still applies.
         try:
             if self.latest:
-                self.stop()
+                self._command('close' if self.latest['contract'].get('input_recovery_protocol') == 1 else 'stop')
         except (OSError, TimeoutError):
             pass
         self.socket.close()

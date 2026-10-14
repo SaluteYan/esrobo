@@ -184,7 +184,9 @@ def test_fault_recovery_uses_existing_gateway_without_restarting_it(console):
 def test_restarted_idle_gateway_with_estop_exposes_explicit_recovery(console, side):
     console.remote = {'sessions': ['esrobo_gateway'], 'gateway_args': ['--side', side]}
     console.robot_state = Mock(return_value=dict(mode='IDLE', age_s=.05, recovery_supported=True,
-        feedback={'controller_fault': {'status_name': 'EMERGENCY_STOP'}}))
+        return_protocol=2,
+        feedback={'controller_fault': {'status_name': 'EMERGENCY_STOP'},
+                  'enable_states': [False]*7, 'arm_urdf_rad': [0.]*7, 'arm_feedback_age_s': .01}))
     request(console, 'remote_recover')
     console.key.assert_called_once_with('r')
 
@@ -218,6 +220,25 @@ def test_fault_recovery_rejects_old_robot_gateway(console):
     with pytest.raises(RuntimeError, match='尚未加载故障恢复功能'):
         request(console, 'remote_recover')
     console.key.assert_not_called()
+
+
+def test_recovery_rejects_old_return_implementation_even_with_existing_entry_protocol(console):
+    console.remote = {'sessions': ['esrobo_gateway'], 'gateway_args': ['--side', 'left']}
+    console.robot_state = Mock(return_value=dict(mode='FAULT', age_s=.05,
+        recovery_supported=True, entry_protocol=6))
+    with pytest.raises(RuntimeError, match='受检恢复版本 2'):
+        request(console, 'remote_recover')
+    console.key.assert_not_called()
+
+
+@pytest.mark.parametrize('action', ['remote_diagnostics', 'remote_sync'])
+@pytest.mark.parametrize('phase', ['ACTIVE', 'RETURNING', 'APPROACHING'])
+def test_maintenance_rejects_busy_robot_without_running_remote_command(console, action, phase):
+    console.robot_state = Mock(return_value=dict(mode=phase))
+    console.command = Mock()
+    with pytest.raises(RuntimeError, match='暂不诊断或同步'):
+        request(console, action)
+    console.command.assert_not_called()
 
 
 def test_waist_jog_requires_disabled_arm_and_blocks_next_arm_enable(console, tmp_path):
@@ -711,7 +732,7 @@ def test_pty_calibration_prompt_and_enter():
 def test_stale_browser_watchdog_stops_own_session(console):
     console.owner='test-browser-session'
     console.heartbeat=time.monotonic()-10
-    def stop():
+    def stop(**kwargs):
         console.owner=None
         console.closed.set()
     console.stop_following=Mock(side_effect=stop)
@@ -896,6 +917,9 @@ def test_compute_status_file_is_atomic_and_omits_session_tokens(monkeypatch, tmp
     controller.input_resume_diagnostics=None
     controller.hand_handover=None
     controller.wrist_handover=None
+    controller.recovery=None
+    controller.recovery_diagnostics=None
+    controller.recovery_enabled=False
     controller.step.return_value={'left':{'arm_urdf_rad':[0]*7}}
     monkeypatch.setattr(app,'read_settings',lambda _:Settings(robot_host='127.0.0.1'))
     monkeypatch.setattr(app,'read_robot_config',lambda _:Mock())
@@ -924,7 +948,7 @@ def test_disconnected_ssh_stops_compute_without_waiting_for_browser_timeout(cons
     import esrobo_laptop.dashboard as dashboard
     console.connected=Mock(return_value=False)
     console.running=Mock(return_value=True)
-    console.stop_following=Mock(side_effect=console.closed.set)
+    console.stop_following=Mock(side_effect=lambda **kwargs: console.closed.set())
     monkeypatch.setattr(dashboard.subprocess,'run',Mock(return_value=Mock(returncode=1)))
     thread=threading.Thread(target=console._monitor)
     thread.start()
@@ -1066,3 +1090,23 @@ def test_handover_button_cannot_bypass_preconditions(console,bad):
     with pytest.raises(RuntimeError):
         request(console,'gateway_key',key='g')
     console.key.assert_not_called()
+
+
+@pytest.mark.parametrize('failure', [None, 'legacy', 'fault', 'stale', 'mixed', 'unknown'])
+def test_recover_from_hold_requires_capability_and_fresh_healthy_arm(console, failure):
+    console.remote = {'sessions': ['esrobo_gateway'], 'gateway_args': ['--side', 'left']}
+    fb = dict(enable_states=[True]*7, arm_urdf_rad=[0.]*7, arm_feedback_age_s=.01)
+    state = dict(mode='HOLD_LATCHED', age_s=.01, recovery_supported=True,
+                 return_protocol=2, hold_return_protocol=1, feedback=fb)
+    if failure == 'legacy': state.pop('hold_return_protocol')
+    if failure == 'fault': fb['controller_fault'] = {'status_name': 'EMERGENCY_STOP'}
+    if failure == 'stale': fb['arm_feedback_age_s'] = 2.
+    if failure == 'mixed': fb['enable_states'][0] = False
+    if failure == 'unknown': fb.pop('enable_states')
+    console.robot_state = Mock(return_value=state)
+    if failure:
+        with pytest.raises(RuntimeError): request(console, 'remote_recover')
+        console.key.assert_not_called()
+    else:
+        request(console, 'remote_recover')
+        console.key.assert_called_once_with('r')

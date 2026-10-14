@@ -95,6 +95,17 @@ def test_absolute_entry_holds_wrist_then_live_mapping_releases_all_axes(side):
     np.testing.assert_allclose(live['arm_urdf_rad'][4:], [.3, .4, -.5])
     assert live['hand_unit'] == [70]*10
     assert not wrist.last_diagnostics['entry_wrist_held']
+    from scipy.spatial.transform import Rotation
+    poses['hand_source_orientations']={side:Rotation.from_euler('z',20,degrees=True).as_matrix()}
+    wrist.source_terminal.return_value=np.array([.35,.6,-.7])
+    live=p.solve(frame,measured,feedback)[side]
+    assert live['arm_urdf_rad'][4:]==[.3,.4,-.5]
+    assert live['source_arm_urdf_rad'][4:]==[.35,.6,-.7]
+    wrist.source_terminal.reset_mock()
+    poses['hand_source_orientations']={side:np.eye(3)}
+    live=p.solve(frame,measured,feedback)[side]
+    wrist.source_terminal.assert_not_called()
+    assert live['source_arm_urdf_rad']==live['arm_urdf_rad']
 
 
 def test_full_target_and_source_sent_until_arrival_without_rebasing():

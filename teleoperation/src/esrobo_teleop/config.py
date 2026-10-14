@@ -76,7 +76,7 @@ class RobotConfig:
     # returns still use torso_collision_enabled and cannot bypass the guard.
     teleop_torso_collision_enabled: bool = False
     collision_package_dirs: tuple = ()
-    torso_collision_margin_m: float = 0.02
+    torso_collision_margin_m: float = 0.01
     shoulder_collision_margin_m: float = 0.005
     # physical = direction * URDF + offset. The J2 +pi/2 offset follows the
     # pyAgxArm NERO limits and this project's URDF limits exactly.
@@ -97,20 +97,20 @@ class RobotConfig:
     # deliberately asymmetric limits sit inside the SDK hard limits and are
     # converted to each arm's physical convention by the driver.
     joint_soft_lower_limits_urdf: tuple = (
-        -1.047198, -1.308997, -1.570796, -0.139626, -2.617994, -0.663225, -1.396263,
+        -1.308997, -1.308997, -1.570796, -0.139626, -2.617994, -0.663225, -1.396263,
     )
     joint_soft_upper_limits_urdf: tuple = (
-        1.047198, 0.122173, 1.570796, 1.483530, 2.617994, 0.872665, 1.396263,
+        1.308997, 0.122173, 1.570796, 1.483530, 2.617994, 0.872665, 1.396263,
     )
-    # Match the per-side YAML limits (right J1 forward travel updated 2026-10-03).
+    # Match YAML: both arms J1 -75/+75 deg (2026-10-14).
     left_joint_soft_lower_limits_urdf: Optional[tuple] = (
-        -1.047198, -1.308997, -2.617994, -0.139626, -2.617994, -0.663225, -1.396263,
+        -1.308997, -1.308997, -2.617994, -0.139626, -2.617994, -0.663225, -1.396263,
     )
     left_joint_soft_upper_limits_urdf: Optional[tuple] = (
-        1.047198, 0.122173, 1.570796, 2.094395, 2.617994, 0.872665, 1.396263,
+        1.308997, 0.122173, 1.570796, 2.094395, 2.617994, 0.872665, 1.396263,
     )
     right_joint_soft_lower_limits_urdf: Optional[tuple] = (
-        -1.047198, -1.308997, -1.570796, -0.139626, -2.617994, -0.663225, -1.396263,
+        -1.308997, -1.308997, -1.570796, -0.139626, -2.617994, -0.663225, -1.396263,
     )
     right_joint_soft_upper_limits_urdf: Optional[tuple] = (
         1.308997, 0.122173, 2.617994, 2.094395, 2.617994, 0.872665, 1.396263,
@@ -123,8 +123,9 @@ class RobotConfig:
     max_joint_velocity: tuple = (
         0.453786, 0.453786, 0.418879, 0.418879, 0.418879, 0.418879, 0.418879,
     )
+    # Wrist telemetry tuning: J5-J7 100 deg/s^2; hardware validation pending.
     max_joint_acceleration: tuple = (
-        0.698132, 0.698132, 0.785398, 0.872665, 0.872665, 0.872665, 0.872665,
+        0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329,
     )
     # Both arms use the same rate envelope; J4 is 30 deg/s.
     left_max_joint_step: Optional[tuple] = (
@@ -134,7 +135,7 @@ class RobotConfig:
         0.453786, 0.453786, 0.418879, 0.523599, 0.418879, 0.418879, 0.418879,
     )
     left_max_joint_acceleration: Optional[tuple] = (
-        0.698132, 0.698132, 0.785398, 0.872665, 0.872665, 0.872665, 0.872665,
+        0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329,
     )
     # Keep per-side overrides available for future hardware commissioning.
     right_max_joint_step: Optional[tuple] = (
@@ -144,7 +145,7 @@ class RobotConfig:
         0.453786, 0.453786, 0.418879, 0.523599, 0.418879, 0.418879, 0.418879,
     )
     right_max_joint_acceleration: Optional[tuple] = (
-        0.698132, 0.698132, 0.785398, 0.872665, 0.872665, 0.872665, 0.872665,
+        0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329,
     )
     synchronize_joint_motion: bool = False
     left_command_trajectory_enabled: bool = True
@@ -159,6 +160,9 @@ class RobotConfig:
     # fresh frames are required before the command trajectory is re-based.
     runtime_feedback_recovery_timeout_s: float = 0.3
     command_trajectory_lead_timeout_s: float = 2.0
+    # Set only after side-specific, supported real-machine hold validation.
+    left_input_recovery_verified: bool = False
+    right_input_recovery_verified: bool = False
     joint_sync_error_deadband_deg: float = 0.05
     # Legacy optional limit relative to the angles captured when armed.  Keep
     # disabled when absolute per-joint URDF soft limits are configured.

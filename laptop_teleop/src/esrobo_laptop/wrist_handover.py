@@ -66,7 +66,9 @@ class WristHandover:
         if np.any(lower > upper):
             raise RuntimeError('wrist handover feedback diverged from command')
         candidate = np.clip(goal, lower, upper)
-        matched = (np.all(np.abs(candidate-goal) <= 1.e-10)
+        # A live goal changes every accepted frame. Exact floating-point
+        # equality can prevent takeover forever despite bounded tracking.
+        matched = (np.all(np.abs(candidate-goal) <= self.tolerance)
                    and np.all(np.abs(actual-goal) <= self.tolerance))
         return WristStep(candidate.copy(), now, self.matched+1 if matched else 0)
 

@@ -13,6 +13,10 @@ class ProtocolError(ValueError):
     pass
 
 
+class InputHoldTransition(RuntimeError):
+    """Abort an in-flight target because the gateway switched to latched hold."""
+
+
 def key_from_file(path):
     key = Path(path).read_bytes().strip()
     if len(key) < 32:
@@ -113,6 +117,21 @@ def validate_target(msg, contract):
         result["entry"] = dict(phase=entry["phase"], token=token, source=source,
                                reference_source=reference_source)
     return result
+
+
+def validate_recovery(msg, contract):
+    value = msg.get('recovery')
+    if value is None:
+        return None
+    if (contract.get('input_recovery_protocol') != 1
+            or contract.get('input_recovery_enabled') is not True):
+        raise ProtocolError('input recovery requires a commissioned protocol 1 endpoint')
+    if (not isinstance(value, dict) or set(value) != {'phase', 'epoch'}
+            or value.get('phase') not in ('reacquiring', 'complete')
+            or not isinstance(value.get('epoch'), str) or len(value['epoch']) != 16
+            or any(c not in '0123456789abcdef' for c in value['epoch'])):
+        raise ProtocolError('invalid input recovery metadata')
+    return dict(value)
 
 
 def validate_entry_keepalive(msg, contract):

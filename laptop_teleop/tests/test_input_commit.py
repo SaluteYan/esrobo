@@ -99,6 +99,51 @@ def test_burst_keeps_latest_valid_body_and_each_hand(body):
     assert body.receive_counts['rejected']==2
 
 
+def test_burst_transforms_only_the_latest_valid_body(body):
+    payloads = [packet(9.92+i*.001) for i in range(60)]
+    invalid = json.loads(packet(9.999))
+    invalid['frames']['right_wrist'] = [float('nan')]*7
+    payloads.append(json.dumps(invalid))
+    with patch('esrobo_laptop.inputs.time.monotonic',return_value=10.), \
+         patch.object(body,'_decode_frames',wraps=body._decode_frames) as decode:
+        body._commit_batch(payloads)
+    assert decode.call_count == 1
+    assert body.stamps['right_arm'] == pytest.approx(9.979)
+    assert body.receive_counts['body_coalesced'] == 59
+    assert body.receive_counts['rejected'] == 1
+
+
+def test_wrist_filter_capture_is_transactional(body):
+    from esrobo_laptop.orientation import AbsoluteHandOrientation, ForearmFrame
+    from scipy.spatial.transform import Rotation
+    from test_absolute_hand import points
+    arm=points();carrier=ForearmFrame().update(arm)
+    desired=Rotation.from_euler('z',30,degrees=True).as_matrix()
+    reference=AbsoluteHandOrientation(arm,carrier,palm_rotation=carrier@desired)
+    reference.reset_filter(np.eye(3))
+    body.wrist_references={'right':reference}
+    body.wrist_rotations={'right':np.eye(3)}
+    def advance(view,**kwargs):
+        view.wrist_rotations['right']=view.wrist_references['right'].update(
+            arm,carrier,palm_rotation=carrier@desired)
+        return {}
+    with patch('esrobo_laptop.inputs.time.monotonic',return_value=10.):
+        body._commit_batch([packet(9.98),hand('left',9.98,1),hand('right',9.98,1)])
+        body._reference_locked=True
+        with patch.object(BodyDevice,'advance',advance):
+            a=body.capture_targets(.1); b=body.capture_targets(.1)
+            np.testing.assert_allclose(a[1]['hand_local_orientations']['right'],
+                                       b[1]['hand_local_orientations']['right'])
+            np.testing.assert_array_equal(reference.filtered,np.eye(3))
+            np.testing.assert_allclose(b[1]['hand_source_orientations']['right'],desired,atol=1e-12)
+            body.commit_wrist_filters(b[1],[])  # Position/input hold cannot commit.
+            np.testing.assert_array_equal(reference.filtered,np.eye(3))
+            body.commit_wrist_filters(b[1],['right'])
+            assert np.degrees(Rotation.from_matrix(body.wrist_references['right'].filtered).magnitude()) == pytest.approx(2.)
+            c=body.capture_targets(.1)
+            assert np.degrees(Rotation.from_matrix(c[1]['hand_local_orientations']['right']).magnitude()) == pytest.approx(4.)
+
+
 def test_hand_expiring_while_waiting_for_commit_is_rejected(body):
     with patch('esrobo_laptop.inputs.time.monotonic',return_value=10.):
         prepared=body._decode_input(hand('right',9.98,1))
@@ -196,3 +241,20 @@ def test_entry_source_uses_captured_body_not_a_later_receiver_frame(body):
     pipeline.settings, pipeline.body = Settings(side='right'), body
     assert pipeline.entry_source(frame) == expected
     assert pipeline.entry_source() != expected
+
+
+def test_post_compute_age_includes_the_actual_paired_palm(body):
+    from esrobo_laptop.pipeline import Pipeline
+    from esrobo_laptop.config import Settings
+    from esrobo_laptop.inputs import SourceExpired
+    with patch('esrobo_laptop.inputs.time.monotonic',return_value=10.):
+        body._commit_batch([packet(9.93),hand('left',9.98,1),hand('right',9.98,1)])
+        body._reference_locked=True
+        def advance(view,**kwargs):
+            view.wrist_input_diagnostics['right']={'comparison_hand_sample_monotonic':9.92}
+            return {}
+        with patch.object(BodyDevice,'advance',advance): frame=body.capture_targets(.1)
+    assert frame[0]['right_hand']==9.98 and frame[0]['right_palm']==9.92
+    pipeline=Pipeline.__new__(Pipeline);pipeline.settings=Settings(side='right')
+    with patch('esrobo_laptop.pipeline.time.monotonic',return_value=10.025):
+        with pytest.raises(SourceExpired):pipeline.check_ticket(frame[0])

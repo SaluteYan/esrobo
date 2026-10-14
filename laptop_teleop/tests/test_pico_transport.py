@@ -112,6 +112,33 @@ def run_profiled(f):
     return f.test_profile
 
 
+def test_transport_rate_expires_without_refreshing_sample_age():
+    now = 20_000_000_000
+    receipts = [now-10_000_000*i for i in range(199, -1, -1)]
+    assert summary_times(receipts, now)['hz'] == pytest.approx(100.)
+    stale = summary_times(receipts, now+800_000_000_000)
+    assert stale == dict(hz=0., age_ms=800_000.)
+    assert summary_times([], now) == dict(hz=0., age_ms=None)
+
+
+def test_hand_diagnostics_expire_when_receipts_or_mapping_stop(monkeypatch):
+    now = time.monotonic_ns()
+    sdk = FakeSDK()
+    sdk.receipts = [now-200_000_000, now-190_000_000]
+    f = forwarder(sdk, mapper=Mapper())
+    for side in ('left', 'right'):
+        f.metrics.status(side, 'tracking')
+        f.metrics.mark(side+'_map', now-190_000_000)
+    monkeypatch.setattr('esrobo_laptop.pico_transport.time.monotonic_ns', lambda: now)
+    assert f.snapshot()['hand_status'] == dict(left='stale', right='stale')
+    # Fresh raw data cannot make an old mapped control sample fresh.
+    sdk.receipts = [now-10_000_000, now]
+    assert f.snapshot()['hand_status']['left'] == 'stale'
+    f.metrics.mark('left_map', now)
+    assert f.snapshot()['hand_status']['left'] == 'tracking'
+    assert f.metrics.status_snapshot()['right'] == 'tracking'  # derived display only
+
+
 @pytest.mark.parametrize('hz', [60, 74, 90])
 def test_uniform_input_forwards_95_percent_with_low_notification_latency(hz):
     sdk = FakeSDK(hz)

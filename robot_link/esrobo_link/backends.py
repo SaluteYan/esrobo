@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 import time
 
-from .protocol import canonical
+from .protocol import canonical, InputHoldTransition
 
 
 class MockBackend:
@@ -15,6 +15,8 @@ class MockBackend:
         self.contract = dict(id=f"mock-v1-{side}-{with_hand}-{bool(hand_only)}", side=side, with_hand=with_hand,
                              hand_only=bool(hand_only),
                              input_hold_protocol=2,
+                             input_recovery_protocol=1, input_recovery_enabled=False,
+                             return_protocol=2, hold_return_protocol=1,
                              arm_unit="URDF radians", hand_unit="L10 physical 0..255",
                              lower_rad=[-1.0] * 7, upper_rad=[1.0] * 7)
         self.q = [0.0] * 7
@@ -104,7 +106,7 @@ class MockBackend:
         self.hand_enabled = False
         return bool(self.hand is not None)
 
-    def return_zero(self, cancelled):
+    def return_zero(self, cancelled, *, from_hold=False):
         if cancelled():
             raise RuntimeError("return cancelled")
         self.q = [0.0] * 7
@@ -222,6 +224,9 @@ class HardwareBackend:
                                  side=side, with_hand=with_hand, arm_unit="URDF radians",
                                  hand_only=self.hand_only,
                                  input_hold_protocol=2,
+                                 input_recovery_protocol=1,
+                                 input_recovery_enabled=getattr(cfg.robot, side+'_input_recovery_verified') is True,
+                                 return_protocol=2, hold_return_protocol=1,
                                  hand_unit="L10 physical 0..255", hand_order=L10_PHYSICAL_JOINT_NAMES,
                                  arm_order=list(getattr(cfg.ik, f"{side}_arm_joints")),
                                  lower_rad=np.minimum(a, b).tolist(), upper_rad=np.maximum(a, b).tolist(),
@@ -255,8 +260,11 @@ class HardwareBackend:
                 break
             states.append(bool(state.msg.foc_status.driver_enable_status))
         return dict(arm_urdf_rad=None if full is None else full[self._full_slice].tolist(),
+                    motion_diagnostics=getattr(self.arm, 'motion_limit_diagnostics', None),
                     arm_feedback_age_s=None if snap is None else max(0.0, time.monotonic() - snap.received_monotonic),
                     feedback_diagnostic=feedback_diagnostic,
+                    feedback_request_diagnostic=(getattr(self.arm._arm, "feedback_request_diagnostic", None)
+                                                 if full is None else None),
                     enable_states=states,
                     controller_fault=self.arm._arm.controller_fault(allow_disabled=True),
                     driver_fault=self.arm.safety_fault_reason,
@@ -347,9 +355,10 @@ class HardwareBackend:
             raise RuntimeError(f'handover trajectory initialization failed: {reason}')
         return dataclasses.asdict(result)
 
-    def _restore_hand_before_return(self, result, cancelled):
-        """Verify hand zero at the current disabled arm pose before arm motion."""
-        result = dict(result, arm_returned=False, hands_open=False, stage='hand_open_before_arm')
+    def _restore_hand_before_return(self, result, cancelled, *, after_arm=False):
+        """Verify hand zero at the current disabled arm pose."""
+        result = dict(result, hands_open=False,
+                      stage='hand_open' if after_arm else 'hand_open_before_arm')
         reason = ''
         try:
             if cancelled():
@@ -480,6 +489,10 @@ class HardwareBackend:
         if (not self.arm._controller_is_safe()
                 or not self.arm._torque_is_safe(self.arm._arm, self.side)):
             raise RuntimeError(self.arm.safety_fault_reason or f"{self.side} held arm fault")
+        # Arrival -> ACTIVE may wait for multiple independent source frames.
+        # Keep committing bounded hold steps while waiting; read-only polling
+        # leaves the initialized command timestamp behind fresh CAN feedback.
+        self.hold_arm()
 
     def send_arm(self, target, cancelled):
         if self.hand_only:
@@ -570,12 +583,12 @@ class HardwareBackend:
         return not self.hand.is_enabled()
 
     def return_zero(self, cancelled, *, arm_only_collision=False,
-                    stationary_hand_check=None, explicit_recovery=True):
+                    stationary_hand_check=None, explicit_recovery=True, from_hold=False):
         request_id = self.arm.prepare_return()
         if request_id is None:
             return dict(returned=False, disabled=False, arm_returned=False,
                         hands_open=False, stage='busy', reason='return already running')
-        hand_first = explicit_recovery and self.hand is not None
+        hand_first = explicit_recovery and self.hand is not None and not from_hold
         result = dict(returned=False, disabled=False, arm_returned=False, hands_open=False)
         try:
             if self.hand:
@@ -599,11 +612,25 @@ class HardwareBackend:
             if cancelled():
                 self.arm.cancel_return()
                 return dict(result, returned=False, stage='preflight', reason='cancelled before arm return')
-            arm_result = self.arm.safe_return(recover=True, request_id=request_id,
+            if hand_first:
+                # Arrival may be lost between the hand worker's final check
+                # and this phase boundary. Never start seven-joint motion on
+                # a cached hands_open flag alone.
+                result['hands_open'], errors = self.hand.open_pose_status()
+                if not result['hands_open']:
+                    return dict(result, returned=False, stage='hand_open_before_arm',
+                                reason='hand zero lost before arm return: '+
+                                self.hand.describe_open_pose_errors(errors))
+            arm_result = self.arm.safe_return(recover=not from_hold, request_id=request_id,
+                preserve_hold=from_hold,
                 arm_only_collision=arm_only_collision,
                 stationary_hand_check=stationary_hand_check,
-                recognize_inherited_stop=explicit_recovery)
+                recognize_inherited_stop=explicit_recovery and not from_hold)
             result.update(dataclasses.asdict(arm_result), arm_returned=arm_result.returned)
+            if from_hold:
+                result['holding'] = bool(getattr(self.arm, 'return_hold_preserved', False))
+                if result['returned'] and result['disabled'] and self.hand is not None:
+                    result = self._restore_hand_before_return(result, cancelled, after_arm=True)
             if explicit_recovery and result['returned'] and result['disabled']:
                 try:
                     result['controller_recovery'] = self.arm.recover_disabled_controller(cancelled)
@@ -698,6 +725,8 @@ class DualBackend:
         self.contract = dict(id=hashlib.sha256(canonical(contracts)).hexdigest(),
                              side="both", with_hand=True, sides=contracts,
                              input_hold_protocol=2,
+                             input_recovery_protocol=1,
+                             input_recovery_enabled=all(c.get('input_recovery_enabled') is True for c in contracts.values()),
                              return_supported=False)
         self.operation_results = {}
 
@@ -735,6 +764,8 @@ class DualBackend:
         return dict(sides=states, last_operation=self.operation_results)
 
     def _abort(self, exc):
+        if isinstance(exc, InputHoldTransition):
+            raise exc
         self.cancel()
         try:
             self.stop()

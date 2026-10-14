@@ -173,6 +173,7 @@ class AbsoluteHandOrientation(RelativeHandOrientation):
         self.palm_reference_clock = (float(np.arctan2(normal[2], normal[1]))
                                      if np.linalg.norm(normal[1:]) > 1.e-6 else None)
         self.initial_local = self.palm_reference_local.copy()
+        self.source_local = self.initial_local.copy()
         self.body_to_palm = checked_rotation(hand_rotation).T @ self.palm_reference
         self.filtered = self.initial_local.copy()
         self.raw_delta = np.eye(3)
@@ -187,6 +188,7 @@ class AbsoluteHandOrientation(RelativeHandOrientation):
         body = checked_rotation(hand_rotation)
         palm = checked_rotation(palm_rotation)
         local = checked_rotation(carrier.T @ palm)
+        self.source_local = local.copy()
         self.raw_delta = carrier.T @ body @ self.reference_local.T
         body_local = carrier.T @ body @ self.body_to_palm
         step = Rotation.from_matrix(local @ self.filtered.T).as_rotvec()
@@ -198,7 +200,10 @@ class AbsoluteHandOrientation(RelativeHandOrientation):
         if not full_target:
             if step_angle > step_limit:
                 step *= step_limit / step_angle
-            target = Rotation.from_rotvec(step).as_matrix() @ self.filtered
+                target = Rotation.from_rotvec(step).as_matrix() @ self.filtered
+            # When the full step fits, use the source matrix directly. Avoid
+            # an unnecessary SO(3) round trip and preserve exact equality for
+            # reusing the source/command IK result after the filter catches up.
             self.filtered = target.copy()
         requested = local @ ANATOMICAL_NEUTRAL.T
         filtered = target @ ANATOMICAL_NEUTRAL.T

@@ -114,7 +114,7 @@ class NeroMappingTests(unittest.TestCase):
         )
         output = self.driver._clamp(target_physical, target_physical, "left", 0.02)
         expected_urdf = np.asarray(
-            [1.047198, -1.308997, 1.570796, 2.094395, 2.0, -0.663225, 1.396263]
+            [1.308997, -1.308997, 1.570796, 2.094395, 2.0, -0.663225, 1.396263]
         )
         expected_physical, _ = self.driver._full_to_physical(
             np.concatenate([expected_urdf, expected_urdf])
@@ -140,7 +140,7 @@ class NeroMappingTests(unittest.TestCase):
         )
         np.testing.assert_allclose(
             np.degrees(cfg.max_joint_acceleration),
-            [40.0, 40.0, 45.0, 50.0, 50.0, 50.0, 50.0],
+            [40.0, 40.0, 45.0, 50.0, 100.0, 100.0, 100.0],
             atol=1.0e-4,
         )
         np.testing.assert_allclose(
@@ -154,7 +154,7 @@ class NeroMappingTests(unittest.TestCase):
         )
         np.testing.assert_allclose(
             np.degrees(cfg.left_max_joint_acceleration),
-            [40.0, 40.0, 45.0, 50.0, 50.0, 50.0, 50.0],
+            [40.0, 40.0, 45.0, 50.0, 100.0, 100.0, 100.0],
             atol=1.0e-4,
         )
         np.testing.assert_allclose(
@@ -2707,6 +2707,39 @@ class NeroArmFeedbackTests(unittest.TestCase):
         self.assertEqual(robot._msg_mode.enable_can_push, 0)
         self.assertEqual(robot._msg_mode.move_mode, 1)
         robot.move_j.assert_not_called()
+
+    def test_can_feedback_push_rejects_sdk_that_silently_skips_send(self):
+        arm = NeroArm.__new__(NeroArm)
+        arm._robot = mock.Mock()
+        arm._robot._msg_mode.enable_can_push = 0
+        arm._robot._msg_mode.move_mode = 1
+        arm._send_monitor = mock.Mock(attempts=3)
+        arm._send_monitor.snapshot.return_value = {'last_frame': {
+            'can_id': 0x151, 'outcome': 'socket_send_returned'}}
+        self.assertFalse(arm.request_can_feedback_push())
+        self.assertFalse(arm.feedback_request_diagnostic['socket_send_returned'])
+        self.assertEqual(arm._robot._msg_mode.enable_can_push, 0)
+        self.assertEqual(arm._robot._msg_mode.move_mode, 1)
+
+    def test_can_feedback_push_records_native_send_and_restores_mode_on_failure(self):
+        arm = NeroArm.__new__(NeroArm)
+        arm._robot = mock.Mock()
+        arm._robot._msg_mode.enable_can_push = 0
+        arm._robot._msg_mode.move_mode = 1
+        arm._send_monitor = mock.Mock(attempts=0)
+        frame = {'can_id': 0x151, 'data_hex': '01ff320000000100',
+                 'outcome': 'socket_send_returned'}
+        arm._send_monitor.snapshot.return_value = {'last_frame': frame}
+        def send():
+            arm._send_monitor.attempts += 1
+        arm._robot._set_mode.side_effect = send
+        self.assertTrue(arm.request_can_feedback_push())
+        self.assertEqual(arm.feedback_request_diagnostic['frame'], frame)
+        arm._robot._set_mode.side_effect = RuntimeError('CAN failed')
+        with self.assertRaisesRegex(RuntimeError, 'CAN failed'):
+            arm.request_can_feedback_push()
+        self.assertEqual(arm._robot._msg_mode.enable_can_push, 0)
+        self.assertEqual(arm._robot._msg_mode.move_mode, 1)
 
     def test_known_target_enable_preloads_and_repeats_zero_around_enable(self):
         cfg = build_config().robot

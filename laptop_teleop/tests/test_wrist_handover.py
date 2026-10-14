@@ -14,6 +14,30 @@ from test_entry_keepalive import fixed_controller
 
 
 @pytest.mark.parametrize('side', ['left', 'right'])
+@pytest.mark.parametrize('with_hand', [False, True])
+@pytest.mark.parametrize('gap', [.12, .238, .374])
+def test_recorded_network_gaps_do_not_turn_filter_catchup_into_source_motion(side,with_hand,gap):
+    from audit_wrist_filter_recovery import replay
+    result=replay(side,with_hand,gap_s=gap)
+    assert result['resumed_after_frames']==3
+    assert result['timeout'] is None
+    # While collecting the three frames, every candidate starts from the
+    # committed filter. Only the accepted third candidate commits its state.
+    assert [r['filtered_j7_deg'] for r in result['rows'][1:4]] == pytest.approx([4.]*3)
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+@pytest.mark.parametrize('with_hand', [False, True])
+def test_real_source_jump_is_not_hidden_by_slow_command_filter(side,with_hand):
+    from audit_wrist_filter_recovery import replay
+    result=replay(side,with_hand,source_jump=8.)
+    assert result['resumed_after_frames'] is None
+    assert result['matched']==0
+    assert 'hold exceeded 500 ms' in result['timeout']
+    assert result['committed_filter_deg']==pytest.approx(2.)
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
 def test_proposal_is_bounded_and_not_committed_until_sent(side):
     h = WristHandover(np.zeros(7), RobotConfig(), side, 100., 50.)
     goal = np.deg2rad([0, 0, 0, 0, 0, 12, -21])
@@ -161,6 +185,7 @@ def test_no_commit_on_failed_send_or_stale_input(monkeypatch, failure):
         p.check_ticket.side_effect = [None, SourceExpired('expired after proposal')]
         error = SourceExpired
     with pytest.raises(error):tick()
+    assert p.commit_frame.call_count == 1
     np.testing.assert_array_equal(c.wrist_handover.command, old)
     assert c.wrist_handover.last_at == stamp
 
@@ -175,6 +200,24 @@ def test_duplicate_frames_do_not_advance_transition(monkeypatch):
     np.testing.assert_array_equal(c.wrist_handover.command, old)
     assert c.wrist_handover.last_at == stamp
     assert client.send_target.call_count == sends
+
+
+def test_failed_recovery_send_keeps_original_hold_deadline_and_source(monkeypatch):
+    c,p,client,state,clock,tick=setup(monkeypatch)
+    target=tick();state['feedback']['arm_urdf_rad']=target['left']['arm_urdf_rad']
+    clock[0]+=.12;client.received_at=clock[0]
+    assert c.hold_missing_input(state,'source gap')
+    deadline_start=c.input_hold_started_at
+    original_source=copy.deepcopy(c.last_arm_source)
+    commits=p.commit_frame.call_count
+    assert tick() is None
+    assert tick() is None
+    client.send_target.side_effect=OSError('send failed')
+    with pytest.raises(OSError):tick()
+    assert c.input_hold_started_at==deadline_start
+    assert c.last_arm_source==original_source
+    assert p.commit_frame.call_count==commits
+    with pytest.raises(RuntimeError,match='hold exceeded 500 ms'):tick(.501)
 
 
 def test_completed_transition_retains_normal_recovery_delta_gate(monkeypatch):
@@ -193,3 +236,26 @@ def test_completed_transition_retains_normal_recovery_delta_gate(monkeypatch):
     assert tick() is None
     assert c.input_resume_count == 0
     assert c.input_resume_diagnostics['arm_delta_deg'] == pytest.approx(8.)
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+def test_live_goal_within_arrival_tolerance_does_not_require_exact_equality(side):
+    h = WristHandover(np.zeros(7), RobotConfig(), side, 0., 50.)
+    for n in range(1, 4):
+        actual = np.zeros(7)
+        actual[5:] = h.command
+        target = actual.copy()
+        target[5:] += min(h.tolerance*.8, .02)
+        proposed = h.propose(target, actual, n*.02)
+        assert np.any(np.abs(proposed.position-target[5:]) > 1e-10)
+        assert not h.done
+        h.commit(proposed)
+    assert h.done
+
+
+def test_live_goal_outside_feedback_tolerance_cannot_complete_handover():
+    h = WristHandover(np.zeros(7), RobotConfig(), 'left', 0., 50.)
+    for n in range(1, 10):
+        target = np.zeros(7)
+        target[5:] = h.tolerance*1.1
+        h.commit(h.propose(target, np.zeros(7), n*.02))
+        assert not h.done and h.matched == 0

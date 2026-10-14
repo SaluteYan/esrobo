@@ -615,14 +615,14 @@ class Console:
         else:
             self.event(f'{LABELS[name]} 已启动')
 
-    def stop_following(self):
+    def stop_following(self, *, explicit_stop=True):
         error = None
         # Stop local target generation BEFORE any potentially delayed SSH call.
         if self.running('teleop'):
             self.processes['teleop'].stop()
         self.owner = None
         try:
-            if self.connected() and SESSIONS['gateway'] in self.remote.get('sessions', []):
+            if explicit_stop and self.connected() and SESSIONS['gateway'] in self.remote.get('sessions', []):
                 self.key('s')
         except Exception as exc:
             error = str(exc)
@@ -663,7 +663,7 @@ class Console:
                 self.heartbeat = time.monotonic()
             return {}
         if action == 'stop' or (action == 'release' and session == self.owner):
-            self.stop_following()
+            self.stop_following(explicit_stop=action == 'stop')
             if action == 'stop' and SESSIONS['waist'] in self.remote.get('sessions', []):
                 try:
                     self.waist_command('stop')
@@ -705,7 +705,7 @@ class Console:
                     raise ValueError('未知服务')
                 self.refresh()
                 if name in ('gateway', 'hands', 'hand_bridge'):
-                    if self.running('teleop') or self.robot_state().get('mode') in ('ACTIVE', 'ARMING', 'RETURNING', 'RECOVERING', 'CHECKING_ENTRY', 'APPROACHING', 'WAITING_FOR_ACTIVE_TARGET'):
+                    if self.running('teleop') or self.robot_state().get('mode') in ('ACTIVE', 'HOLD_LATCHED', 'ARMING', 'RETURNING', 'RECOVERING', 'CHECKING_ENTRY', 'APPROACHING', 'WAITING_FOR_ACTIVE_TARGET'):
                         raise RuntimeError('请先停止遥操作并确认机器人停止')
                 if name == 'gateway':
                     self.key('q')
@@ -823,6 +823,18 @@ class Console:
                     if saved:
                         return dict(log=saved)
                 return dict(log=self.command(['tmux', 'capture-pane', '-p', '-t', SESSIONS[name], '-S', '-180']))
+            elif action in ('remote_diagnostics', 'remote_sync'):
+                if self.running('teleop'):
+                    raise RuntimeError('先停止本机计算再诊断或同步机器人代码')
+                self.refresh()
+                if self.robot_state().get('mode') not in (None, 'IDLE', 'FAULT'):
+                    raise RuntimeError('机器人仍在准备、恢复或运动；暂不诊断或同步')
+                from .robot_maintenance import CAN_DIAGNOSTICS, sync_sources
+                if action == 'remote_diagnostics':
+                    return dict(log=self.command(['python3', '-c', CAN_DIAGNOSTICS], timeout=8))
+                result = sync_sources(self, WORKSPACE, REMOTE)
+                self.event(result['message'])
+                return result
             elif action == 'can':
                 return self.initialize_can(data.get('password', ''))
             elif action == 'remote_recover':
@@ -835,7 +847,7 @@ class Console:
                                    bool(feedback.get('controller_fault') or feedback.get('driver_fault')))
                 if (SESSIONS['gateway'] not in self.remote.get('sessions', [])
                         or state.get('age_s', 999) > 1
-                        or (state.get('mode') != 'FAULT' and not inherited_fault)):
+                        or (state.get('mode') not in ('FAULT', 'HOLD_LATCHED') and not inherited_fault)):
                     raise RuntimeError('恢复需要新鲜的 FAULT 状态，或 IDLE 下仍有控制器/驱动故障')
                 if state.get('recovery_supported') is not True:
                     raise RuntimeError('机器人网关尚未加载故障恢复功能；请同步新代码并重启一次网关')
@@ -844,6 +856,23 @@ class Console:
                 args = self.remote.get('gateway_args', [])
                 if '--side' not in args or args[args.index('--side')+1] == 'both':
                     raise RuntimeError('双臂恢复需按现场流程操作；网页不执行未经验证的双臂回零')
+                if '--hand-only' not in args and state.get('return_protocol') != 2:
+                    raise RuntimeError('机器人网关尚未加载受检恢复版本 2；需同步代码并重启网关，不能反复发送旧版回零')
+                if '--hand-only' not in args:
+                    side = args[args.index('--side')+1]
+                    arm = feedback.get('sides', {}).get(side, feedback)
+                    age = arm.get('arm_feedback_age_s')
+                    q = arm.get('arm_urdf_rad')
+                    states = arm.get('enable_states')
+                    if (not isinstance(age, (int, float)) or not 0 <= age <= .1
+                            or not isinstance(q, list) or len(q) != 7
+                            or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in q)):
+                        raise RuntimeError('受检恢复需要新鲜七轴位置反馈；不会自动失能')
+                    if states != [False]*7 and not (
+                            states == [True]*7 and state.get('mode') == 'HOLD_LATCHED'
+                            and state.get('hold_return_protocol') == 1
+                            and not arm.get('controller_fault') and not arm.get('driver_fault')):
+                        raise RuntimeError('当前状态不支持保持使能回零；不会自动失能，请可靠托稳后单独处理失能')
                 self.key('r')
                 return dict(message='已请求网关恢复；请等待状态变为 IDLE，再重新开始计算和使能')
             elif action == 'local_start':
@@ -855,7 +884,7 @@ class Console:
                 if name not in LABELS:
                     raise ValueError('未知服务')
                 if self.running('teleop'):
-                    self.stop_following()
+                    self.stop_following(explicit_stop=False)
                 if name == 'pc_service':
                     self.processes[name] = Process([str(ROOT/'scripts/xrobotoolkit_service.sh'), 'stop'])
                 elif name in self.processes:
@@ -1036,10 +1065,10 @@ class Console:
                 except Exception as exc:
                     self.remote_error = str(exc)
                     if self.running('teleop'):
-                        self.stop_following()
+                        self.stop_following(explicit_stop=False)
             elif self.running('teleop'):
                 self.remote_error = 'SSH 连接中断，已停止本机计算'
-                self.stop_following()
+                self.stop_following(explicit_stop=False)
 
     def _watchdog(self):
         # Independent of SSH polling and process actions: a blocked SSH read must
@@ -1047,14 +1076,14 @@ class Console:
         while not self.closed.wait(.2):
             if self.owner and time.monotonic()-self.heartbeat > 4:
                 self.event('浏览器心跳丢失，停止遥操作')
-                self.stop_following()
+                self.stop_following(explicit_stop=False)
             elif self.owner and not self.running('teleop'):
                 self.owner = None
 
     def close(self):
         self.closed.set()
         if self.running('teleop'):
-            self.stop_following()
+            self.stop_following(explicit_stop=False)
         for proc in self.processes.values():
             proc.stop()
         if self.ssh:
@@ -1221,6 +1250,8 @@ def main(argv=None):
         raise
     server.RequestHandlerClass = make_handler(console, args.port)
     server.daemon_threads = True
+    from esrobo_teleop.debug.log_retention import start_log_maintenance
+    start_log_maintenance(WORKSPACE, console.closed)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     print(f'ESROBO 遥操作控制台：http://127.0.0.1:{args.port}（启动页面不会使能机器人）', flush=True)
     try:

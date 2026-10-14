@@ -172,38 +172,64 @@ class GeometryGuardTests(unittest.TestCase):
         cls.solver = IkSolver(cfg)
         cls.guards = {side: TorsoCollisionGuard(cls.solver, side, margin=.03) for side in ('left', 'right')}
 
-    def test_current_clearance_rejects_19mm_and_accepts_21mm(self):
+    def test_current_clearance_rejects_9mm_and_accepts_11mm(self):
         from esrobo_teleop.config import load_config
         from esrobo_teleop.robot.torso_collision import TorsoCollisionGuard
         cfg = load_config(str(ROOT / 'config/teleop_config.yaml'))
-        self.assertEqual(cfg.robot.torso_collision_margin_m, .02)
-        self.assertEqual(build_config().robot.torso_collision_margin_m, .02)
+        self.assertEqual(cfg.robot.torso_collision_margin_m, .01)
+        self.assertEqual(build_config().robot.torso_collision_margin_m, .01)
         guard = TorsoCollisionGuard(self.solver, 'right', include_fingers=False)
         self.assertEqual(guard.margin, cfg.robot.torso_collision_margin_m)
         self.assertEqual(guard.shoulder_margin, .005)
         q = np.zeros(14)
-        for distance, accepted in ((.019, False), (.02, False), (.021, True)):
+        for distance, accepted in ((.009, False), (.01, False), (.011, True)):
             with self.subTest(distance=distance), mock.patch.object(
                     guard.coal, 'distance', return_value=distance):
                 self.assertEqual(guard(q, q), accepted)
-                self.assertEqual(guard.last_diagnostics['required_m'], .02)
+                self.assertEqual(guard.last_diagnostics['required_m'], .01)
+                self.assertEqual(guard.last_diagnostics['collision_geometry'], 'original_mesh_convex_hull')
 
-    def test_20mm_acceptance_differs_from_historical_30mm_palm_refusal(self):
+    def test_every_mesh_link_uses_convex_geometry_including_arm_and_palm(self):
+        for guard in self.guards.values():
+            for obj, (shape, _) in zip(guard.geometry.geometryObjects, guard.shapes):
+                with self.subTest(link=obj.name):
+                    self.assertIsInstance(shape, guard.coal.Convex)
+            for shape, _, name, _ in guard.fingers:
+                with self.subTest(finger=name):
+                    self.assertIsInstance(shape, guard.coal.Convex)
+
+    def test_original_palm_hull_removes_historical_box_only_refusal(self):
         from esrobo_teleop.robot.torso_collision import TorsoCollisionGuard
         q = np.zeros(14)
         q[:7] = np.deg2rad([2.27, -12.645, -25.203, 28.305, .001, -.092, -.162])
-        for margin, accepted in ((.03, False), (.02, True)):
-            guard = TorsoCollisionGuard(self.solver, 'left', margin=margin, include_fingers=False)
-            self.assertEqual(guard(q, q), accepted)
+        guard = TorsoCollisionGuard(self.solver, 'left', margin=.03, include_fingers=False)
+        self.assertTrue(guard(q, q), guard.last_diagnostics)
+        hull_clearance = guard.last_diagnostics['clearance_m']
+        palm = next(i for i, obj in enumerate(guard.geometry.geometryObjects)
+                    if obj.name == 'leftHand_link_0')
+        obj = guard.geometry.geometryObjects[palm]
+        bounds = obj.geometry.aabb_local
+        shape, center = guard.shapes[palm]
+        try:
+            guard.shapes[palm] = (guard.coal.Box(*(np.asarray(bounds.max_)-np.asarray(bounds.min_))), center)
+            self.assertFalse(guard(q, q))
             self.assertAlmostEqual(guard.last_diagnostics['clearance_m'], .027608973183751082)
-            self.assertEqual(guard.last_diagnostics['required_m'], margin)
+            self.assertGreater(hull_clearance, guard.last_diagnostics['clearance_m'])
+            self.assertEqual(guard.last_diagnostics['required_m'], .03)
+        finally:
+            guard.shapes[palm] = (shape, center)
 
-    def test_recorded_collision_poses_are_rejected_before_contact(self):
+    def test_recorded_poses_use_original_hulls_and_still_reject_early_overlap(self):
         g = self.guards['left']
+        # These are joint snapshots around an incident, not measured mesh
+        # distances. With original hulls, the first three remain below 30 mm;
+        # the last two no longer intersect the old expanded boxes. Do not turn
+        # a historical box-only rejection into a requirement to enlarge meshes.
+        expected = {714: False, 720: False, 729: False, 741: True, 744: True}
         for row in FIXTURE['left']:
             q = np.zeros(14)
             q[:7] = np.deg2rad(row['joints_deg']['feedback'])
-            self.assertFalse(g(q, q), row['line'])
+            self.assertEqual(g(q, q), expected[row['line']], g.last_diagnostics)
             self.assertIsNotNone(g.last_diagnostics['pair'])
 
     def test_all_finger_postures_require_clearance_at_startup(self):
@@ -230,10 +256,10 @@ class GeometryGuardTests(unittest.TestCase):
             self.assertEqual(guard.fingers, [])
 
         # Removing finger articulation must not remove rigid wrist/hand torso
-        # protection. This is a logged left-arm pose immediately before the
-        # controller collision report; its palm body is inside the 30 mm
-        # software clearance even without any articulated-finger geometry.
-        left_guard = TorsoCollisionGuard(self.solver, "left", margin=.03, include_fingers=False)
+        # protection. At this recorded pose the original palm hull has about
+        # 49.56 mm clearance (the old box gave 27.61 mm). A larger 60 mm margin
+        # must still reject it without any articulated-finger geometry.
+        left_guard = TorsoCollisionGuard(self.solver, "left", margin=.06, include_fingers=False)
         q = np.zeros(14)
         q[:7] = np.deg2rad([
             2.27, -12.645, -25.203, 28.305, 0.001, -0.092, -0.162,

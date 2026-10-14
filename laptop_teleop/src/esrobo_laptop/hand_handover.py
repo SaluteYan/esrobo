@@ -16,7 +16,8 @@ class HandStep:
 
 
 class HandHandover:
-    def __init__(self, measured, cfg, now, control_hz):
+    def __init__(self, measured, cfg, now, control_hz, *, live_goal=False):
+        self.live_goal = live_goal
         self.velocity = float(cfg.max_velocity)
         self.step = int(cfg.max_step)
         self.period = 1. / max(float(cfg.publish_hz), float(control_hz))
@@ -55,7 +56,7 @@ class HandHandover:
         # Complete one bounded initial transition before live following. A
         # moving human target must not keep restarting the arrival criterion.
         # Latch only in commit(), after input checks and successful transport.
-        goal = source if self.reference_target is None else np.asarray(self.reference_target)
+        goal = source if self.live_goal or self.reference_target is None else np.asarray(self.reference_target)
         if not math.isfinite(now) or now < self.last_at:
             raise ValueError("hand handover clock moved backwards or is invalid")
         if now-self.started > 10.:

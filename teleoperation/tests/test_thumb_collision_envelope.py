@@ -11,16 +11,25 @@ from scipy.spatial import ConvexHull
 
 from esrobo_teleop.config import load_config
 from esrobo_teleop.ik.solver import IkSolver
-from esrobo_teleop.robot.hand_geometry import geometry_state
+from esrobo_teleop.robot.hand_geometry import HandGeometryState, geometry_state
 from esrobo_teleop.robot.linker_hand_driver import L10_PHYSICAL_JOINT_NAMES
 from esrobo_teleop.robot.torso_collision import (
-    TorsoCollisionGuard, _sweep_convex_vertices,
+    TorsoCollisionGuard, _sweep_convex_vertices, _convex_vertices,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class ConvexArcTests(unittest.TestCase):
+    def test_compaction_keeps_original_vertices_without_outer_plane_expansion(self):
+        points = np.array([[0., 0., 0.], [.04, 0., 0.], [0., .03, 0.],
+                           [0., 0., .02], [.004, .003, .002]])
+        compact = _convex_vertices(points)
+        self.assertEqual(len(compact), 4)
+        for vertex in compact:
+            self.assertTrue(np.any(np.all(points == vertex, axis=1)))
+        self.assertAlmostEqual(ConvexHull(compact).volume, ConvexHull(points).volume)
+
     def test_continuous_arc_is_inside_outer_hull_not_only_sampled_angles(self):
         rng = np.random.default_rng(42)
         points = rng.uniform(-.04, .04, (30, 3))
@@ -89,7 +98,7 @@ class RecordedThumbTests(unittest.TestCase):
             self.assertEqual(g.margin, .03)
             self.assertGreater(g.last_diagnostics['clearance_m'],
                                g.last_diagnostics['required_m'])
-            self.assertEqual(g.last_diagnostics['thumb_envelope'], 'mesh_convex_arc_hull')
+            self.assertEqual(g.last_diagnostics['thumb_envelope'], 'original_mesh_convex_arc_hull')
 
     def test_stale_feedback_is_still_rejected(self):
         g, q = self.guard, self.recorded_arm()
@@ -151,7 +160,8 @@ class RecordedThumbTests(unittest.TestCase):
             self.assertTrue(g(q, q), g.last_diagnostics)
             self.assertEqual(g.last_diagnostics['required_m'], .03)
             if age == .01:
-                self.assertAlmostEqual(g.last_diagnostics['clearance_m'], .04474566742215065, places=6)
+                # Removing support-plane expansion cannot reduce this clearance.
+                self.assertGreaterEqual(g.last_diagnostics['clearance_m'], .04474566742215065)
         original = g.margin
         try:
             g.margin = .05
@@ -210,7 +220,10 @@ class RecordedThumbTests(unittest.TestCase):
         for angles in itertools.product(*(np.linspace(lo, hi, 4) for _, _, lo, hi in chain)):
             actual = points.copy()
             for angle, (joint, axis, _, _) in zip(angles, chain):
-                rotation = g.pin.AngleAxis(float(angle), axis).matrix()
+                # URDF parsing and the production sweep normalize axes. The
+                # vendor left thumb axes are rounded and not exactly unit length;
+                # AngleAxis requires a unit axis rather than normalizing for us.
+                rotation = g.pin.AngleAxis(float(angle), axis/np.linalg.norm(axis)).matrix()
                 actual = actual @ rotation.T
                 placement = g.model.jointPlacements[joint]
                 actual = actual @ placement.rotation.T + placement.translation
@@ -233,6 +246,33 @@ class LeftFingerEnvelopeTests(unittest.TestCase):
             with self.subTest(finger=finger):
                 self._assert_finger_mesh_enclosed(finger)
 
+    def test_recorded_return_sweep_still_rejects_contact_at_10mm(self):
+        # 2026-10-14: the current thumb pose alone is not a return certificate.
+        guard = TorsoCollisionGuard(self.solver, 'left')
+        self.assertEqual(guard.margin, .01)
+        now = time.monotonic()
+        state = geometry_state([254,127,254,254,254,254,15,122,121,112], now,
+            'left', self.cfg.hand.geometry_feedback_calibration,
+            L10_PHYSICAL_JOINT_NAMES, 0., .1, now=now)
+        q = np.zeros(14)
+        q[:7] = [-.000593411945678072, -.0005235987755982663,
+                 -.00031415926535897936, -.0006457718232379018,
+                 -.000017453292519943296, 0., -.00034906585039886593]
+        guard.hand_state_provider = lambda horizon: state
+        self.assertTrue(guard(q, q), guard.last_diagnostics)
+        intervals = dict(state.intervals)
+        intervals.update(left_thumb_cmc_pitch=(-.24, .24),
+                         left_thumb_cmc_yaw=(-.34, 1.12),
+                         left_thumb_cmc_roll=(.12, .78))
+        sweep = HandGeometryState(now, intervals, state.calibrated, True)
+        drift = np.zeros(14)
+        drift[:7] = np.deg2rad(.2)
+        self.assertFalse(guard.check_hand_return(q-drift, q+drift, sweep))
+        self.assertLess(guard.last_diagnostics['clearance_m'], 0.)
+        self.assertEqual(guard.last_diagnostics['required_m'], .01)
+        self.assertEqual(guard.last_diagnostics['pair'],
+                         ['left_thumb_distal_finger_envelope', 'waist_link1_0'])
+
     def test_left_recorded_pose_keeps_margin_and_rejects_stale_feedback(self):
         g = self.guard
         raw = [254,127,254,254,254,254,0,128,99,112]
@@ -248,7 +288,7 @@ class LeftFingerEnvelopeTests(unittest.TestCase):
             valid = g(q, q)
             if age == .01:
                 self.assertTrue(valid, g.last_diagnostics)
-                self.assertEqual(g.last_diagnostics['thumb_envelope'], 'mesh_convex_arc_hull')
+                self.assertEqual(g.last_diagnostics['thumb_envelope'], 'original_mesh_convex_arc_hull')
                 self.assertEqual(g.margin, .03)
                 margin = g.margin
                 try:

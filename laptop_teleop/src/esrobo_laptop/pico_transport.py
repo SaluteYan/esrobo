@@ -25,9 +25,10 @@ def require_notifications(sdk):
 
 
 def summary_times(times, now_ns):
-    """Background only. Include silence since the last reception in the rate."""
+    """Recent transport rate; retain the true age even after the window expires."""
     times = list(times)[-200:]
-    return dict(hz=(len(times)-1)*1e9/max(now_ns-times[0], 1) if len(times) >= 2 else 0.,
+    recent = [stamp for stamp in times if 0 <= now_ns-stamp <= 2_000_000_000]
+    return dict(hz=(len(recent)-1)*1e9/max(now_ns-recent[0], 1) if len(recent) >= 2 else 0.,
                 age_ms=(now_ns-times[-1])/1e6 if times else None)
 
 
@@ -251,9 +252,16 @@ class PicoForwarder:
         counts, times, status = self.metrics.raw()
         now = time.monotonic_ns()
         sdk = self.sdk.get_tracking_diagnostics()
-        return dict(generated_monotonic_ns=now, sdk={k: dict(summary_times(v['receipts_ns'], now),
-                    committed=v['committed'], rejected=v['rejected'], invalid=v['invalid']) for k, v in sdk.items()},
-                    timing={k: summary_times(v, now) for k, v in times.items()},
+        sdk = {k: dict(summary_times(v['receipts_ns'], now),
+                      committed=v['committed'], rejected=v['rejected'], invalid=v['invalid'])
+               for k, v in sdk.items()}
+        timing = {k: summary_times(v, now) for k, v in times.items()}
+        for side in ('left', 'right'):
+            if status.get(side) == 'tracking':
+                ages = (sdk.get(side, {}).get('age_ms'), timing[side+'_map']['age_ms'])
+                if any(age is None or not 0 <= age <= 100 for age in ages):
+                    status[side] = 'stale'
+        return dict(generated_monotonic_ns=now, sdk=sdk, timing=timing,
                     counts=counts, hand_status=status,
                     errors=self.metrics.error_snapshot(),
                     logging=self.diagnostics.stats() if self.diagnostics else {}, web_poll_hz=20.)

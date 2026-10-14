@@ -2,7 +2,7 @@
 from collections import OrderedDict
 import secrets
 
-from .protocol import ProtocolError, validate_hold, validate_target, validate_entry_keepalive
+from .protocol import ProtocolError, validate_hold, validate_target, validate_entry_keepalive, validate_recovery
 
 
 class SessionGate:
@@ -22,11 +22,17 @@ class SessionGate:
         self.last_seen = 0.0
         self.hold_started_at = None
         self.position_hold_started_at = None
+        self.recovery_started_at = None
+        self.recovery_epoch = None
+        self.completed_recovery_epochs = set()
 
     def hello(self, msg, peer, now, busy):
         nonce = msg.get("client_nonce")
         if not isinstance(nonce, str) or len(nonce) != 32:
             raise ProtocolError("invalid client nonce")
+        if (self.contract.get('input_recovery_enabled') is True
+                and msg.get('input_recovery_protocol') != 1):
+            raise ProtocolError('client lacks input recovery protocol 1; update both endpoints')
         if self.peer == peer and self.client_nonce == nonce:
             return  # idempotent; hello never renews target validity
         if busy or (self.peer is not None and now - self.last_seen < 1.0):
@@ -43,6 +49,9 @@ class SessionGate:
         self.last_seen = now
         self.hold_started_at = None
         self.position_hold_started_at = None
+        self.recovery_started_at = None
+        self.recovery_epoch = None
+        self.completed_recovery_epochs.clear()
 
     def state(self, now, status):
         lease = secrets.token_hex(12)
@@ -78,6 +87,28 @@ class SessionGate:
             return kind  # Do not modify target, ready validity, or input-hold state.
         if kind == "target":
             target = validate_target(msg, self.contract)
+            recovery = validate_recovery(msg, self.contract)
+            if self.recovery_epoch is not None:
+                if recovery is None or recovery['epoch'] != self.recovery_epoch:
+                    raise ProtocolError('active reacquisition requires the original epoch')
+                if now - self.recovery_started_at >= 3.:
+                    raise ProtocolError('reacquisition deadline expired')
+            if recovery is not None:
+                epoch = recovery['epoch']
+                if recovery['phase'] == 'reacquiring':
+                    if self.recovery_epoch is None:
+                        if epoch in self.completed_recovery_epochs or self.hold_started_at is None:
+                            raise ProtocolError('new reacquisition requires an input hold and unused epoch')
+                        self.recovery_epoch, self.recovery_started_at = epoch, now
+                elif epoch != self.recovery_epoch:
+                    if epoch not in self.completed_recovery_epochs or self.recovery_epoch is not None:
+                        raise ProtocolError('completion requires current reacquisition epoch')
+                else:
+                    if len(self.completed_recovery_epochs) >= 128:
+                        raise ProtocolError('recovery epoch budget exhausted; restart session')
+                    self.completed_recovery_epochs.add(epoch)
+                    self.recovery_epoch = self.recovery_started_at = None
+                target['recovery'] = recovery
             self.hold_started_at = None
             self.position_hold_started_at = None
         elif kind == "hold":
@@ -95,7 +126,9 @@ class SessionGate:
                 self.position_hold_started_at = None
                 if self.hold_started_at is None:
                     self.hold_started_at = now
-        elif kind == "stop":
+        elif kind in ("stop", "close", "input_fault"):
+            if kind != 'stop' and self.contract.get('input_recovery_protocol') != 1:
+                raise ProtocolError('input recovery protocol 1 required')
             target = None
             self.hold_started_at = None
             self.position_hold_started_at = None

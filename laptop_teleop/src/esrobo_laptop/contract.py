@@ -24,6 +24,8 @@ def local_id(cfg, side, with_hand, hand_only=False):
 
 
 def verify_contract(contract, cfg, settings, *, mock=False):
+    if contract.get('input_recovery_protocol') != 1:
+        raise ProtocolError('gateway lacks input recovery protocol 1; update and restart both endpoints')
     if contract.get("input_hold_protocol") != REQUIRED_INPUT_HOLD_PROTOCOL:
         raise ProtocolError("gateway lacks input hold protocol 2 (separate position/input pauses); "
                             "update and restart the robot gateway")

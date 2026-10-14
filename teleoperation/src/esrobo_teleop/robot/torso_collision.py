@@ -1,7 +1,7 @@
 """Conservative arm/torso swept-volume checks using URDF collision geometry.
 
-Arm mesh boxes, NERO link3 convex hulls, and torso convex hulls enclose meshes;
-this can reject some paths that exact mesh distance would accept. No guessed
+Original mesh convex hulls enclose each link; continuous angular sweeps enclose
+uncertain finger motion. Convexification can still reject concave free space. No guessed
 torso dimensions or network access at runtime. All non-arm joints are assumed
 stationary at URDF zero.
 """
@@ -15,32 +15,11 @@ from pathlib import Path
 import numpy as np
 
 
-_ENVELOPE_DIRECTIONS = np.asarray([
-    direction for direction in itertools.product((-1., 0., 1.), repeat=3)
-    if any(direction)
-])
-_ENVELOPE_DIRECTIONS /= np.linalg.norm(_ENVELOPE_DIRECTIONS, axis=1)[:, None]
-
-
-def _compact_enclosing_vertices(points):
-    """Bound complexity with 26 outward support planes, never an inner hull.
-
-    Every supplied point satisfies every support plane. Intersecting those
-    halfspaces therefore encloses their entire convex hull, with at most 48
-    vertices. This also keeps rebuilding and GJK distance checks bounded.
-    """
-    from scipy.spatial import HalfspaceIntersection
+def _convex_vertices(points):
+    """Retain the original convex hull, without a box or support-plane expansion."""
+    from scipy.spatial import ConvexHull
     points = np.asarray(points, dtype=float)
-    support = np.full(len(_ENVELOPE_DIRECTIONS), -np.inf)
-    # STL files repeat vertices per triangle. Stream the support reduction to
-    # avoid a mesh-size-by-26 temporary or threaded BLAS startup stalls.
-    for start in range(0, len(points), 8192):
-        projections = np.einsum('ij,kj->ik', points[start:start+8192],
-                                _ENVELOPE_DIRECTIONS, optimize=False)
-        support = np.maximum(support, projections.max(axis=0))
-    support += 1e-10
-    planes = np.column_stack((_ENVELOPE_DIRECTIONS, -support))
-    return HalfspaceIntersection(planes, points.mean(axis=0)).intersections
+    return points[ConvexHull(points).vertices]
 
 
 def _sweep_convex_vertices(points, axis, lower, upper):
@@ -55,7 +34,8 @@ def _sweep_convex_vertices(points, axis, lower, upper):
     axis = np.asarray(axis, dtype=float)
     axis = axis / np.linalg.norm(axis)
     points = np.asarray(points, dtype=float)
-    base = np.outer(points @ axis, axis)
+    # Tiny 3-D products must not start large BLAS thread pools while planning.
+    base = np.outer(np.einsum('ij,j->i', points, axis, optimize=False), axis)
     cosine = points - base
     sine = np.cross(axis, points)
     count = max(1, int(np.ceil((upper-lower) / np.deg2rad(15))))
@@ -64,7 +44,7 @@ def _sweep_convex_vertices(points, axis, lower, upper):
     for a, b in zip(angles[:-1], angles[1:]):
         middle, half = (a+b)/2, (b-a)/2
         values.append(base + (cosine*np.cos(middle) + sine*np.sin(middle))/np.cos(half))
-    return _compact_enclosing_vertices(np.concatenate(values))
+    return _convex_vertices(np.concatenate(values))
 
 
 class TorsoCollisionGuard:
@@ -73,7 +53,7 @@ class TorsoCollisionGuard:
     _entry_coverage_only = False
     _entry_arm_geometry_only = False
 
-    def __init__(self, solver, side, package_dirs=(), margin=0.02,
+    def __init__(self, solver, side, package_dirs=(), margin=0.01,
                  shoulder_margin=0.005, *, include_fingers=True):
         import pinocchio as pin
         try:
@@ -89,7 +69,7 @@ class TorsoCollisionGuard:
         self.lock = threading.Lock()
         self.hand_state_provider = None
         self.include_fingers = bool(include_fingers)
-        self.thumb_envelope = "mesh_convex_arc_hull"
+        self.thumb_envelope = "original_mesh_convex_arc_hull"
         self.hand_motion_horizon_s = 0.5
         self._hand_interval_key = None
         self._hand_diagnostics = {}
@@ -103,8 +83,8 @@ class TorsoCollisionGuard:
         roots = [str(Path(p).expanduser().resolve()) for p in package_dirs]
         roots.append(str(Path(__file__).resolve().parents[4] / "model" / "urdf"))
         roots.append(str(Path(__file__).resolve().parents[3] / "assets"))
-        # Build enclosing boxes directly from STL vertices. Avoid building
-        # several million-triangle BVHs just to read their local bounds.
+        # Build original STL convex hulls for every link. Temporary URDF boxes
+        # carry placements into Pinocchio; collision queries use the hulls.
         root = ET.parse(solver._cfg.urdf_path).getroot()
         collision_hulls = {}
         finger_mesh_vertices = {}
@@ -134,24 +114,14 @@ class TorsoCollisionGuard:
             if not np.all(np.isfinite(extent)) or np.any(extent <= 0):
                 raise ValueError(f"invalid mesh bounds: {path}")
             link_name = collision_links[id(collision)]
+            points = _convex_vertices(vertices.astype(float) * scale - center)
+            cloud = coal.StdVec_Vec3s()
+            for point in points:
+                cloud.append(point)
+            collision_hulls[link_name] = coal.Convex.convexHull(cloud, True, "Qt")
             if link_name.startswith(tuple(f"{side}_{finger}_" for finger in
                     ("thumb", "index", "middle", "ring", "pinky"))):
-                # Repeated axis-aligned boxes around bent fingers
-                # can enter the waist clearance even when an enclosing mesh
-                # arc hull proves the same uncertain posture has room.
-                finger_mesh_vertices[link_name] = _compact_enclosing_vertices(vertices.astype(float) * scale - center)
-            # A convex hull still encloses the original STL. The NERO link3
-            # box can spuriously reject a measured pose next to waist_link3;
-            # use its tighter enclosing hull without relaxing the configured margin.
-            if (not link_name.startswith(("left", "right"))
-                    or link_name in ("left_nero_link3", "right_nero_link3")):
-                from scipy.spatial import ConvexHull
-                points = vertices.astype(float) * scale - center
-                hull = ConvexHull(points)
-                cloud = coal.StdVec_Vec3s()
-                for point in points[hull.vertices]:
-                    cloud.append(point)
-                collision_hulls[link_name] = coal.Convex.convexHull(cloud, True, "Qt")
+                finger_mesh_vertices[link_name] = points
             origin = collision.find("origin")
             if origin is None:
                 origin = ET.SubElement(collision, "origin")
@@ -180,10 +150,9 @@ class TorsoCollisionGuard:
         moving, torso = [], []
         self.reach = 0.0
         # Retain all collision links, including the force sensor and hand.
-        # Finger geometries are replaced below by a pose-independent envelope.
+        # Finger geometries are swept below over measured or full joint ranges.
         hand_id = self.model.getFrameId(getattr(solver._cfg, f"{side}_hand_frame"))
         hand_joint = self.model.frames[hand_id].parentJoint
-        fingers = []
         finger_specs = []
         joint_axes = {j.attrib["name"]: np.fromstring(j.find("axis").get("xyz"), sep=" ")
                       for j in root.findall("joint") if j.find("axis") is not None}
@@ -191,21 +160,6 @@ class TorsoCollisionGuard:
         def corners(lower, upper):
             return np.array(list(itertools.product(*zip(lower, upper))))
 
-        def sweep_axis(points, axis, lower, upper):
-            axis = axis / np.linalg.norm(axis)
-            base = np.outer(points @ axis, axis)
-            cosine = points - base
-            sine = np.cross(axis, points)
-            values = [base + cosine * np.cos(t) + sine * np.sin(t) for t in (lower, upper)]
-            # Extrema of each sinusoidal coordinate; evaluating extra points
-            # is conservative and avoids angular sampling assumptions.
-            for phase in np.arctan2(sine, cosine).flat:
-                for k in range(-3, 4):
-                    t = phase + k * np.pi
-                    if lower <= t <= upper:
-                        values.append(base + cosine * np.cos(t) + sine * np.sin(t))
-            values = np.concatenate(values)
-            return corners(values.min(axis=0), values.max(axis=0))
         for i, obj in enumerate(self.geometry.geometryObjects):
             frame_name = self.model.frames[obj.parentFrame].name
             obj.geometry.computeLocalAABB()
@@ -231,9 +185,8 @@ class TorsoCollisionGuard:
                     reach += np.linalg.norm(self.model.jointPlacements[joint].translation)
                     joint = self.model.parents[joint]
                 self.reach = max(self.reach, reach)
-                # Enclose every allowed finger posture with interval boxes.
-                # Sweep box corners analytically over each URDF joint range,
-                # working from the mesh back to the fixed wrist parent.
+                # Identify the finger chain without replacing mesh geometry
+                # by a box. Primitive box links retain their exact corners.
                 joint = obj.parentJoint
                 if joint != hand_joint:
                     points = corners(center - extent / 2, center + extent / 2)
@@ -245,22 +198,15 @@ class TorsoCollisionGuard:
                         name = self.model.names[joint]
                         if name not in joint_axes or self.model.joints[joint].nq != 1:
                             raise ValueError(f"unsupported finger collision joint: {name}")
-                        qi = self.model.idx_qs[joint]
-                        points = sweep_axis(points, joint_axes[name],
-                            self.model.lowerPositionLimit[qi], self.model.upperPositionLimit[qi])
-                        placement = self.model.jointPlacements[joint]
-                        points = points @ placement.rotation.T + placement.translation
                         joint = self.model.parents[joint]
                     if joint == hand_joint and visited:
                         mesh_points = finger_mesh_vertices.get(frame_name)
                         if mesh_points is not None:
                             mesh_points = mesh_points @ obj.placement.rotation.T + obj.placement.translation
-                        finger_specs.append((initial_points, initial_joint, frame_name, mesh_points))
-                        lo, hi = points.min(axis=0), points.max(axis=0)
-                        fingers.append((coal.Box(*(hi-lo)), (hi+lo)/2, frame_name,
-                                        motion_weights(hand_joint, (hi+lo)/2, np.linalg.norm(hi-lo)/2)))
+                        finger_specs.append((mesh_points if mesh_points is not None else initial_points,
+                                             initial_joint, frame_name))
                         moving.remove(i)
-        if not moving or not torso or (self.include_fingers and not fingers):
+        if not moving or not torso or (self.include_fingers and not finger_specs):
             raise ValueError("URDF lacks complete active arm, hand or torso collision geometry")
         self.pairs = [(a, b) for a in moving for b in torso]
         # Initial approach excludes the entire dexterous hand, including its
@@ -275,9 +221,7 @@ class TorsoCollisionGuard:
             else self.margin) for a, b in self.pairs}
         self.torso = torso
         self.hand_joint = hand_joint
-        self.fingers = fingers if self.include_fingers else []
-        if self.fingers:
-            self.reach += max(np.linalg.norm(center) for _, center, _, _ in self.fingers)
+        self.fingers = []
         self.distance_request = coal.DistanceRequest()
         mimics = {j.attrib["name"]: (j.find("mimic").get("joint"),
                     float(j.find("mimic").get("multiplier", "1")),
@@ -297,31 +241,31 @@ class TorsoCollisionGuard:
                         raise ValueError("hand feedback outside URDF limits: " + name)
                 return lo, hi
             result = []
-            for initial_points, initial_joint, name, mesh_points in finger_specs:
+            for initial_points, initial_joint, name in finger_specs:
                 # The selected side's fingers use enclosing mesh hulls and
                 # conservative arc hulls. Missing feedback still uses the full
                 # URDF interval; no joint or calibration uncertainty is omitted.
-                use_hull = mesh_points is not None
-                points, joint = (mesh_points if use_hull else initial_points).copy(), initial_joint
+                points, joint = initial_points.copy(), initial_joint
                 while joint != hand_joint:
                     joint_name = self.model.names[joint]
                     lo, hi = limits(joint_name, self.model.idx_qs[joint])
-                    points = (_sweep_convex_vertices if use_hull else sweep_axis)(
-                        points, joint_axes[joint_name], lo, hi)
+                    points = _sweep_convex_vertices(points, joint_axes[joint_name], lo, hi)
                     placement = self.model.jointPlacements[joint]
-                    points = points @ placement.rotation.T + placement.translation
+                    points = (np.einsum('ij,kj->ik', points, placement.rotation, optimize=False)
+                              + placement.translation)
                     joint = self.model.parents[joint]
                 lo, hi = points.min(axis=0), points.max(axis=0)
-                shape = coal.Box(*(hi-lo))
-                if use_hull:
-                    cloud = coal.StdVec_Vec3s()
-                    for point in points - (hi+lo)/2:
-                        cloud.append(point)
-                    shape = coal.Convex.convexHull(cloud, True, "Qt")
+                cloud = coal.StdVec_Vec3s()
+                for point in points - (hi+lo)/2:
+                    cloud.append(point)
+                shape = coal.Convex.convexHull(cloud, True, "Qt")
                 result.append((shape, (hi+lo)/2, name,
                     motion_weights(hand_joint, (hi+lo)/2, np.linalg.norm(hi-lo)/2)))
             return result
         self._build_fingers = build_fingers
+        if self.include_fingers:
+            self.fingers = build_fingers({})
+            self.reach += max(np.linalg.norm(center) for _, center, _, _ in self.fingers)
 
     def _refresh_hand(self, *, include_fingers=True, state=None):
         if not include_fingers or not getattr(self, "include_fingers", True):
@@ -329,7 +273,13 @@ class TorsoCollisionGuard:
                 "entry_arm" if self._entry_arm_geometry_only else "arm_wrist_palm")}
             return True
         if state is None and getattr(self, "hand_state_provider", None) is None:
-            return True  # Legacy/offline use retains all-pose envelopes.
+            # Do not reuse the last measured pose after losing the provider.
+            if getattr(self, '_hand_interval_key', None) is not None:
+                self.fingers = self._build_fingers({})
+                self._hand_interval_key = None
+            self._hand_diagnostics = {"thumb_envelope": getattr(
+                self, 'thumb_envelope', 'original_mesh_convex_arc_hull')}
+            return True  # Legacy/offline use retains all-pose convex sweeps.
         if state is None:
             state = self.hand_state_provider(self.hand_motion_horizon_s)
         if not state.valid:
@@ -557,6 +507,7 @@ class TorsoCollisionGuard:
         def outcome(ok, category, checks):
             self.last_diagnostics.update(
                 certified=bool(ok), category=category, checked_boxes=checks,
+                collision_geometry="original_mesh_convex_hull",
                 checked_lower_urdf_rad=np.minimum(start,end).tolist(),
                 checked_upper_urdf_rad=np.maximum(start,end).tolist())
             return ok

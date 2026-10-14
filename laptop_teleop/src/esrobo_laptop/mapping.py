@@ -253,6 +253,20 @@ class WristMapping:
         rotation = mu.quat_wxyz_to_matrix(actual[f"{self.side}_wrist"][3:])
         return carrier.T @ rotation @ self.anatomical_mount.T
 
+    def source_terminal(self, local_orientation, position_solution):
+        """Map the unfiltered source without changing command IK history."""
+        import copy
+        previous = self._last_terminal_target
+        diagnostics = self.last_diagnostics
+        forearm = self.forearm_frame
+        self.forearm_frame = copy.deepcopy(forearm)
+        try:
+            return self.absolute_terminal(local_orientation, position_solution)
+        finally:
+            self._last_terminal_target = previous
+            self.last_diagnostics = diagnostics
+            self.forearm_frame = forearm
+
     def absolute_terminal(self, local_orientation, position_solution):
         """Transfer absolute palm attitude without subtracting the entry pose."""
         poses = self.solver.current_task_frame_poses(self.with_neutral(position_solution))

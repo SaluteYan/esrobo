@@ -206,6 +206,22 @@ def test_cancellation_after_hand_arrival_never_starts_arm():
     b.arm.release_return_request.assert_called_once()
 
 
+@pytest.mark.parametrize('side', ['left', 'right'])
+def test_hand_zero_lost_at_phase_boundary_never_starts_seven_joint_motion(side):
+    b = backend(side)
+    # The hand phase verifies arrival, but its next independent observation
+    # no longer confirms zero (stale feedback or a moved finger).
+    b.hand.open_pose_status.side_effect = [(False, {}), (False, {})]
+    b.hand.describe_open_pose_errors.return_value = 'arrival no longer verified'
+    result = b.return_zero(lambda: False)
+    assert not result['returned'] and not result['hands_open']
+    assert not result['arm_returned'] and result['disabled']
+    assert result['stage'] == 'hand_open_before_arm'
+    assert 'before arm return' in result['reason']
+    b.arm.safe_return.assert_not_called()
+    b.arm.release_return_request.assert_called_once()
+
+
 def test_final_hand_feedback_loss_refuses_idle_without_reopening():
     b = backend()
     def arm_return(**kw):
@@ -236,3 +252,37 @@ def test_arm_only_return_keeps_original_sequence():
     b.arm.recover_disabled_controller.side_effect = lambda *args: events.append('recover') or dict(disabled=True)
     assert b.return_zero(lambda: False)['returned']
     assert events == ['arm', 'recover']
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+def test_held_return_runs_arm_first_without_controller_disable_reset(side):
+    b = backend(side)
+    events = []
+    def arm_return(**kw):
+        assert not kw['recover'] and kw['preserve_hold']
+        assert not kw['recognize_inherited_stop']
+        events.append('arm_zero_and_disable')
+        return ReturnResult(True, True, 'disabling')
+    b.arm.safe_return.side_effect = arm_return
+    b.arm.return_hold_preserved = False
+    def hand_open(cancelled, **kw):
+        assert kw['safety_check']()
+        events.append('hand_open')
+        b.hand.open_pose_status.return_value = (True, {})
+        return True, {}
+    b.hand.align_and_verify_open_pose.side_effect = hand_open
+    result = b.return_zero(lambda: False, from_hold=True)
+    assert result['returned'] and result['disabled'] and result['arm_returned'] and result['hands_open']
+    assert events == ['arm_zero_and_disable', 'hand_open']
+    b.arm.disable.assert_not_called()
+    b.arm.recover_disabled_controller.assert_called_once()
+
+
+def test_refused_held_return_does_not_start_hand_or_reset_controller():
+    b = backend()
+    b.arm.safe_return.return_value = ReturnResult(False, False, 'planning', 'blocked')
+    b.arm.return_hold_preserved = True
+    result = b.return_zero(lambda: False, from_hold=True)
+    assert result['holding'] and not result['returned']
+    b.arm.recover_disabled_controller.assert_not_called()
+    b.hand.align_and_verify_open_pose.assert_not_called()

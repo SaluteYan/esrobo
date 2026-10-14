@@ -26,7 +26,7 @@ def serve_mock(contract, key, address_pipe, stop):
     """Separate process: a test gateway must not compete for the controller GIL."""
     from esrobo_link.gateway import Gateway
     from esrobo_link.backends import MockBackend
-    backend=MockBackend('right',True)
+    backend=MockBackend(contract['side'],True)
     backend.contract=contract
     gateway=Gateway(backend,key,port=0)
     worker=threading.Thread(target=gateway.run,daemon=True);worker.start()
@@ -50,6 +50,7 @@ class Profile:
         self.long_gaps = defaultdict(int)
         self.component_sequence = {}
         self.notifications = {}
+        self.native_last = {}
         self.stack = ExitStack()
         self.worker = threading.Thread(target=self._write, daemon=True)
         self.worker.start()
@@ -68,13 +69,20 @@ class Profile:
             if before:
                 before(args, kwargs)
             start = time.perf_counter()
+            started_ns = time.monotonic_ns()
             cpu_start = time.thread_time_ns()
             try:
                 result = original(*args, **kwargs)
             finally:
                 elapsed=1000*(time.perf_counter()-start)
-                self.submit(label or name, elapsed,
-                            thread_cpu_ms=(time.thread_time_ns()-cpu_start)/1.e6)
+                facts = {}
+                for arg in args:
+                    if isinstance(arg, dict) and 'sequence' in arg and 'received_monotonic_ns' in arg:
+                        facts = dict(sequence=arg['sequence'], receipt_ns=arg['received_monotonic_ns'])
+                        break
+                if label == 'raw_hand_mapping': facts['side'] = args[1]
+                self.submit(label or name, elapsed, started_ns=started_ns,
+                            thread_cpu_ms=(time.thread_time_ns()-cpu_start)/1.e6, **facts)
             if observe:
                 observe(args, kwargs, result)
             return result
@@ -118,6 +126,17 @@ class Profile:
                 self.notifications[sample['sequence']]=now
                 if len(self.notifications)>200:
                     self.notifications.pop(next(iter(self.notifications)))
+
+    def native_receipts(self, sdk):
+        # Read-only history from the existing subscription, including frames
+        # coalesced before the Python waiter runs. Never open a second subscriber.
+        for side, values in sdk.get_tracking_diagnostics().items():
+            receipts = values['receipts_ns']
+            for index, stamp in enumerate(receipts):
+                if stamp <= self.native_last.get(side, 0): continue
+                self.submit('native_'+side, receipt_ns=stamp,
+                            sequence=values['committed']-len(receipts)+index+1)
+            if receipts: self.native_last[side] = receipts[-1]
 
     def _write(self):
         try:
@@ -190,7 +209,10 @@ class Profile:
             lambda a,k,r:self.packet(a[2],'udp_send') if r else None)
         if sdk:
             import xrobotoolkit_sdk
-            self.wrap(xrobotoolkit_sdk,'wait_tracking_updates','sdk_wait',self.tracking)
+            def observed(a,k,result):
+                self.tracking(a,k,result)
+                self.native_receipts(xrobotoolkit_sdk)
+            self.wrap(xrobotoolkit_sdk,'wait_tracking_updates','sdk_wait',observed)
             self.wrap(PicoForwarder,'__init__','forwarder_init',
                 lambda a,k,r:self.wrap(a[2],'_packet_from_sample','body_build'))
 
@@ -200,6 +222,9 @@ def main():
     p.add_argument('mode',choices=['preview','acquisition'])
     p.add_argument('--seconds',type=int,default=60)
     p.add_argument('--output',required=True)
+    p.add_argument('--side', choices=['left','right'], default='right')
+    p.add_argument('--forward-only', action='store_true',
+                   help='Acquisition sends to the preview receiver; do not bind its UDP port')
     p.add_argument('--mapping-baseline', help='Test-only archived mapping.py for paired comparisons')
     p.add_argument('--synthetic', action='store_true', help='Isolated synthetic source; preview only')
     p.add_argument('--switch-interval', type=float, help='Test-only Python thread scheduling comparison')
@@ -208,6 +233,10 @@ def main():
     p.add_argument('--observe-only', action='store_true',
                    help='Preview without per-function timing wrappers; use normal stream-rate records')
     args=p.parse_args()
+    if args.forward_only and args.mode != 'acquisition':
+        p.error('--forward-only is only for acquisition')
+    if args.synthetic and args.side != 'right':
+        p.error('the synthetic posture fixture supports --side right; left preview requires real input')
     previous_switch_interval=sys.getswitchinterval()
     if args.switch_interval is not None: sys.setswitchinterval(args.switch_interval)
     prof=Profile(args.output)
@@ -287,10 +316,10 @@ def main():
             cfg=read_robot_config(read_settings(ROOT/'config/laptop.yaml'))
             limits=NeroSingleArmDriver.__new__(NeroSingleArmDriver)
             limits._cfg=cfg.robot; limits._session_start=None
-            lo,hi=limits._effective_position_limits('right')
-            direction,offset=limits._mapping('right')
+            lo,hi=limits._effective_position_limits(args.side)
+            direction,offset=limits._mapping(args.side)
             a,b=(lo-offset)/direction,(hi-offset)/direction
-            backend=MockBackend('right',True)
+            backend=MockBackend(args.side,True)
             backend.contract.update(lower_rad=np.minimum(a,b).tolist(),upper_rad=np.maximum(a,b).tolist())
             import multiprocessing
             context=multiprocessing.get_context('spawn')
@@ -303,7 +332,7 @@ def main():
                 port=parent_pipe.recv();parent_pipe.close()
                 with tempfile.TemporaryDirectory() as temp:
                     keypath=Path(temp)/'key';keypath.write_bytes(key);keypath.chmod(0o600)
-                    code=run(['run','--mock','--preview','--side','right','--host','127.0.0.1',
+                    code=run(['run','--mock','--preview','--side',args.side,'--host','127.0.0.1',
                         '--port',str(port),'--key-file',str(keypath),
                         '--seconds',str(args.seconds),'--log-file',str(Path(args.output).with_suffix('.session.jsonl'))])
             finally:
@@ -313,19 +342,23 @@ def main():
         else:
             from esrobo_laptop.acquisition import pico
             receiver=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-            receiver.bind(('127.0.0.1',15050));receiver.settimeout(.05)
+            if not args.forward_only: receiver.bind(('127.0.0.1',15050))
+            receiver.settimeout(.05)
             receiving=threading.Event()
             def receive():
                 while not receiving.is_set():
                     try:payload,_=receiver.recvfrom(65535)
                     except socket.timeout:continue
                     prof.packet(payload,'udp_receive')
-            rx=threading.Thread(target=receive,daemon=True);rx.start()
+            rx=threading.Thread(target=receive,daemon=True)
+            if not args.forward_only: rx.start()
             timer=threading.Timer(args.seconds,lambda:os.kill(os.getpid(),signal.SIGTERM))
             timer.start()
-            try:code=pico([])
+            try:code=pico(['--viewer-host','127.0.0.1'])
             finally:
-                timer.cancel();receiving.set();rx.join(.1);receiver.close()
+                timer.cancel();receiving.set()
+                if rx.is_alive(): rx.join(.1)
+                receiver.close()
         return code or 0
     finally:
         if compute_timer: compute_timer.cancel()

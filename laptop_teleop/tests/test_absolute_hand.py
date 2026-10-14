@@ -146,3 +146,26 @@ def test_absolute_entry_uses_saved_palm_pose_and_keeps_fingers_stationary(config
                  {'right':{'hand':{'position_unit':hand}}})['right']
     np.testing.assert_allclose(np.rad2deg(live['arm_urdf_rad'][4:]),[-125.,20.,-15.],atol=.05)
     assert not wrist.last_diagnostics['entry_wrist_held']
+
+
+@pytest.mark.parametrize('side',['left','right'])
+def test_raw_source_mapping_is_separate_from_filtered_command_and_history(config,side):
+    import copy
+    solver=IkSolver(config.ik)
+    q=np.zeros(14);offset=0 if side=='left' else 7
+    q[offset:offset+4]=[.1,-.4,.2,1.]
+    wrist=WristMapping(solver,config.robot,side,q,absolute_pose=True)
+    filtered=q.copy();filtered[offset+4:offset+7]=np.deg2rad([-60.,2.,-2.])
+    source=q.copy();source[offset+4:offset+7]=np.deg2rad([-60.,18.,-30.])
+    local=wrist.absolute_local_from_robot(filtered)
+    raw=wrist.absolute_local_from_robot(source)
+    command=wrist.absolute_terminal(local,q)
+    previous=wrist._last_terminal_target.copy()
+    diagnostics=copy.deepcopy(wrist.last_diagnostics)
+    forearm=wrist.forearm_frame
+    target=wrist.source_terminal(raw,q)
+    np.testing.assert_allclose(np.degrees(target),[-60.,18.,-30.],atol=.05)
+    np.testing.assert_allclose(np.degrees(command),[-60.,2.,-2.],atol=.05)
+    np.testing.assert_array_equal(wrist._last_terminal_target,previous)
+    assert wrist.last_diagnostics==diagnostics
+    assert wrist.forearm_frame is forearm

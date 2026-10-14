@@ -445,6 +445,7 @@ def test_short_pico_gap_holds_arm_and_hand_then_resumes_after_three_matching_fra
                  feedback_cache_age_s=0.)
     assert controller.step(state) == target
     controller.last_active_target_at -= .05
+    controller.last_complete_input_at -= .05
     pipeline.body.ticket.return_value = None
     assert controller.step(state) is None
     assert controller.hold_missing_input(state, "no new sample")

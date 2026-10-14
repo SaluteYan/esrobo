@@ -164,7 +164,7 @@ def test_arm_hand_packets_need_valid_anatomical_palm_without_fallback(device, pa
     assert not device.palm_history["right"]
 
 
-def test_palm_calibration_checks_pair_age_stability_transform_and_reset(device):
+def test_palm_calibration_accepts_single_frame_and_checks_pair_age_transform_reset(device):
     from esrobo_teleop import math_utils as mu
     now = time.monotonic()
     # Body's transformed forearm is X, palm normal is Z.
@@ -176,7 +176,7 @@ def test_palm_calibration_checks_pair_age_stability_transform_and_reset(device):
     desired = Rotation.from_euler("y", 90., degrees=True).as_matrix()
     raw = device._rotation.T @ waist @ desired
     device.incoming_body_stamps = {"right_arm": now-.005}
-    device.palm_history["right"].extend((now-.2+i*.01, raw.copy(), i+1) for i in range(20))
+    device.palm_history["right"].append((now-.01, raw.copy(), 1))
     transformed, stamp, seq = device._calibration_palm("right", now)
     np.testing.assert_allclose(transformed, desired, atol=1e-6)
     assert abs(stamp-device.incoming_body_stamps["right_arm"]) <= .04
@@ -185,11 +185,13 @@ def test_palm_calibration_checks_pair_age_stability_transform_and_reset(device):
         device._calibration_palm("right", now)
     device.incoming_body_stamps["right_arm"] = now-.005
     device.palm_history["right"].append((now-.001, raw @ Rotation.from_euler("x", 10., degrees=True).as_matrix(), 21))
-    with pytest.raises(ValueError, match="仍在移动"):
+    device._calibration_palm("right", now)  # Moving history is not a rejection.
+    device.incoming_body_stamps["right_arm"] = now-.2
+    with pytest.raises(ValueError, match="不同步"):
         device._calibration_palm("right", now)
     device.restart_preparation()
     assert not device.palm_history["right"]
-    with pytest.raises(ValueError, match="12"):
+    with pytest.raises(ValueError, match="有效掌面"):
         device._calibration_palm("right", now)
 
 
@@ -231,40 +233,43 @@ def test_absolute_palm_diagnostics_are_frozen_with_control_frame(device):
         device._compose_wrist_rotation('right',None)
 
 
-def test_hand_only_requires_one_selected_pico_hand_without_body_reference():
+@pytest.mark.parametrize('side', ['left', 'right'])
+def test_hand_only_requires_one_selected_pico_hand_without_body_reference(side):
     cfg = copy.deepcopy(read_robot_config(read_settings(ROOT/'config/laptop.yaml')).retarget)
     cfg.port = 0
-    device = FreshBodyDevice(cfg, ('right',), True, hand_only=True)
+    device = FreshBodyDevice(cfg, (side,), True, hand_only=True)
     try:
-        assert device.required == ('right_hand',)
+        assert device.required == (f'{side}_hand',)
         assert not device.is_ready()
-        device._handle_packet(packet('right'))
+        device.restart_preparation()
+        device._handle_packet(packet(side))
         ticket = device.ticket(.1)
-        assert set(ticket) == {'right_hand'}
+        assert set(ticket) == {f'{side}_hand'}
         assert device.hand_joints().shape == (20,)
+        assert set(device.initial_hand_reference()[0]) == {side}
     finally:
         device.close()
 
 
-def test_natural_open_reference_requires_stable_extended_fingers(device):
+@pytest.mark.parametrize('invalid', ['stale', 'future', 'nan', 'shape', 'missing'])
+def test_initial_hand_reference_accepts_one_curled_sample_and_rejects_invalid(device, invalid):
     now = time.monotonic()
-    for side in ("left", "right"):
-        device.hand_history[side].extend(
-            (now - .3 + index * .01, np.zeros(10)) for index in range(20)
-        )
-    references, message = device.natural_open_hand_reference()
+    curled = np.ones(10)
+    for side in device.sides:
+        device.hand_history[side].append((now, curled.copy()))
+    references, message = device.initial_hand_reference()
     assert set(references) == {"left", "right"}
-    assert "自然张手" in message
-
-    curled = np.zeros(10)
-    curled[4] = 1.0
-    device.hand_history["right"].clear()
-    device.hand_history["right"].extend(
-        (now - .3 + index * .01, curled) for index in range(20)
-    )
-    references, message = device.natural_open_hand_reference()
-    assert references is None
-    assert "尚未自然张开" in message
+    np.testing.assert_array_equal(references['right'], curled)
+    references['right'][0] = 99
+    assert device.hand_history['right'][-1][1][0] == 1
+    device.hand_history['right'].clear()
+    cases = dict(stale=(now-.2, curled), future=(now+1, curled),
+                 nan=(now, np.full(10, np.nan)), shape=(now, np.zeros(9)))
+    if invalid != 'missing':
+        device.hand_history['right'].append(cases[invalid])
+    assert device.initial_hand_reference()[0] is None
+    device.restart_preparation()
+    assert device.initial_hand_reference()[0] is None
 
 
 def test_hand_packets_cannot_change_body_or_inject_imu(device):
@@ -302,3 +307,49 @@ def test_absolute_palm_targets_and_step_filter_apply_to_both_sides(device,side):
     assert Rotation.from_matrix(result @ previous.T).magnitude() <= np.deg2rad(2.01)
     device._compose_wrist_rotation(side,None,full_target=True)
     np.testing.assert_allclose(device.wrist_rotations[side],local,atol=1e-6)
+
+@pytest.mark.parametrize('sides', [('left',), ('right',), ('left', 'right')])
+@pytest.mark.parametrize('with_hand', [False, True])
+def test_initial_reference_locks_one_body_frame_atomically(device, sides, with_hand):
+    from unittest.mock import Mock
+    from esrobo_laptop.orientation import ForearmFrame
+    now = time.monotonic()
+    device.sides, device.with_hand = sides, with_hand
+    device.restart_preparation()
+    points = dict(shoulder=np.array([0., 1., 0.]), elbow=np.zeros(3), wrist=np.array([1., 0., 0.]))
+    device._current_arm_points = lambda _: points
+    device._current_wrist_matrix = lambda _: (np.eye(4), None)
+    device._record_reference_diagnostic = Mock()
+    carrier = ForearmFrame().update(points)
+    device._calibration_palm = Mock(return_value=(carrier, now, 1))
+    device.incoming_body_stamps = {f'{s}_arm': now for s in sides}
+    # No elapsed countdown, body sample window, or palm history is required.
+    if len(sides) == 2:
+        device.incoming_body_stamps['right_arm'] = now-.2
+        device._update_auto_reference(now)
+        assert not device._reference_locked and not device.wrist_references
+        assert device._reference_left_points is None
+        device.incoming_body_stamps['right_arm'] = now
+    device._update_auto_reference(now)
+    assert device._reference_locked
+    assert set(device.wrist_references) == (set(sides) if with_hand else set())
+    for side in sides:
+        np.testing.assert_array_equal(getattr(device, f'_reference_{side}_points')['wrist'], points['wrist'])
+    points['wrist'][0] = 2
+    device._update_auto_reference(now+.01)
+    for side in sides:
+        assert getattr(device, f'_reference_{side}_points')['wrist'][0] == 1
+    assert device._record_reference_diagnostic.call_count == len(sides)
+
+
+def test_invalid_palm_does_not_partially_lock_reference(device):
+    from unittest.mock import Mock
+    device.restart_preparation()
+    now = time.monotonic()
+    device.incoming_body_stamps = {f'{s}_arm': now for s in device.sides}
+    device._current_arm_points = lambda _: dict(shoulder=np.zeros(3), elbow=np.ones(3), wrist=np.ones(3)*2)
+    device._current_wrist_matrix = lambda _: (np.eye(4), None)
+    device._calibration_palm = Mock(side_effect=ValueError('invalid palm'))
+    device._update_auto_reference(now)
+    assert not device._reference_locked and not device.wrist_references
+    assert device._reference_left_points is None

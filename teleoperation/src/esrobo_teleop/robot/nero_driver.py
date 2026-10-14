@@ -334,10 +334,25 @@ class NeroArm:
             return False
         previous_push = mode.enable_can_push
         previous_move_mode = mode.move_mode
+        monitor = getattr(self, "_send_monitor", None)
+        before = monitor.attempts if monitor is not None else None
+        self.feedback_request_diagnostic = dict(
+            sdk_driver=type(self._robot).__module__ + "." + type(self._robot).__name__,
+            socket_send_returned=False)
         try:
             mode.enable_can_push = 0x01
             mode.move_mode = 0xFF
             send_mode()
+            if monitor is not None:
+                frame = monitor.snapshot().get("last_frame") or {}
+                sent = (monitor.attempts > before and frame.get("can_id") == 0x151
+                        and frame.get("outcome") == "socket_send_returned")
+                self.feedback_request_diagnostic.update(
+                    socket_send_returned=sent, frame=dict(frame))
+                # Some SDK implementations silently skip an unsupported
+                # message. A method return alone is not a telemetry request.
+                if not sent:
+                    return False
         finally:
             mode.enable_can_push = previous_push
             mode.move_mode = previous_move_mode
@@ -1475,7 +1490,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             self._return_cancel.wait(min(.005, remaining))
         return False
 
-    def _verify_disabled_estop_recovery_candidate(self, current) -> tuple[bool, str]:
+    def _verify_disabled_estop_recovery_candidate(self, current, *, check_geometry=True) -> tuple[bool, str]:
         """Recognize a lone inherited electronic stop without changing hardware."""
         values = np.asarray(current, dtype=np.float64).reshape(-1)
         if values.shape != (7,) or not np.all(np.isfinite(values)):
@@ -1501,7 +1516,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             return False, f"driver-state verification failed: {exc}"
         if residual is not None:
             return False, f"another controller/driver fault remains: {residual}"
-        if not self._check_physical_path(values, values):
+        if check_geometry and not self._check_physical_path(values, values):
             return False, "current pose failed collision check"
         return True, ""
 
@@ -1526,15 +1541,40 @@ class NeroSingleArmDriver(NeroDualArmDriver):
         """
         if cancelled():
             raise RuntimeError("cancelled before disabled controller recovery")
+        # A disable/transport restart can stop CAN reporting. Explicit recovery
+        # may request telemetry again, but must never infer an enabled state,
+        # reset a silent controller or send a known-pose wake target.
+        fault = self._arm.controller_fault(allow_disabled=True)
+        missing_categories = ("controller_feedback_stale", "driver_feedback_stale")
+        if (self._arm.get_joint_enable_states() is None
+                or fault is not None and fault.get("category") in missing_categories):
+            if not self._arm.request_can_feedback_push():
+                raise RuntimeError("CAN telemetry request unavailable; controller feedback remains missing")
+            deadline = time.monotonic() + self._cfg.controller_status_timeout_s
+            while True:
+                if cancelled() or self._return_cancel.is_set():
+                    raise RuntimeError("cancelled while restoring controller feedback")
+                fault = self._arm.controller_fault(allow_disabled=True)
+                if (self._arm.get_joint_enable_states() is not None
+                        and (fault is None or fault.get("category") not in missing_categories)):
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("controller feedback still missing after CAN telemetry request; "
+                                       "verify power, CAN connection and interface mapping; no reset or motion sent")
+                self._return_cancel.wait(min(.02, remaining))
         current = self.read_joints()
         if current is None or self._arm.get_joint_enable_states() != [False]*7:
             raise RuntimeError("fresh seven-joint disabled feedback required for controller recovery")
-        if not self._within_hard_limits(current) or not self._check_physical_path(current, current):
-            raise RuntimeError("current pose failed disabled recovery geometry/limits check")
+        # Resetting an already disabled controller does not authorize motion.
+        # Geometry admission belongs to subsequent hand/arm motion preflight;
+        # a rejected pose must not prevent clearing an isolated electronic stop.
+        if not self._within_hard_limits(current):
+            raise RuntimeError("current pose failed disabled recovery joint limits check")
         fault = self._arm.controller_fault(allow_disabled=True)
         reset_sent = False
         if fault is not None:
-            verified, reason = self._verify_disabled_estop_recovery_candidate(current)
+            verified, reason = self._verify_disabled_estop_recovery_candidate(current, check_geometry=False)
             if not verified:
                 raise RuntimeError("disabled controller recovery refused: " + reason)
             with self._trajectory_lock:
@@ -1565,8 +1605,8 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 verified_samples += 1
                 previous_stamp = stamp
                 if verified_samples >= 3:
-                    if not self._check_physical_path(actual, actual):
-                        raise RuntimeError("pose no longer certified after controller recovery")
+                    if not self._within_hard_limits(actual):
+                        raise RuntimeError("pose outside joint limits after controller recovery")
                     with self._trajectory_lock:
                         if cancelled() or self._return_cancel.is_set():
                             raise RuntimeError("cancelled before committing controller recovery")
@@ -1713,6 +1753,12 @@ class NeroSingleArmDriver(NeroDualArmDriver):
 
     def initialize_command_trajectory(self, snapshot=None):
         """Call after enable/torque settling and before allowing any following."""
+        self._motion_limit_samples = 0
+        self._motion_endpoint_count = 0
+        self._motion_limit_counts = {name: np.zeros(7, dtype=int) for name in (
+            'configured_speed_bound_active', 'acceleration_bound_active',
+            'directional_lead_braking_active', 'feedback_motion_braking_active')}
+        self.motion_limit_diagnostics = None
         if not self.command_trajectory_enabled:
             return True
         with self._trajectory_lock:
@@ -2244,6 +2290,16 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 self.last_command_skipped = True
                 return False
             held = self.last_commanded_full_urdf()
+            if held is None and getattr(self, "_first_follow_hold", False):
+                # A verified stationary entry initializes a trajectory before
+                # the first live command exists. Hold that exact seed through
+                # the normal proposal/commit path, never re-stamp/reset it.
+                state = None if self._trajectory is None else self._trajectory.state
+                if state is not None:
+                    directions, offsets = self._mapping(self._side)
+                    held = np.zeros(14)
+                    start = 0 if self._side == "left" else 7
+                    held[start:start+7] = (state.position-offsets)/directions
             if held is None:
                 return self._trajectory_fault("position-limit hold has no prior command")
             return self._command_trajectory_full_urdf(held, brake_only=True)
@@ -2429,6 +2485,26 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 position_limit_hold=bool(brake_only),
                 feedback_snapshot=None if snapshot is None else snapshot.diagnostics(),
             )
+            # Compact, per-axis cumulative limiter statistics. Full snapshots
+            # remain in the robot journal; this fits the bounded state packet.
+            names = ('configured_speed_bound_active', 'acceleration_bound_active',
+                     'directional_lead_braking_active', 'feedback_motion_braking_active')
+            stats = getattr(self, '_motion_limit_counts', {name: np.zeros(7, dtype=int) for name in names})
+            samples = getattr(self, '_motion_limit_samples', 0) + 1
+            for name in names:
+                stats[name] += np.asarray(proposed.diagnostics[name], dtype=int)
+            endpoint = getattr(self, '_motion_endpoint_count', 0) + int(proposed.diagnostics['cartesian_bound_active'])
+            self._motion_limit_counts, self._motion_limit_samples = stats, samples
+            self._motion_endpoint_count = endpoint
+            self.motion_limit_diagnostics = dict(
+                samples=samples,
+                ratios={name: np.round(value/samples, 4).tolist() for name, value in stats.items()},
+                endpoint_ratio=round(endpoint/samples, 4),
+                command_rad=np.round(full[side_slice], 6).tolist(),
+                velocity_rad_s=np.round(proposed.velocity/directions, 6).tolist(),
+                feedback_velocity_rad_s=np.round(np.asarray(proposed.diagnostics['feedback_velocity_rad_s'])/directions, 6).tolist(),
+                target_command_error_rad=np.round(targets[side_slice]-full[side_slice], 6).tolist(),
+                command_feedback_error_rad=np.round((proposed.position-current)/directions, 6).tolist())
             if getattr(self, "probe_sink", None) is not None:
                 self._emit_probe(dict(event="command_sent" if send_position else "command_held",
                                      **self.trajectory_diagnostics))
@@ -2600,16 +2676,51 @@ class NeroSingleArmDriver(NeroDualArmDriver):
         result = self.safe_return()
         return result.returned, result.disabled
 
+    def _resume_stationary_return_hold(self):
+        """Resume only a stopped committed command after a refused return plan."""
+        initial = getattr(self, "_return_start_state", None)
+        if (initial is None or self._trajectory is None
+                or self._return_cancel.is_set() or self._safety_fault_reason
+                or self._arm.get_joint_enable_states() != [True]*7
+                or np.max(np.abs(initial.velocity)) > 1e-8
+                or not self._controller_is_safe()
+                or not self._torque_is_safe(self._arm, self._side)):
+            return False
+        actual = self._return_stationary()
+        if (actual is None or self._return_cancel.is_set()
+                or not self._within_hard_limits(actual)
+                or np.any(np.abs(actual-initial.position) > self._trajectory.lead)
+                or not self._controller_is_safe()
+                or not self._torque_is_safe(self._arm, self._side)):
+            return False
+        # No target snap and no reset of a moving trajectory. Stationary
+        # feedback permits a fresh clock for the exact last committed position.
+        self._trajectory.reset(initial.position, self._arm.last_feedback_timestamp,
+                               feedback=actual)
+        directions, offsets = self._mapping(self._side)
+        full = np.zeros(14)
+        start = 0 if self._side == 'left' else 7
+        full[start:start+7] = (initial.position-offsets)/directions
+        self._last_commanded_full_urdf = full
+        self._last_command_feedback_timestamp = float(self._arm.last_feedback_timestamp)
+        self._command_velocity[self._side] = np.zeros(7)
+        self._cycle_feedback = None
+        self._first_follow_hold = True
+        self._return_inhibited = False
+        return True
+
     def safe_return(self, *, recover=False, request_id=None, handover_goal=None,
                     on_approach=lambda: None, arm_only_collision=False,
                     stationary_hand_check=None,
-                    recognize_inherited_stop=False):
+                    recognize_inherited_stop=False, preserve_hold=False):
         from .return_planner import ReturnPlanner, ReturnResult
         if not self._return_lock.acquire(blocking=False):
             return ReturnResult(False, False, "busy", "return already running")
         self._entry_arm_only_collision = bool(arm_only_collision or handover_goal is not None)
         self._entry_hand_stationary_check = stationary_hand_check
         self._return_execution_failure = None
+        self.return_hold_preserved = False
+        hold_was_healthy = not (getattr(self, '_return_inhibited', False) or self._safety_fault_reason)
         if request_id is None:
             request_id = self.prepare_return()
         stage = "preflight"
@@ -2623,6 +2734,12 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             self.last_return_result = result
             if not returned:
                 self._return_inhibited = True
+                if (preserve_hold and not recover and hold_was_healthy
+                        and stage in ('preflight', 'planning')):
+                    try:
+                        self.return_hold_preserved = self._resume_stationary_return_hold()
+                    except Exception:
+                        self.return_hold_preserved = False
             self._emit_probe(dict(event="return_result", **result.__dict__,
                 collision=getattr(getattr(self, "_collision_guard", None), "last_diagnostics", None)))
             print(f"[{self._side}-arm] RETURN {stage}: {reason or 'zero verified'}; "

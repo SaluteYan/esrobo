@@ -352,8 +352,10 @@ def test_actual_mesh_certificates_preserve_acceptance_and_rejection():
     from esrobo_teleop.ik.solver import IkSolver
     cfg = build_config().ik
     cfg.urdf_path = str(Path(__file__).resolve().parents[1]/'urdf/esrobo_waist_with_head.urdf')
-    # Recorded rejection is a 30 mm fixture, independent of runtime defaults.
-    g = TorsoCollisionGuard(IkSolver(cfg),'left',margin=.03,include_fingers=False)
+    # The original palm hull has 49.56 mm clearance at the recorded pose.
+    # A 60 mm test margin makes this a genuine rejection with the new geometry,
+    # independent of the runtime 10 mm default and old 27.61 mm box distance.
+    g = TorsoCollisionGuard(IkSolver(cfg),'left',margin=.06,include_fingers=False)
     a, b = np.zeros(14), np.zeros(14)
     b[0] = .001
     assert g(a,b)

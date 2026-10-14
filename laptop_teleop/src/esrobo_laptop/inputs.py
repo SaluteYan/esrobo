@@ -51,62 +51,70 @@ class FreshBodyDevice(BodyDevice):
         super().__init__(cfg, active_arm_side=sides[0] if len(sides) == 1 else None)
 
     def _update_auto_reference(self, now):
-        if self.reference_capture_enabled:
-            was_locked = self._reference_locked
-            palms = {}
-            if not was_locked and self.with_hand and not self.hand_only:
-                try:
-                    for side in self.sides:
-                        palms[side] = self._calibration_palm(side, now)
-                except ValueError as exc:
-                    # Do not lock an arm reference with an uncalibrated or
-                    # asynchronous palm. Restart the stable sampling window.
-                    self._reference_samples_left.clear()
-                    self._reference_samples_right.clear()
-                    self._reference_sample_times.clear()
-                    self._reference_start_time = None
-                    self.last_rejection = str(exc)
-                    self._print_reference_prompt("palm", 0, f"掌面标定等待：{exc}")
-                    return
-            super()._update_auto_reference(now)
-            if not was_locked and self._reference_locked and self.with_hand:
-                # Capture both factors from the same accepted body frame.
-                # Averaged arm points and a later wrist quaternion cannot be
-                # used as if they represented a simultaneous local pose.
-                for side in self.sides:
-                    source = self._source_side_for_target(side)
-                    points = self._current_arm_points(source)
-                    wrist, _ = self._current_wrist_matrix(source)
-                    if points is not None and wrist is not None:
-                        palm, stamp, sequence = palms[side]
-                        reference = AbsoluteHandOrientation(points, wrist[:3, :3], palm_rotation=palm)
-                        self.wrist_references[side] = reference
-                        record = dict(event="palm_calibrated", side=side,
-                                      frame="waist_local" if self._cfg.auto_start_reference_require_waist else "robot_world",
-                                      body_sample_monotonic=self.incoming_body_stamps[f"{side}_arm"],
-                                      hand_sample_monotonic=stamp, hand_sequence=sequence,
-                                      pair_gap_ms=1000*abs(stamp-self.incoming_body_stamps[f"{side}_arm"]),
-                                      palm_basis=palm.tolist(),
-                                      palm_normal_forearm=(reference.forearm.rotation.T @ palm[:, 0]).tolist(),
-                                      palm_reference_clock_deg=(None if reference.palm_reference_clock is None else
-                                                                float(np.degrees(reference.palm_reference_clock))))
-                        path = getattr(self, "_reference_diagnostic_path", None)
-                        if path is not None:
-                            self._write_reference_record(path, record)
-                        self._diagnostic_print(f"[PICO 首帧姿态] {side}: 绝对掌面目标已采集，Body/Hand 间隔 {record['pair_gap_ms']:.1f} ms", flush=True)
+        """Atomically lock one valid initial pose; no stability/countdown gate."""
+        if not self.reference_capture_enabled or self._reference_locked or self.hand_only:
+            return
+        points, wrists, palms, references = {}, {}, {}, {}
+        try:
+            for side in self.sides:
+                stamp = self.incoming_body_stamps.get(f"{side}_arm")
+                if stamp is None or not 0 <= now-stamp <= .1:
+                    raise ValueError(f"{side} 缺少新鲜 Body 数据")
+                source = self._source_side_for_target(side)
+                current = self._current_arm_points(source)
+                if current is None:
+                    raise ValueError(f"{side} 缺少完整肩肘腕或腰部数据")
+                points[side] = {key: value.copy() for key, value in current.items()}
+                wrist, _ = self._current_wrist_matrix(source)
+                if wrist is not None:
+                    wrists[side] = checked_rotation(wrist[:3, :3]).copy()
+                if self.with_hand:
+                    if wrist is None:
+                        raise ValueError(f"{side} 缺少有效手腕姿态")
+                    palms[side] = self._calibration_palm(side, now)
+                    references[side] = AbsoluteHandOrientation(
+                        points[side], wrists[side], palm_rotation=palms[side][0])
+        except ValueError as exc:
+            self.last_rejection = str(exc)
+            self._print_reference_prompt("data", 0, f"初始位姿采集等待：{exc}")
+            return
+        # Validate every selected side before publishing any part of the reference.
+        for side in self.sides:
+            setattr(self, f"_reference_{side}_points", points[side])
+        self._reference_wrist_rotations.update(wrists)
+        self.wrist_references.update(references)
+        self._reference_locked = True
+        for side in self.sides:
+            body_stamp = self.incoming_body_stamps[f"{side}_arm"]
+            self._record_reference_diagnostic(
+                "calibrated", side, points[side], points[side], 1, 0., body_stamp, now)
+            if side in references:
+                palm, stamp, sequence = palms[side]
+                reference = references[side]
+                record = dict(event="palm_calibrated", side=side,
+                              frame="waist_local" if self._cfg.auto_start_reference_require_waist else "robot_world",
+                              body_sample_monotonic=body_stamp,
+                              hand_sample_monotonic=stamp, hand_sequence=sequence,
+                              pair_gap_ms=1000*abs(stamp-body_stamp), palm_basis=palm.tolist(),
+                              palm_normal_forearm=(reference.forearm.rotation.T @ palm[:, 0]).tolist(),
+                              palm_reference_clock_deg=(None if reference.palm_reference_clock is None else
+                                                        float(np.degrees(reference.palm_reference_clock))))
+                path = getattr(self, "_reference_diagnostic_path", None)
+                if path is not None:
+                    self._write_reference_record(path, record)
+                self._diagnostic_print(f"[PICO 首帧姿态] {side}: 绝对掌面目标已采集，Body/Hand 间隔 {record['pair_gap_ms']:.1f} ms", flush=True)
+        self._diagnostic_print(
+            "[PICO 标定] 完成：有效初始位姿已锁定；系统将自动检查目标与接管路径。", flush=True)
 
     def _calibration_palm(self, side, now):
         """Use landmarks from the nearest fresh Hand frame, in Body's frame."""
-        from scipy.spatial.transform import Rotation
-        history = [s for s in self.palm_history[side] if 0 <= now-s[0] <= .6]
-        if len(history) < 12:
-            raise ValueError(f"{side} 需要连续 12 帧有效掌面，请自然张手并保持稳定")
+        history = self.palm_history[side]
+        if not history:
+            raise ValueError(f"{side} 等待有效掌面数据")
         body_stamp = self.incoming_body_stamps[f"{side}_arm"]
         stamp, palm, sequence = min(history, key=lambda s: abs(s[0]-body_stamp))
         if not 0 <= now-stamp <= .1 or abs(stamp-body_stamp) > .04:
             raise ValueError(f"{side} Body/Hand 掌面采样不同步（要求 ≤40 ms）")
-        if max(Rotation.from_matrix(palm.T @ s[1]).magnitude() for s in history) > np.deg2rad(5.):
-            raise ValueError(f"{side} 掌面仍在移动，请保持手腕和手掌稳定")
         # Landmark axes are world vectors: left-multiply the source basis
         # change, without quaternion's right-side conjugation.
         transformed = self._rotation @ palm
@@ -250,7 +258,10 @@ class FreshBodyDevice(BodyDevice):
     def _commit_batch(self, payloads):
         body, hands = None, {}
         for payload in payloads:
-            prepared = self._decode_input(payload)
+            # Validate each component before selection, but transform only the
+            # surviving Body. Bursty delivery must not spend control CPU on
+            # coordinate conversions for snapshots that will be coalesced.
+            prepared = self._decode_input(payload, transform=False)
             if prepared is None:
                 continue
             kind, data = prepared
@@ -273,6 +284,8 @@ class FreshBodyDevice(BodyDevice):
         if hands:
             self._commit_input(('pico_hand', hands))
         if body is not None:
+            message, _, stamps, status = body
+            body = (message, self._decode_frames(message), stamps, status)
             self._commit_input(('pico', body))
 
     def _handle_packet(self, payload):
@@ -280,7 +293,7 @@ class FreshBodyDevice(BodyDevice):
         if prepared is not None:
             self._commit_input(prepared)
 
-    def _decode_input(self, payload):
+    def _decode_input(self, payload, *, transform=True):
         self.receive_counts['packets'] += 1
         try:
             message = json.loads(payload)
@@ -325,7 +338,7 @@ class FreshBodyDevice(BodyDevice):
             needed = {'waist'} | {f'{s}_{part}' for s in source_sides
                                   for part in ('shoulder', 'elbow', 'wrist')}
             body_message = {"frames": {k:v for k,v in message["frames"].items() if k in needed}}
-            parsed_frames = self._decode_frames(body_message)
+            parsed_frames = self._decode_frames(body_message) if transform else None
             return kind, (body_message, parsed_frames, updates, message.get('pico_hand_status'))
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             self.receive_counts['rejected'] += 1
@@ -427,36 +440,24 @@ class FreshBodyDevice(BodyDevice):
                 history.clear()
             for history in self.palm_history.values():
                 history.clear()
-            self.last_rejection = "等待完整 PICO 追踪与自然张手准备姿态"
+            self.last_rejection = "等待有效 PICO 初始位姿"
 
-    def natural_open_hand_reference(self, window_s=.6, min_samples=12):
-        """Return stable PICO hand baselines after a comfortable open-hand pose."""
+    def initial_hand_reference(self):
+        """Capture valid finger angles without requiring an open or steady hand."""
         if not self.with_hand:
             return {}, ""
         now = time.monotonic()
         references = {}
         with self.input_lock:
-            history = {side: tuple((stamp, values.copy()) for stamp, values in samples)
-                       for side, samples in self.hand_history.items()}
-        # PICO active-joint order: thumb pitch plus the four finger flexions.
-        flexion_indices = np.asarray([2, 4, 5, 7, 9], dtype=int)
-        from esrobo_teleop.robot.linker_hand_driver import ACTIVE_HAND_JOINTS, ACTIVE_JOINT_LIMITS_RAD
-        upper = np.asarray([ACTIVE_JOINT_LIMITS_RAD[name][1] for name in ACTIVE_HAND_JOINTS])
-        limits = upper[flexion_indices] * np.asarray([.65, .28, .28, .28, .28])
-        for side in self.sides:
-            samples = [values for stamp, values in history[side]
-                       if 0 <= now-stamp <= window_s]
-            if len(samples) < min_samples:
-                return None, f"等待{side}手连续自然张开（{len(samples)}/{min_samples} 帧）"
-            values = np.stack(samples)
-            median = np.median(values, axis=0)
-            if np.any(median[flexion_indices] > limits):
-                return None, f"{side}手尚未自然张开，请伸展拇指和四指"
-            maximum_std = float(np.max(np.std(values[:, flexion_indices], axis=0)))
-            if maximum_std > .04:
-                return None, f"{side}手仍在移动，请自然张开并保持稳定"
-            references[side] = median
-        return references, "PICO 已检测到自然张手"
+            for side in self.sides:
+                history = self.hand_history[side]
+                if not history or not 0 <= now-history[-1][0] <= .1:
+                    return None, f"等待{side}手有效新鲜数据"
+                values = np.asarray(history[-1][1], dtype=float)
+                if values.shape != (10,) or not np.isfinite(values).all():
+                    return None, f"{side}手关节数据无效"
+                references[side] = values.copy()
+        return references, "PICO 有效初始手部姿态已采集"
 
     def ticket(self, max_age, *, require_reference=True):
         """Must be called under input_lock; no cached frame is a new sample."""
@@ -478,9 +479,9 @@ class FreshBodyDevice(BodyDevice):
         """Freeze receiver-owned inputs; retarget on the control thread.
 
         A shallow calculation view does not initialize a device or subscription.
-        Locked references and filter dictionaries belong to the single control
-        thread after calibration; only receiver-owned frames/history/clocks are
-        copied. Preparation/reset also runs on that same control thread.
+        Wrist filters are candidates until the controller accepts this frame.
+        Rejected recovery frames must not move the committed wrist filter.
+        Preparation/reset also runs on the same control thread.
         """
         with self.input_lock:
             ticket = self.ticket(max_age)
@@ -508,12 +509,27 @@ class FreshBodyDevice(BodyDevice):
                     view.palm_history[side] = ((t, palm.copy(), sequence),)
             view._hand_joint_targets = (None if self._hand_joint_targets is None
                                         else self._hand_joint_targets.copy())
+        # These small objects are control-owned. Copy outside the receiver lock;
+        # never deepcopy the device, socket, or receiver histories.
+        view.wrist_references = copy.deepcopy(self.wrist_references)
+        view.wrist_rotations = dict(self.wrist_rotations)
+        view.wrist_input_diagnostics = dict(self.wrist_input_diagnostics)
         try:
             poses = view.advance(full_target=full_target)
             if poses is None:
                 raise InputUnavailable('retargeting not ready')
             poses['hand_local_orientations'] = {
                 s:r.copy() for s,r in view.wrist_rotations.items()}
+            poses['hand_source_orientations'] = {
+                s:r.source_local.copy() for s,r in view.wrist_references.items()}
+            poses['_wrist_filter_candidates'] = view.wrist_references
+            self.wrist_input_diagnostics = view.wrist_input_diagnostics
+            # The nearest paired palm can be older than the latest finger
+            # sample. Include its actual clock in the post-IK age check too.
+            for side, values in view.wrist_input_diagnostics.items():
+                stamp = values.get('comparison_hand_sample_monotonic')
+                if stamp is not None:
+                    ticket[side+'_palm'] = stamp
             # Arrival continuity must refer to the very same Body snapshot as
             # this ticket, even if the receiver commits another frame meanwhile.
             poses['entry_sources'] = {}
@@ -534,6 +550,16 @@ class FreshBodyDevice(BodyDevice):
                              '_previous_left_pose', '_previous_right_pose',
                              '_previous_left_elbow_pose', '_previous_right_elbow_pose'):
                     setattr(self, name, getattr(view, name))
+
+    def commit_wrist_filters(self, poses, sides):
+        """Called only after send/preview acceptance, never for input holds."""
+        if poses is None:
+            return
+        for side in sides:
+            reference = poses.get('_wrist_filter_candidates', {}).get(side)
+            if reference is not None:
+                self.wrist_references[side] = reference
+                self.wrist_rotations[side] = reference.filtered.copy()
 
     def close(self):
         super().close()

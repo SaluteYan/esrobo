@@ -54,21 +54,23 @@ robot:
   # Startup preflight and all slow return planning/execution keep the guard.
   teleop_torso_collision_enabled: false
   collision_package_dirs: []  # also search model/urdf beside the workspace
-  torso_collision_margin_m: 0.02  # 20 mm torso clearance
+  torso_collision_margin_m: 0.01  # 10 mm clearance using original mesh convex hulls
   shoulder_collision_margin_m: 0.005  # installed link2/waist3 attachment clearance
   # Initial full-arm J1..J7 commissioning limits. Velocity is rad/s,
   # acceleration is rad/s^2, and step is rad per accepted feedback update.
   max_joint_step: [0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633]
   max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.418879, 0.418879, 0.418879, 0.418879]
-  max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 0.872665, 0.872665, 0.872665]
+  # 2026-10-14: J5-J7 acceleration 100 deg/s^2; 24 deg/s and 1.5 deg lead retained.
+  # Offline-tuned from wrist telemetry; new acceleration needs hardware validation.
+  max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329]
   # Second-stage commissioning limits used by the single-arm PICO paths.
   left_max_joint_step: [0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633]
   left_max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.523599, 0.418879, 0.418879, 0.418879]
-  left_max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 0.872665, 0.872665, 0.872665]
+  left_max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329]
   right_max_joint_step: [0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633]
-  # Both J4 joints: 30 deg/s; acceleration and all other axes unchanged.
+  # Both J4 joints: 30 deg/s; both wrist acceleration overrides match the common limits.
   right_max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.523599, 0.418879, 0.418879, 0.418879]
-  right_max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 0.872665, 0.872665, 0.872665]
+  right_max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329]
   synchronize_joint_motion: false
   # Both single-arm and arm+hand entries use the same bounded command trajectory.
   left_command_trajectory_enabled: true
@@ -80,19 +82,25 @@ robot:
   # Resume only after two consecutive fresh frames and a complete safety recheck.
   runtime_feedback_recovery_timeout_s: 0.3
   command_trajectory_lead_timeout_s: 2.0
+  # Commissioned hold capability gates widened input recovery; no speed change.
+  # 2026-10-13: supervised ACTIVE -> HOLD_LATCHED, client exit, >=15 s
+  # position hold verified with onsite no-drop observation (left arm).
+  left_input_recovery_verified: true
+  right_input_recovery_verified: false
   joint_sync_error_deadband_deg: 0.05
   # Initial full-arm commissioning envelope in URDF coordinates (J1..J7).
-  # deg lower=[-60,-75,-90,-8,-150,-38,-80]
-  # deg upper=[ 60,  7, 90,85, 150, 50, 80]
-  joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -1.570796, -0.139626, -2.617994, -0.663225, -1.396263]
-  joint_soft_upper_limits_urdf: [1.047198, 0.122173, 1.570796, 1.483530, 2.617994, 0.872665, 1.396263]
+  # deg lower=[-75,-75,-90,-8,-150,-38,-80]
+  # deg upper=[ 75,  7, 90,85, 150, 50, 80]
+  joint_soft_lower_limits_urdf: [-1.308997, -1.308997, -1.570796, -0.139626, -2.617994, -0.663225, -1.396263]
+  joint_soft_upper_limits_urdf: [1.308997, 0.122173, 1.570796, 1.483530, 2.617994, 0.872665, 1.396263]
   # 2026-10-05: wrist J5 +/-150, J6 -38/+50, J7 +/-80 deg; inside URDF/SDK margins.
   # URDF J3: left [-150,+90] deg; right [-90,+150] deg. Both J4: [-8,+120] deg.
-  left_joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -2.617994, -0.139626, -2.617994, -0.663225, -1.396263]
-  left_joint_soft_upper_limits_urdf: [1.047198, 0.122173, 1.570796, 2.094395, 2.617994, 0.872665, 1.396263]
-  right_joint_soft_lower_limits_urdf: [-1.047198, -1.308997, -1.570796, -0.139626, -2.617994, -0.663225, -1.396263]
+  # 2026-10-14: both arms J1 soft travel unified to -75/+75 deg.
+  # Local configuration change; installed-arm sweep still needs validation.
+  left_joint_soft_lower_limits_urdf: [-1.308997, -1.308997, -2.617994, -0.139626, -2.617994, -0.663225, -1.396263]
+  left_joint_soft_upper_limits_urdf: [1.308997, 0.122173, 1.570796, 2.094395, 2.617994, 0.872665, 1.396263]
+  right_joint_soft_lower_limits_urdf: [-1.308997, -1.308997, -1.570796, -0.139626, -2.617994, -0.663225, -1.396263]
   # Right J1 positive rotation carries the arm forward (+X in the URDF).
-  # 2026-10-03: expand forward soft travel from +60 to +75 deg.
   right_joint_soft_upper_limits_urdf: [1.308997, 0.122173, 2.617994, 2.094395, 2.617994, 0.872665, 1.396263]
   max_joint_deviation_from_start: 0.0  # legacy uniform limit; disabled in favor of per-joint limits
   # SenseGlove pilot: only terminal physical joints 5/6/7 control hand orientation.

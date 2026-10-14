@@ -43,6 +43,7 @@ __pycache__/
 
 # Local debug notes
 debug_cmd.txt
+.deploy-backups/
 
 # Teleoperation machine-local dependencies and device state
 teleoperation/external/

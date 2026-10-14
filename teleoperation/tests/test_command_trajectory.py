@@ -68,6 +68,9 @@ class TrajectoryTests(unittest.TestCase):
             with self.subTest(timestamp=case['unix_ns']):
                 d = case['context']
                 p = planner()
+                # These historical fault frames were recorded at 50 deg/s^2.
+                # Replay their original envelope, independent of later tuning.
+                p.amax[4:] = .872665
                 p.state = TrajectoryStep(np.array(d['previous_command_physical_rad']),
                                          np.array(d['previous_velocity_physical_rad_s']),
                                          d['previous_command_stamp_s'], np.full(7, np.nan), {})
@@ -80,6 +83,40 @@ class TrajectoryTests(unittest.TestCase):
                 for key in ('feasible_velocity_lower_rad_s', 'feasible_velocity_upper_rad_s'):
                     np.testing.assert_allclose(caught.exception.diagnostics[key], d[key], atol=1e-12)
                 json.dumps(caught.exception.diagnostics, allow_nan=False)
+
+    def test_wrist_acceleration_tuning_reduces_settling_with_same_speed_and_lead(self):
+        for side in ('left', 'right'):
+            for tau in (.03, .05, .08):
+                with self.subTest(side=side, servo_response_s=tau):
+                    cfg = build_config().robot
+                    results = []
+                    for old in (True, False):
+                        acceleration = np.array(getattr(cfg, side+'_max_joint_acceleration'))
+                        if old:
+                            acceleration[4:] = np.deg2rad(50.)
+                        p = CommandTrajectory(getattr(cfg, side+'_max_joint_velocity'), acceleration,
+                                              getattr(cfg, side+'_max_joint_step'),
+                                              np.deg2rad(cfg.command_trajectory_lead_deg))
+                        p.reset(np.zeros(7), 0.)
+                        feedback, target = np.zeros(7), np.zeros(7)
+                        target[4:] = np.deg2rad(30 if side == 'left' else -30)
+                        stamp = 0.
+                        settled = None
+                        for i in range(250):
+                            dt = (.015, .02, .025)[i % 3]
+                            stamp += dt
+                            # First-order actuator approximation, not hardware proof.
+                            feedback += (p.state.position-feedback)*(1-np.exp(-dt/tau))
+                            before = p.state
+                            proposed = p.propose(target, feedback, stamp, -np.ones(7),
+                                                 np.ones(7), linear_fk, .22)
+                            self.assert_limits(p, before, proposed, feedback, dt)
+                            p.commit(proposed)
+                            if settled is None and np.max(abs(target-feedback)) < np.deg2rad(1.5):
+                                settled = stamp
+                        self.assertIsNotNone(settled)
+                        results.append(settled)
+                    self.assertLess(results[1], .85*results[0])
 
     def test_reset_held_command_uses_actual_feedback_for_motion_history(self):
         p = planner()
@@ -490,6 +527,38 @@ class DriverTrajectoryTests(unittest.TestCase):
                       "feedback_urdf_rad", "velocity_urdf_rad_s", "lead_rad"):
             self.assertEqual(len(driver.trajectory_diagnostics[field]), 7)
         self.assertIn("feedback_j4_deg_at_send", driver.elbow_command_diagnostics)
+
+    def test_waiting_entry_hold_keeps_trajectory_current_without_reset(self):
+        from esrobo_link.backends import HardwareBackend
+        for side in ('left', 'right'):
+            with self.subTest(side=side):
+                driver = self.driver(side)
+                backend = HardwareBackend.__new__(HardwareBackend)
+                backend.arm, backend.side, backend.hand_only = driver, side, False
+                backend.prepare_step = mock.Mock()
+                with mock.patch.object(driver._trajectory, 'reset', wraps=driver._trajectory.reset) as reset:
+                    # Wait 600 ms for source qualification with fresh 20 ms CAN
+                    # frames. Holding must not accumulate a 600 ms command dt.
+                    for i in range(1, 31):
+                        driver._arm.last_feedback_timestamp = 10+i*.02
+                        backend.monitor_hold()
+                        self.assertAlmostEqual(driver._trajectory.state.stamp, 10+i*.02)
+                        np.testing.assert_allclose(driver.last_commanded_full_urdf(), np.zeros(14))
+                        np.testing.assert_array_equal(driver._trajectory.state.velocity, np.zeros(7))
+                    reset.assert_not_called()
+                target = np.zeros(14)
+                target[5 if side == 'left' else 12] = .1
+                driver._arm.last_feedback_timestamp = 10.62
+                self.assertTrue(driver.command_full_urdf(target))
+                self.assertTrue(np.all(np.abs(driver._trajectory.state.velocity)
+                                       <= driver._trajectory.amax*.02+1e-9))
+
+    def test_entry_hold_does_not_hide_real_feedback_gap(self):
+        driver = self.driver('left')
+        driver._arm.last_feedback_timestamp = 10.1207
+        self.assertFalse(driver.hold_command_trajectory())
+        self.assertIn('feedback interval', driver.safety_fault_reason)
+        driver._arm.move_j.assert_not_called()
 
     def test_shared_cycle_snapshot_does_not_reread_sdk_both_sides(self):
         for side in ("left", "right"):

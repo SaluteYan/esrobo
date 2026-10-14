@@ -82,20 +82,20 @@ class Pipeline:
         self.position_limit_recovery = {side: 0 for side in self.settings.sides}
         self.initialized = False
         if self.settings.hand_only:
-            self.preparation_status = "请自然张开所选侧人手并保持稳定"
+            self.preparation_status = "请保持所选侧人手追踪，采集有效初始姿态"
         elif self.settings.with_hand:
-            self.preparation_status = "请保持完整 PICO 追踪与期望的手臂姿态，并自然张开双手"
+            self.preparation_status = "请保持完整 PICO 追踪，采集期望的初始手臂和手部姿态"
         else:
-            self.preparation_status = "请保持完整 PICO 追踪与期望的手臂姿态，尽量保持稳定"
+            self.preparation_status = "请保持完整 PICO 追踪，采集期望的初始手臂姿态"
         self._diagnostic_print(f"[遥操作准备] {self.preparation_status}", flush=True)
 
     def preparation_ready(self):
         with self.body.input_lock:
             body_ready = self.settings.hand_only or self.body.is_ready()
         if not body_ready:
-            self.preparation_status = "等待完整 PICO 数据与稳定的标定采样"
+            self.preparation_status = "等待完整有效的 PICO 初始位姿"
             return False
-        references, message = self.body.natural_open_hand_reference()
+        references, message = self.body.initial_hand_reference()
         if references is None:
             self.preparation_status = message
             return False
@@ -164,7 +164,7 @@ class Pipeline:
             return self.body.calibrated_entry_source(self.settings.side)
 
     def capture_calibrated_entry(self):
-        """Use the accepted multi-frame PICO reference as the first arm goal."""
+        """Use the accepted single-frame PICO reference as the first arm goal."""
         with self.body.input_lock:
             ticket = self.body.ticket(self.settings.input_max_age_s)
             if ticket is None:
@@ -180,6 +180,9 @@ class Pipeline:
 
     def capture(self, *, full_target=False):
         return self.body.capture_targets(self.settings.input_max_age_s, full_target=full_target)
+
+    def commit_frame(self, frame, targets):
+        self.body.commit_wrist_filters(frame[1], [s for s,t in targets.items() if not t.get('hold')])
 
     def _entry_goal_inside_limits(self, side, joints):
         """Inset only the locked first goal; never clip measured feedback."""
@@ -278,7 +281,7 @@ class Pipeline:
                         self._diagnostic_print(f"[laptop] {side.upper()} TARGET PAUSED at {label}; "
                               "robot braking/hold active. Move PICO arm back into reachable range.", flush=True)
                     else:
-                        self._diagnostic_print(f"[laptop] {side.upper()} target reachable; following resumed.", flush=True)
+                        self._diagnostic_print(f"[laptop] {side.upper()} target reachable; awaiting control admission.", flush=True)
                 return q, hold, approaching_limit
 
             q, hold, approaching_limit = solve_once(terminal)
@@ -287,11 +290,16 @@ class Pipeline:
                 # packet with no position goal. Do not expose the position
                 # IK's calibrated wrist reference as a new wrist command.
                 q = np.asarray(measured, dtype=float).copy()
+            source_terminal = None
             if wrist and not hold:
                 local = poses.get("hand_local_orientations", {}).get(side)
                 if local is None:
                     raise InputUnavailable(f"{side} absolute anatomical hand target missing")
                 terminal_target = wrist.absolute_terminal(local, q)
+                source_local = poses.get('hand_source_orientations', {}).get(side)
+                if source_local is not None:
+                    source_terminal = (terminal_target.copy() if np.array_equal(source_local, local)
+                                       else wrist.source_terminal(source_local, q))
                 if hold_entry_wrist_and_hand:
                     # The locked first goal moves J1-J5 only, even with
                     # absolute palm mapping. Live mapping remains full wrist.
@@ -325,6 +333,10 @@ class Pipeline:
                     hand = self.map_hand_target(side, hands, feedback)
             result[side] = dict(arm_urdf_rad=q[offset:offset+7].tolist(), hand_unit=hand,
                                 hold=hold, limit_approach=approaching_limit)
+            if source_terminal is not None:
+                source_arm = q[offset:offset+7].copy()
+                source_arm[4:] = source_terminal
+                result[side]['source_arm_urdf_rad'] = source_arm.tolist()
         self.check_ticket(ticket)
         return result
 

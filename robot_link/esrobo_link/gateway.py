@@ -9,7 +9,7 @@ import threading
 import time
 
 from .backends import MockBackend, MockDualBackend
-from .protocol import MAX_PACKET, ProtocolError, key_from_file, pack, unpack
+from .protocol import MAX_PACKET, ProtocolError, InputHoldTransition, key_from_file, pack, unpack
 from .session import SessionGate
 
 
@@ -114,6 +114,8 @@ class Gateway:
                          target_remaining_s=max(0.0, self.gate.deadline-now),
                          feedback=self.feedback, stop_send_returned=self.stop_send_returned,
                          disable_verified=self.disable_verified, recovery_supported=True,
+                         return_protocol=self.backend.contract.get("return_protocol"),
+                         hold_return_protocol=self.backend.contract.get("hold_return_protocol"),
                          feedback_cache_age_s=None if self.feedback_time is None else now-self.feedback_time,
                          state_send_gap_s=self.state_send_gap_s,
                          state_send_gap_max_s=self.state_send_gap_max_s,
@@ -135,6 +137,7 @@ class Gateway:
                                       and now-self.entry_candidate_since >= .5 and self.gate.fresh(now)
                                       and self.entry_matches(self.gate.target, distance=.01, joint_limit_deg=.5)))
             entry.update(self.entry_liveness(now))
+            entry.update(self.recovery_status())
             entry["entry_execution"] = self.entry_execution_diagnostics()
         if fault_event is not None:
             self.journal.write(json.dumps(fault_event, allow_nan=False) + "\n")
@@ -152,7 +155,7 @@ class Gateway:
             intentional_stop = reason.startswith(("operator requested ", "laptop requested stop"))
             if self.mode != "FAULT":
                 self.stop_pending = self.stop_pending or (not verified_disabled and self.mode in (
-                    "ACTIVE", "ARMING", "RETURNING", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET"))
+                    "ACTIVE", "HOLD_LATCHED", "ARMING", "RETURNING", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET"))
                 self.stop_send_returned = None
                 self.disable_verified = None
             if not intentional_stop and self.first_fault_reason is None:
@@ -177,11 +180,41 @@ class Gateway:
                 self.pending = None
         self.backend.cancel()  # Only sets an Event; never performs network/CAN I/O.
 
+    def input_fault(self, reason):
+        """Latch robot-owned braking without cancelling its trajectory worker.
+
+        Only commissioned endpoints may enter this state. All hardware errors
+        still go through trip(), including any failure while maintaining hold.
+        """
+        with self.lock:
+            if self.mode == 'HOLD_LATCHED':
+                return
+            if (self.mode != 'ACTIVE'
+                    or self.backend.contract.get('input_recovery_enabled') is not True):
+                self.trip(reason)
+                return
+            self.mode, self.reason = 'HOLD_LATCHED', reason
+            self.first_fault_reason = self.first_fault_reason or reason
+            self.pending = None
+
+    def recovery_status(self):
+        started = self.gate.recovery_started_at
+        phase = ('HOLD_LATCHED' if self.mode == 'HOLD_LATCHED' else
+                 'REACQUIRING' if started is not None else
+                 'INPUT_WAIT' if self.gate.hold_started_at is not None else self.mode)
+        return dict(input_recovery_protocol=self.backend.contract.get('input_recovery_protocol'),
+                    input_recovery_enabled=self.backend.contract.get('input_recovery_enabled', False),
+                    recovery_phase=phase,
+                    reacquisition_age_s=None if started is None else time.monotonic()-started)
+
     def watchdog(self):
         with self.lock:
             if (self.mode == "ACTIVE" and self.gate.hold_started_at is not None
                     and time.monotonic()-self.gate.hold_started_at > .5):
-                self.trip("input hold exceeded 500 ms; explicit local recovery required")
+                self.input_fault("input hold exceeded 500 ms; explicit local recovery required")
+            if (self.mode == 'ACTIVE' and self.gate.recovery_started_at is not None
+                    and time.monotonic()-self.gate.recovery_started_at >= 3.):
+                self.input_fault('input reacquisition exceeded 3 s; explicit local recovery required')
             if (self.mode == "CALIBRATING" and self.backend.contract.get("entry_protocol") in (1, 2, 3, 4, 5, 6)
                     and (not self.gate.fresh(time.monotonic())
                          or self.gate.target.get("entry", {}).get("phase") != "candidate")):
@@ -189,7 +222,10 @@ class Gateway:
                     self.entry_target = None
                 self.entry_candidate_since = None
             if self.mode in ("ACTIVE", "ARMING", "CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET") and not self.gate.fresh(time.monotonic()):
-                self.trip("joint target lease expired; explicit local recovery required")
+                if self.mode == 'ACTIVE':
+                    self.input_fault("joint target lease expired; explicit local recovery required")
+                else:
+                    self.trip("joint target lease expired; explicit local recovery required")
             if self.mode in ("CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET"):
                 if not self.entry_matches(self.gate.target):
                     self.trip("handover target/reference changed or input expired")
@@ -244,6 +280,17 @@ class Gateway:
                 self.shutdown.set()
             return
         with self.lock:
+            held_return = action in ('r', 'z') and self.mode == 'HOLD_LATCHED' and not getattr(self.backend, 'hand_only', False)
+            if held_return:
+                fb = self.feedback
+                age = fb.get('arm_feedback_age_s')
+                if (self.backend.contract.get('hold_return_protocol') != 1
+                        or fb.get('enable_states') != [True]*7
+                        or fb.get('controller_fault') or fb.get('driver_fault')
+                        or not isinstance(age, (int, float)) or not 0 <= age <= .1
+                        or self.feedback_time is None
+                        or not 0 <= time.monotonic()-self.feedback_time <= .1):
+                    raise RuntimeError('healthy fresh enabled feedback and hold-return protocol required; latched hold retained')
             if action == "d":
                 self.trip("operator requested disable")
                 self.disable_verified = None
@@ -282,15 +329,15 @@ class Gateway:
             elif action == "z":
                 if not getattr(self.backend, "supports_return", True):
                     raise RuntimeError("z unavailable in hand-only mode or without an inter-arm return checker; no motion sent")
-                if self.mode not in ("IDLE", "FAULT") or self.pending or self.stop_pending:
+                if self.mode not in ("IDLE", "FAULT", "HOLD_LATCHED") or self.pending or self.stop_pending:
                     raise RuntimeError("stop first and wait for stop handling before z")
                 self.cancelled.clear()
-                self.pending, self.mode = "z", "RETURNING"
+                self.pending, self.mode = ("z_hold" if held_return else "z"), "RETURNING"
             elif action == "r":
                 inherited_fault = (self.mode == "IDLE" and
                                    bool(self.feedback.get("controller_fault") or
                                         self.feedback.get("driver_fault")))
-                if ((self.mode != "FAULT" and not inherited_fault)
+                if ((self.mode not in ("FAULT", "HOLD_LATCHED") and not inherited_fault)
                         or self.pending or self.stop_pending or self.stop_send_returned is False):
                     raise RuntimeError("recovery requires a stopped FAULT gateway")
                 if getattr(self.backend, "hand_only", False):
@@ -299,7 +346,7 @@ class Gateway:
                     self.reason = "verifying disabled arm and hand feedback without motion"
                 elif getattr(self.backend, "supports_return", True):
                     self.cancelled.clear()
-                    self.pending, self.mode = "z", "RETURNING"
+                    self.pending, self.mode = ("z_hold" if held_return else "z"), "RETURNING"
                     self.reason = "explicit single-arm recovery; verified return to zero"
                 else:
                     raise RuntimeError("dual-arm recovery requires the supervised inter-arm procedure; no motion sent")
@@ -308,6 +355,8 @@ class Gateway:
 
     def accept_command(self, message, peer, now):
         """Called under lock; a delayed keepalive cannot cross into ACTIVE."""
+        if self.mode == 'HOLD_LATCHED' and message.get('type') not in ('stop', 'close', 'input_fault'):
+            raise ProtocolError('latched hold requires explicit local recovery; target rejected')
         if message.get("type") == "hold" and self.mode != "ACTIVE":
             raise ProtocolError("hold requires an active arm session")
         token = (self.entry_plan_token if self.mode in
@@ -333,7 +382,7 @@ class Gateway:
                         now = time.monotonic()
                         if message.get("type") == "hello":
                             self.gate.hello(message, peer, now,
-                                            self.mode in ("ACTIVE", "ARMING", "RETURNING", "RECOVERING", "CALIBRATING", "CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET"))
+                                            self.mode in ("ACTIVE", "HOLD_LATCHED", "ARMING", "RETURNING", "RECOVERING", "CALIBRATING", "CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET"))
                         else:
                             kind = self.accept_command(message, peer, now)
                             if (kind == "target" and self.backend.contract.get("entry_protocol") in (1, 2, 3, 4, 5, 6)
@@ -344,6 +393,8 @@ class Gateway:
                             if kind == "stop":
                                 self.trip("laptop requested stop")
                                 self.stop_pending = True
+                            elif kind in ('close', 'input_fault'):
+                                self.input_fault('laptop input fault/session closed; explicit local recovery required')
                 except socket.timeout:
                     pass
                 except (ProtocolError, ValueError, TypeError) as exc:
@@ -370,6 +421,8 @@ class Gateway:
                                       state_send_gap_max_s=self.state_send_gap_max_s,
                                       stop_send_returned=self.stop_send_returned,
                                       disable_verified=self.disable_verified, recovery_supported=True,
+                                      return_protocol=self.backend.contract.get("return_protocol"),
+                         hold_return_protocol=self.backend.contract.get("hold_return_protocol"),
                                       rejected_packets=self.rejected_packets, last_rejection=self.last_rejection,
                                       last_return=self.last_return, entry_token=self.entry_token,
                                       entry_protocol=self.backend.contract.get("entry_protocol"),
@@ -384,6 +437,7 @@ class Gateway:
                                                    and now-self.entry_candidate_since >= .5 and self.gate.fresh(now)
                                                    and self.entry_matches(self.gate.target, distance=.01, joint_limit_deg=.5)))
                         status.update(self.entry_liveness(now))
+                        status.update(self.recovery_status())
                         status["entry_execution"] = self.entry_execution_diagnostics()
                         packet = pack(self.gate.state(now, status), self.key)
                         peer = self.gate.peer
@@ -405,6 +459,8 @@ class Gateway:
 
     def motion_cancelled(self):
         self.watchdog()
+        if self.mode == 'HOLD_LATCHED':
+            raise InputHoldTransition('input stop transferred to robot-owned hold')
         return self.cancelled.is_set() or self.shutdown.is_set()
 
     def tick(self):
@@ -515,8 +571,9 @@ class Gateway:
                     if self.motion_cancelled():
                         raise RuntimeError("enable interrupted")
                     self.mode, self.reason = "ACTIVE", "following fresh laptop targets"
-            elif operation == "z":
-                result = self.backend.return_zero(self.cancelled.is_set)
+            elif operation in ("z", "z_hold"):
+                result = (self.backend.return_zero(self.cancelled.is_set, from_hold=True)
+                          if operation == "z_hold" else self.backend.return_zero(self.cancelled.is_set))
                 with self.lock:
                     self.last_return = result
                     if not self.cancelled.is_set() and result["returned"] and result["disabled"]:
@@ -526,6 +583,10 @@ class Gateway:
                                        "zero/disable verified; local e required")
                         self.first_fault_reason, self.first_fault_summary = None, None
                         self.gate.target, self.gate.deadline = None, 0.0
+                    elif (operation == 'z_hold' and result.get('holding')
+                          and not self.cancelled.is_set()):
+                        self.mode = 'HOLD_LATCHED'
+                        self.reason = f"return planning refused; verified hold retained: {result.get('reason')}"
                     else:
                         # A failed hand-open check before/after arm return
                         # must remain FAULT, but need not re-latch E-stop on an
@@ -564,9 +625,13 @@ class Gateway:
                 if self.motion_cancelled():
                     return
                 self.backend.step(target, self.motion_cancelled)
+            if self.mode == 'HOLD_LATCHED':
+                self.backend.step({'hold': True}, lambda: self.shutdown.is_set() or self.mode != 'HOLD_LATCHED')
             feedback = self.backend.snapshot()
             with self.lock:
                 self.feedback, self.feedback_time = feedback, time.monotonic()
+        except InputHoldTransition:
+            return  # Next executor cycle brakes; do not convert an input stop to E-stop.
         except Exception as exc:
             self.trip(f"executor: {type(exc).__name__}: {exc}")
             # enable can fail after partially enabling hardware; stop even if
@@ -685,9 +750,14 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: gateway.request("q"))
     signal.signal(signal.SIGINT, lambda *_: gateway.request("q"))
     threading.Thread(target=console, name="robot-link-console", daemon=True).start()
+    retention_stopped = threading.Event()
+    if args.hardware:
+        from esrobo_teleop.debug.log_retention import start_log_maintenance
+        start_log_maintenance(Path(__file__).resolve().parents[2], retention_stopped)
     try:
         gateway.run()
     finally:
+        retention_stopped.set()
         gateway.journal.close()
         if lock_file:
             lock_file.close()
