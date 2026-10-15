@@ -45,6 +45,9 @@ __pycache__/
 debug_cmd.txt
 .deploy-backups/
 
+# Keep test directories local at any depth; do not publish them.
+tests/
+
 # Teleoperation machine-local dependencies and device state
 teleoperation/external/
 teleoperation/config/senseglove_esrobo_calibration*.json
