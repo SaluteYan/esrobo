@@ -6,6 +6,8 @@ torso dimensions or network access at runtime. All non-arm joints are assumed
 stationary at URDF zero.
 """
 import threading
+import hashlib
+import json
 import time
 import struct
 import itertools
@@ -54,8 +56,8 @@ class TorsoCollisionGuard:
     _entry_coverage_only = False
     _entry_arm_geometry_only = False
 
-    def __init__(self, solver, side, package_dirs=(), margin=0.01,
-                 shoulder_margin=0.005, *, include_fingers=True):
+    def __init__(self, solver, side, package_dirs=(), margin=0.005,
+                 shoulder_margin=0.005, *, include_fingers=True, mesh_snapshot=None):
         import pinocchio as pin
         try:
             import coal
@@ -86,36 +88,52 @@ class TorsoCollisionGuard:
         roots.append(str(Path(__file__).resolve().parents[3] / "assets"))
         # Build original STL convex hulls for every link. Temporary URDF boxes
         # carry placements into Pinocchio; collision queries use the hulls.
-        root = ET.parse(solver._cfg.urdf_path).getroot()
+        urdf_bytes = Path(solver._cfg.urdf_path).read_bytes()
+        self.proof_urdf_digest = hashlib.sha256(urdf_bytes).hexdigest()
+        root = ET.fromstring(urdf_bytes)
         collision_hulls = {}
         finger_mesh_vertices = {}
+        self.proof_mesh_snapshot = {}
         collision_links = {id(c): link.attrib["name"] for link in root.findall("link") for c in link.findall("collision")}
         for collision in root.findall(".//collision"):
             mesh = collision.find("geometry/mesh")
             if mesh is None:
                 continue
             filename = mesh.attrib["filename"]
-            if filename.startswith("package://"):
-                candidates = [Path(p) / filename.removeprefix("package://") for p in roots]
+            mesh_key = filename + '|' + mesh.get('scale', '1 1 1')
+            if mesh_snapshot is not None:
+                cached = mesh_snapshot[mesh_key]
+                center, extent, points = (np.asarray(cached[k], dtype=float)
+                                          for k in ('center', 'extent', 'points'))
+                if (center.shape != (3,) or extent.shape != (3,) or points.ndim != 2
+                        or points.shape[1] != 3 or len(points) < 4
+                        or not all(np.all(np.isfinite(v)) for v in (center, extent, points))
+                        or np.any(extent <= 0)):
+                    raise ValueError('invalid immutable collision mesh snapshot')
             else:
-                candidates = [Path(solver._cfg.urdf_path).parent / filename]
-            path = next((p for p in candidates if p.is_file()), None)
-            if path is None:
-                raise ValueError(f"missing collision mesh: {filename}; run scripts/fetch_collision_meshes.py")
-            raw = path.read_bytes()
-            count = struct.unpack_from("<I", raw, 80)[0] if len(raw) >= 84 else 0
-            if len(raw) != 84 + count * 50 or not count:
-                raise ValueError(f"expected binary STL collision mesh: {path}")
-            dtype = np.dtype([("normal", "<f4", 3), ("vertices", "<f4", (3, 3)), ("attr", "<u2")])
-            vertices = np.frombuffer(raw, dtype=dtype, count=count, offset=84)["vertices"].reshape(-1, 3)
-            scale = np.fromstring(mesh.get("scale", "1 1 1"), sep=" ")
-            bounds = np.array([vertices.min(axis=0), vertices.max(axis=0)]) * scale
-            lower, upper = bounds.min(axis=0), bounds.max(axis=0)
-            extent, center = upper - lower, (upper + lower) / 2
-            if not np.all(np.isfinite(extent)) or np.any(extent <= 0):
-                raise ValueError(f"invalid mesh bounds: {path}")
+                if filename.startswith("package://"):
+                    candidates = [Path(p) / filename.removeprefix("package://") for p in roots]
+                else:
+                    candidates = [Path(solver._cfg.urdf_path).parent / filename]
+                path = next((p for p in candidates if p.is_file()), None)
+                if path is None:
+                    raise ValueError(f"missing collision mesh: {filename}; run scripts/fetch_collision_meshes.py")
+                raw = path.read_bytes()
+                count = struct.unpack_from("<I", raw, 80)[0] if len(raw) >= 84 else 0
+                if len(raw) != 84 + count * 50 or not count:
+                    raise ValueError(f"expected binary STL collision mesh: {path}")
+                dtype = np.dtype([("normal", "<f4", 3), ("vertices", "<f4", (3, 3)), ("attr", "<u2")])
+                vertices = np.frombuffer(raw, dtype=dtype, count=count, offset=84)["vertices"].reshape(-1, 3)
+                scale = np.fromstring(mesh.get("scale", "1 1 1"), sep=" ")
+                bounds = np.array([vertices.min(axis=0), vertices.max(axis=0)]) * scale
+                lower, upper = bounds.min(axis=0), bounds.max(axis=0)
+                extent, center = upper - lower, (upper + lower) / 2
+                if not np.all(np.isfinite(extent)) or np.any(extent <= 0):
+                    raise ValueError(f"invalid mesh bounds: {path}")
+                points = _convex_vertices(vertices.astype(float) * scale - center)
+            self.proof_mesh_snapshot[mesh_key] = dict(center=center.tolist(), extent=extent.tolist(),
+                                                     points=points.tolist())
             link_name = collision_links[id(collision)]
-            points = _convex_vertices(vertices.astype(float) * scale - center)
             cloud = coal.StdVec_Vec3s()
             for point in points:
                 cloud.append(point)
@@ -132,6 +150,8 @@ class TorsoCollisionGuard:
             geometry = collision.find("geometry")
             geometry.remove(mesh)
             ET.SubElement(geometry, "box", size=" ".join(map(str, extent)))
+        self.proof_mesh_digest = hashlib.sha256(json.dumps(
+            self.proof_mesh_snapshot, sort_keys=True, allow_nan=False).encode()).hexdigest()
         self.geometry = pin.buildGeomFromUrdfString(
             self.model, ET.tostring(root).decode(), pin.GeometryType.COLLISION)
         self.geometry_data = pin.GeometryData(self.geometry)
@@ -622,10 +642,11 @@ class TorsoCollisionGuard:
                 left_end[joint] = right_start[joint] = middle[joint]
                 # A pair with d(midpoint)-margin-motion_bound > 0 was
                 # certified for this WHOLE parent box, hence for each child.
-                # Recheck only unresolved pairs during entry. Proofs never
-                # escape this locked request or cross a hand/model change.
+                # Recheck only unresolved pairs during entry or a hand-return
+                # sweep. Proofs never escape this locked request or cross a
+                # hand/model change; each root starts with all pairs.
                 child_pairs = (getattr(self, '_uncertified_pairs', None)
-                               if cache is not None else None)
+                               if cache is not None or hand_state is not None else None)
                 pending.extend(((a, left_end, child_pairs), (right_start, b, child_pairs)))
             if worst is not None:
                 self.last_diagnostics = worst

@@ -168,7 +168,7 @@ class Controller:
         self.sent = 0
         self.computed = 0
         self.preparing = False
-        self.safe_entry = contract.get("entry_protocol") in (3, 4, 5, 6) and not preview
+        self.safe_entry = contract.get("entry_protocol") in (3, 4, 5, 6, 7) and not preview
         self.entry_seed = None
         self.entry_token = ""
         self.entry_target = None
@@ -313,7 +313,7 @@ class Controller:
         if first_wide:
             current_source = InputRecovery.sources(targets)
             adjacent = (self.first_resume_source is None or
-                        InputRecovery(self.settings).within(current_source, self.first_resume_source, False)[0])
+                        InputRecovery(self.settings).within(current_source, self.first_resume_source)[0])
             self.first_resume_source = current_source
             if not adjacent:
                 diagnostic.update(reason='first active input adjacent source jump')
@@ -432,6 +432,8 @@ class Controller:
             self.last_active_target = copy.deepcopy(self.entry_target)
             self.last_active_target_at = self.entry_ready_sent_at
             self.entry_active_pending = True
+            # Legacy replay only: protocol 7 finishes the calibrated wrist
+            # stage on the gateway before ACTIVE, so it needs no live chase.
             if (state['contract'].get('entry_protocol') == 6
                     and self.settings.side in ('left', 'right') and not self.settings.hand_only):
                 self.wrist_handover = WristHandover(
@@ -489,7 +491,7 @@ class Controller:
             targets = self.pipeline.solve(
                 frame, self.entry_seed if entering else measured, feedback,
                 allow_limit_hold=(mode == "ACTIVE" and not self.preview),
-                hold_entry_wrist_and_hand=entering,
+                hold_entry_hand=entering,
             )
         else:
             targets = measured_targets(feedback, self.settings)
@@ -504,8 +506,8 @@ class Controller:
         if mode == 'ACTIVE' and self.recovery is not None:
             if any(target.get('hold') for target in targets.values()):
                 # An unreachable IK target carries measured joints for display,
-                # not a new human source pose. Keep braking without comparing
-                # that placeholder with the fixed pre-gap source anchor.
+                # not a new human source pose. Keep braking without qualifying
+                # that placeholder as a recovery source.
                 now = time.monotonic()
                 reason = 'arm target unreachable; waiting for a valid recovery source'
                 self.recovery.pause()
@@ -793,7 +795,7 @@ def main(argv=None):
             pose_instruction = "keep complete PICO arm/waist tracking and hold your chosen arm pose steady"
         journal.message(f"Click Enable once. The robot returns to zero first; then {pose_instruction}.")
         if not settings.hand_only:
-            journal.message("PICO first absolute pose plans J1-J5; J6-J7 and robot fingers stay at their measured positions until arrival. Laptop s/x/q or Ctrl+C stops and exits.")
+            journal.message("PICO calibration locks all seven joints: approach J1-J5 first, then J6-J7; fingers stay held. Live following starts after both stages arrive. Laptop s/x/q or Ctrl+C stops and exits.")
         else:
             journal.message("Hand-only mode keeps the arm disabled. Laptop s/x/q or Ctrl+C stops and exits.")
         started = time.monotonic()

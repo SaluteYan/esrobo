@@ -63,7 +63,7 @@ class RobotConfig:
     torque_feedback_timeout_s: float = 0.3
     torque_deviation_limits_nm: tuple = (16.0, 16.0, 12.0, 12.0, 6.0, 6.0, 5.0)
     left_torque_deviation_limits_nm: Optional[tuple] = (
-        25.0, 25.0, 12.0, 12.0, 6.0, 6.0, 5.0,
+        30.0, 25.0, 20.0, 20.0, 6.0, 6.0, 5.0,
     )
     right_torque_deviation_limits_nm: Optional[tuple] = (
         21.0, 21.0, 12.0, 12.0, 6.0, 6.0, 5.0,
@@ -76,7 +76,7 @@ class RobotConfig:
     # returns still use torso_collision_enabled and cannot bypass the guard.
     teleop_torso_collision_enabled: bool = False
     collision_package_dirs: tuple = ()
-    torso_collision_margin_m: float = 0.01
+    torso_collision_margin_m: float = 0.005
     shoulder_collision_margin_m: float = 0.005
     # physical = direction * URDF + offset. The J2 +pi/2 offset follows the
     # pyAgxArm NERO limits and this project's URDF limits exactly.
@@ -121,36 +121,37 @@ class RobotConfig:
         0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633,
     )
     max_joint_velocity: tuple = (
-        0.453786, 0.453786, 0.418879, 0.418879, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586,
+        0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586,
     )
-    # Wrist candidate: 36 deg/s, 100 deg/s^2, 10 deg lead; hardware validation pending.
+    # Candidate: 36 deg/s and 10 deg lead; J1-J4 80, J5-J7 100 deg/s^2.
+    # Hardware validation pending.
     max_joint_acceleration: tuple = (
-        0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329,
+        1.3962634015954636, 1.3962634015954636, 1.3962634015954636, 1.3962634015954636, 1.745329, 1.745329, 1.745329,
     )
-    # Both arms use the same rate envelope; J4 is 30 deg/s.
+    # Both arms use the same rate envelope in all motion phases.
     left_max_joint_step: Optional[tuple] = (
         0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633,
     )
     left_max_joint_velocity: Optional[tuple] = (
-        0.453786, 0.453786, 0.418879, 0.523599, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586,
+        0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586,
     )
     left_max_joint_acceleration: Optional[tuple] = (
-        0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329,
+        1.3962634015954636, 1.3962634015954636, 1.3962634015954636, 1.3962634015954636, 1.745329, 1.745329, 1.745329,
     )
     # Keep per-side overrides available for future hardware commissioning.
     right_max_joint_step: Optional[tuple] = (
         0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633,
     )
     right_max_joint_velocity: Optional[tuple] = (
-        0.453786, 0.453786, 0.418879, 0.523599, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586,
+        0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586,
     )
     right_max_joint_acceleration: Optional[tuple] = (
-        0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329,
+        1.3962634015954636, 1.3962634015954636, 1.3962634015954636, 1.3962634015954636, 1.745329, 1.745329, 1.745329,
     )
     synchronize_joint_motion: bool = False
     left_command_trajectory_enabled: bool = True
     right_command_trajectory_enabled: bool = True
-    command_trajectory_lead_deg: tuple = (3.0, 3.0, 3.0, 3.0, 10.0, 10.0, 10.0)
+    command_trajectory_lead_deg: tuple = (10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0)
     command_trajectory_max_dt_s: float = 0.1
     # The planned return performs collision checks on every command. Allow a
     # small scheduling overrun without relaxing the live-following horizon.

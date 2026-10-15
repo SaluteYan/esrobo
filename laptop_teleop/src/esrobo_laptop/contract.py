@@ -6,7 +6,7 @@ from pathlib import Path
 from esrobo_link.protocol import ProtocolError, canonical
 from esrobo_teleop.robot.linker_hand_driver import L10_PHYSICAL_JOINT_NAMES
 
-REQUIRED_ENTRY_PROTOCOL = 6
+REQUIRED_ENTRY_PROTOCOL = 7
 REQUIRED_ENTRY_KEEPALIVE_PROTOCOL = 1
 REQUIRED_INPUT_HOLD_PROTOCOL = 2
 

@@ -44,7 +44,7 @@ robot:
   # Software monitor is a slower secondary guard; controller collision ratings
   # remain the fast first layer. Right-side limits include normal gravity/dynamics.
   torque_deviation_limits_nm: [16.0, 16.0, 12.0, 12.0, 6.0, 6.0, 5.0]
-  left_torque_deviation_limits_nm: [25.0, 25.0, 12.0, 12.0, 6.0, 6.0, 5.0]
+  left_torque_deviation_limits_nm: [30.0, 25.0, 20.0, 20.0, 6.0, 6.0, 5.0]
   right_torque_deviation_limits_nm: [21.0, 21.0, 12.0, 12.0, 6.0, 6.0, 5.0]
   torque_trip_consecutive_samples: 5
   controller_status_monitor_enabled: true
@@ -54,28 +54,28 @@ robot:
   # Startup preflight and all slow return planning/execution keep the guard.
   teleop_torso_collision_enabled: false
   collision_package_dirs: []  # also search model/urdf beside the workspace
-  torso_collision_margin_m: 0.01  # 10 mm clearance using original mesh convex hulls
+  torso_collision_margin_m: 0.005  # 5 mm clearance using original mesh convex hulls
   shoulder_collision_margin_m: 0.005  # installed link2/waist3 attachment clearance
   # Initial full-arm J1..J7 commissioning limits. Velocity is rad/s,
   # acceleration is rad/s^2, and step is rad per accepted feedback update.
   max_joint_step: [0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633]
-  max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.418879, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586]
-  # 2026-10-15 candidate: J5-J7 36 deg/s, 100 deg/s^2 and 10 deg lead in all phases.
+  max_joint_velocity: [0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586]
+  # 2026-10-15 candidate: all joints 36 deg/s and 10 deg lead; J1-J4 80, J5-J7 100 deg/s^2.
   # Preparation, approach, following and return share these limits; hardware validation pending.
-  max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329]
+  max_joint_acceleration: [1.3962634015954636, 1.3962634015954636, 1.3962634015954636, 1.3962634015954636, 1.745329, 1.745329, 1.745329]
   # Second-stage commissioning limits used by the single-arm PICO paths.
   left_max_joint_step: [0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633]
-  left_max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.523599, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586]
-  left_max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329]
+  left_max_joint_velocity: [0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586]
+  left_max_joint_acceleration: [1.3962634015954636, 1.3962634015954636, 1.3962634015954636, 1.3962634015954636, 1.745329, 1.745329, 1.745329]
   right_max_joint_step: [0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633]
-  # Both J4 joints: 30 deg/s; both wrist acceleration overrides match the common limits.
-  right_max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.523599, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586]
-  right_max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329]
+  # Side overrides match the common limits for all seven joints.
+  right_max_joint_velocity: [0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586]
+  right_max_joint_acceleration: [1.3962634015954636, 1.3962634015954636, 1.3962634015954636, 1.3962634015954636, 1.745329, 1.745329, 1.745329]
   synchronize_joint_motion: false
   # Both single-arm and arm+hand entries use the same bounded command trajectory.
   left_command_trajectory_enabled: true
   right_command_trajectory_enabled: true
-  command_trajectory_lead_deg: [3, 3, 3, 3, 10, 10, 10]
+  command_trajectory_lead_deg: [10, 10, 10, 10, 10, 10, 10]
   command_trajectory_max_dt_s: 0.1
   return_command_trajectory_max_dt_s: 0.12  # planned return only; live following remains 0.1 s
   # Hold the last controller target during a brief assembled-feedback gap.

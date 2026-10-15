@@ -890,8 +890,8 @@ class Console:
                 args = self.remote.get('gateway_args', [])
                 if '--side' not in args or args[args.index('--side')+1] == 'both':
                     raise RuntimeError('双臂恢复需按现场流程操作；网页不执行未经验证的双臂回零')
-                if '--hand-only' not in args and state.get('return_protocol') != 2:
-                    raise RuntimeError('机器人网关尚未加载受检恢复版本 2；需同步代码并重启网关，不能反复发送旧版回零')
+                if '--hand-only' not in args and state.get('return_protocol') != 3:
+                    raise RuntimeError('机器人网关尚未加载手部优先受检回零版本 3；需同步代码并重启网关，不能反复发送旧版回零')
                 if '--hand-only' not in args:
                     side = args[args.index('--side')+1]
                     arm = feedback.get('sides', {}).get(side, feedback)
@@ -950,6 +950,9 @@ class Console:
     def _gateway_key(self, key, session):
         """Shared preparation checks; g is called only by automatic handover."""
         self.refresh()
+        if (key in ('e', 'z') and not self.mode.get('hand_only')
+                and self.robot_state().get('return_protocol') != 3):
+            raise RuntimeError('需要手部优先受检回零版本 3；请同步源码并安全重启网关')
         if key in ('e', 'g'):
             if WAIST_MOVED_FILE.exists():
                 raise RuntimeError('腰部曾通过页面离开竖直基准；请读取腰部反馈，确认 31/32/33 号回到 139° / 215° / 144°（±0.2°）')
@@ -1071,7 +1074,7 @@ class Console:
 
     def _maybe_auto_handover(self):
         state = self.robot_state()
-        if not (state.get('entry_protocol') in (3, 4, 5, 6) and state.get('mode') == 'CALIBRATING'
+        if not (state.get('entry_protocol') in (3, 4, 5, 6, 7) and state.get('mode') == 'CALIBRATING'
                 and state.get('entry_ready') and state.get('age_s', 999) < 1
                 and self.owner and self.running('teleop') and not self.mode['preview']
                 and time.monotonic()-self.heartbeat < 1.5

@@ -13,8 +13,16 @@ class ProtocolError(ValueError):
     pass
 
 
+class PacketTooLarge(ProtocolError):
+    """The encoded packet exceeds the transport bound, not invalid telemetry."""
+
+
 class InputHoldTransition(RuntimeError):
     """Abort an in-flight target because the gateway switched to latched hold."""
+
+
+class HoldReturnTransition(RuntimeError):
+    """Yield an in-flight hold to an accepted robot-owned checked return."""
 
 
 def key_from_file(path):
@@ -32,7 +40,7 @@ def pack(message, key):
     body = canonical(dict(message, v=VERSION))
     packet = canonical({"body": body.decode(), "mac": hmac.new(key, body, hashlib.sha256).hexdigest()})
     if len(packet) > MAX_PACKET:
-        raise ProtocolError("packet exceeds 8192 bytes; images use a separate channel")
+        raise PacketTooLarge("packet exceeds 8192 bytes; images use a separate channel")
     return packet
 
 
@@ -102,7 +110,7 @@ def validate_target(msg, contract):
     elif hand is not None:
         raise ProtocolError("hand not enabled on this endpoint")
     result = {"arm_urdf_rad": arm, "hand_unit": hand}
-    if contract.get("entry_protocol") in (1, 2, 3, 4, 5, 6):
+    if contract.get("entry_protocol") in (1, 2, 3, 4, 5, 6, 7):
         entry = msg.get("entry")
         if not isinstance(entry, dict) or entry.get("phase") not in ("idle", "candidate", "ready", "active"):
             raise ProtocolError("safe handover metadata required; update laptop and gateway together")
@@ -112,7 +120,7 @@ def validate_target(msg, contract):
         source = (vector(entry.get("source"), 9, "entry source")
                   if entry["phase"] in ("candidate", "ready") else None)
         reference_source = (vector(entry.get("reference_source"), 9, "calibrated entry source")
-                            if contract.get("entry_protocol") in (2, 3, 4, 5, 6)
+                            if contract.get("entry_protocol") in (2, 3, 4, 5, 6, 7)
                             and entry["phase"] in ("candidate", "ready") else None)
         result["entry"] = dict(phase=entry["phase"], token=token, source=source,
                                reference_source=reference_source)

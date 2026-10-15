@@ -18,7 +18,7 @@ class Pipeline:
             from scipy.optimize import least_squares
             least_squares(lambda x: x, np.zeros(1), jac=lambda _x: np.ones((1, 1)), max_nfev=1)
 
-        if (any(c.get("entry_protocol") in (2, 3, 4, 5, 6) for c in contracts.values())
+        if (any(c.get("entry_protocol") in (2, 3, 4, 5, 6, 7) for c in contracts.values())
                 and not (cfg.ik.partition_terminal_wrist_ik and cfg.ik.enable_elbow_tasks)):
             raise ValueError("safe handover requires complete partitioned endpoint IK")
         self.cfg, self.settings = cfg, settings
@@ -188,7 +188,7 @@ class Pipeline:
         """Inset only the locked first goal; never clip measured feedback."""
         limits = self._entry_limits[side]
         offset = 0 if side == 'left' else 7
-        count = 5
+        count = 7 if self.wrists.get(side) is not None else 5
         selected = slice(offset, offset+count)
         result = np.asarray(joints, dtype=float).copy()
         original = result[selected].copy()
@@ -200,7 +200,7 @@ class Pipeline:
         return result
 
     def solve(self, frame, measured, feedback, *, allow_limit_hold=False,
-              hold_entry_wrist_and_hand=False):
+              hold_entry_hand=False):
         ticket, poses, hands = frame
         if self.settings.hand_only:
             result = {}
@@ -214,10 +214,6 @@ class Pipeline:
             offset = 0 if side == "left" else 7
             wrist = self.wrists.get(side)
             terminal = (wrist.reference_terminal if wrist else measured[offset+4:offset+7])
-            if hold_entry_wrist_and_hand:
-                terminal = np.asarray(terminal, dtype=float).copy()
-                terminal[1:] = measured[offset+5:offset+7]
-
             def solve_once(terminal_target):
                 q = solver.solve(
                     poses["left_wrist"], poses["right_wrist"], measured,
@@ -300,16 +296,11 @@ class Pipeline:
                 if source_local is not None:
                     source_terminal = (terminal_target.copy() if np.array_equal(source_local, local)
                                        else wrist.source_terminal(source_local, q))
-                if hold_entry_wrist_and_hand:
-                    # The locked first goal moves J1-J5 only, even with
-                    # absolute palm mapping. Live mapping remains full wrist.
-                    terminal_target = np.asarray(terminal_target, dtype=float).copy()
-                    terminal_target[1:] = measured[offset+5:offset+7]
                 wrist.last_diagnostics.update(
                     arm_elbow_error_m=solver.solution_diagnostics.get("elbow_error_m"),
                     arm_endpoint_error_m=solver.solution_diagnostics.get("wrist_error_m"),
-                    entry_wrist_held=bool(hold_entry_wrist_and_hand),
-                    entry_hand_held=bool(hold_entry_wrist_and_hand),
+                    entry_wrist_held=False,
+                    entry_hand_held=bool(hold_entry_hand),
                     target_joint_deg=np.degrees(terminal_target).tolist(),
                 )
                 q = q.copy()
@@ -320,11 +311,11 @@ class Pipeline:
                 poses[f"{side}_wrist"][3:] = wrist.last_diagnostics["desired_world_quat_wxyz"]
             if wrist:
                 wrist.last_diagnostics["position_target_paused"] = bool(hold)
-            if hold_entry_wrist_and_hand and not hold and len(self.settings.sides) == 1:
+            if hold_entry_hand and not hold and len(self.settings.sides) == 1:
                 q = self._entry_goal_inside_limits(side, q)
             hand = None
             if self.settings.with_hand:
-                if hold_entry_wrist_and_hand or hold:
+                if hold_entry_hand or hold:
                     held = feedback[side]["hand"]["position_unit"]
                     if held is None or len(held) != 10 or not np.all(np.isfinite(held)):
                         raise InputUnavailable("fresh held hand feedback required for entry/hold")

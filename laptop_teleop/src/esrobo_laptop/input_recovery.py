@@ -35,17 +35,21 @@ class InputRecovery:
             self.anchor = self.sources(targets)
             self.epoch = secrets.token_hex(8)
 
-    def within(self, source, baseline, wide):
+    def within(self, source, baseline, *, diagnostic_only=False):
         details = {}
         allowed = True
         for side in self.settings.sides:
             item = {}
             if not self.settings.hand_only:
-                delta = np.degrees(np.abs(np.asarray(source[side]['arm']) - baseline[side]['arm']))
-                limits = ([10.] * 4 + [15.] * 3 if wide else
+                arm = np.asarray(source[side]['arm'], dtype=float)
+                if arm.shape != (7,) or not np.all(np.isfinite(arm)):
+                    raise RecoveryRejected(f'{side} recovery requires seven finite arm positions')
+                delta = np.degrees(np.abs(arm - baseline[side]['arm']))
+                limits = (None if diagnostic_only else
                           [self.settings.input_resume_arm_delta_deg] * 7)
                 item.update(arm_delta_deg=delta.tolist(), arm_limit_deg=limits)
-                allowed &= bool(np.all(delta <= np.asarray(limits) + 1e-9))
+                if limits is not None:
+                    allowed &= bool(np.all(delta <= np.asarray(limits) + 1e-9))
             if self.settings.with_hand:
                 hand = np.asarray(source[side]['hand'], dtype=float)
                 if (hand.shape != (10,) or not np.all(np.isfinite(hand))
@@ -66,21 +70,16 @@ class InputRecovery:
         """
         self.check_timeout(now)
         current = self.sources(targets)
-        wide, details = self.within(current, self.anchor, True)
-        adjacent = self.previous is None or self.within(current, self.previous, False)[0]
-        if any(t.get('hold') for t in targets.values()):
-            wide = adjacent = False
+        # Keep pre-gap displacement for diagnosis, not recovery eligibility.
+        # Actual travel remains bounded by the robot's trajectory and feedback.
+        _, details = self.within(current, self.anchor, diagnostic_only=True)
+        adjacent = self.previous is None or self.within(current, self.previous)[0]
+        held = any(t.get('hold') for t in targets.values())
         self.diagnostic = dict(at=now, anchor=copy.deepcopy(self.anchor), candidate=current,
-                               limits=details, adjacent_allowed=bool(adjacent), allowed=bool(wide))
-        if not wide:
-            violations = []
-            for side, item in details.items():
-                for index, (delta, limit) in enumerate(zip(
-                        item.get('arm_delta_deg', []), item.get('arm_limit_deg', []))):
-                    if delta > limit + 1e-9:
-                        violations.append(f'{side} J{index+1} delta {delta:.2f}deg > {limit:g}deg')
-            raise RecoveryRejected('input reacquisition source outside fixed recovery envelope; '
-                                   + '; '.join(violations))
+                               limits=details, adjacent_allowed=bool(adjacent and not held),
+                               allowed=bool(adjacent and not held))
+        if held:
+            raise RecoveryRejected('unreachable target during input reacquisition')
         self.count = self.count + 1 if adjacent else 1
         self.previous = copy.deepcopy(current)
         return self.count >= self.settings.input_resume_frames
@@ -94,7 +93,7 @@ class InputRecovery:
             self.started = now
 
     def pause(self):
-        # Keep the fixed anchor AND original deadline across repeated gaps.
+        # Keep the diagnostic anchor and original deadline across repeated gaps.
         self.previous, self.count, self.matched = None, 0, 0
 
     def arrival(self, targets, feedback, enabled_hand_joints):

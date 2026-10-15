@@ -208,8 +208,8 @@ function gatewayProtocolReady() {
     return false;
   }
   const protocol = state?.robot?.entry_protocol;
-  if (mode.side !== 'both' && !mode.hand_only && protocol !== 6) {
-    notice(`机器人网关接管协议为 ${protocol ?? '未知'}，本机需要 6。请同步机器人端 robot_link、teleoperation 源码并核对配置，安全退出旧网关后重新启动。`, true);
+  if (mode.side !== 'both' && !mode.hand_only && protocol !== 7) {
+    notice(`机器人网关接管协议为 ${protocol ?? '未知'}，本机需要 7。请同步机器人端 robot_link、teleoperation 源码并核对配置，安全退出旧网关后重新启动。`, true);
     return false;
   }
   if (mode.side !== 'both' && !mode.hand_only && state?.robot?.entry_keepalive_protocol !== 1) {
@@ -427,8 +427,8 @@ async function recoverGateway() {
   const message = handOnly
     ? '确认停止计算且机器人周围安全？将核验机械臂七轴失能和手部反馈；不会发送回零运动。'
     : heldReturn
-      ? '确认机械臂和手指周围安全且实体急停可触及？将保持使能，受检规划七关节回零，到位后失能，再受检恢复手部自然张开姿态。'
-      : '确认机械臂和手指周围安全且实体急停可触及？将核验失能，带手模式先受检恢复手部自然张开姿态，再执行七关节回零并在到位后失能。';
+      ? '确认机械臂和手指周围安全且实体急停可触及？将完成受控制动并保持机械臂使能，先受检恢复手部自然张开零位，再完成七关节回零核验，到位后失能。七轴均在配置的零位容差内时省略手指包络，仍检查臂、腕和手掌。'
+      : '确认机械臂和手指周围安全且实体急停可触及？将核验失能，带手模式先受检恢复手部自然张开姿态，再执行七关节回零并在到位后失能。七轴均在配置的零位容差内时省略手指包络，仍检查臂、腕和手掌。';
   if (!confirm(message)) return;
   const generation = ++recoveryGeneration;
   recoveryBusy = true;
@@ -452,8 +452,8 @@ $('disable-all').onclick = () => {
   }
 };
 $('enable').onclick = () => {
-  const prompt = state.robot?.entry_protocol === 6
-    ? '确认机器人和手指周围空间清空，实体急停可触及？机器人先受检回零，灵巧手保持当前姿态；首次目标只规划 J1–J5，J6–J7 和手指保持实测位置。到位后才开始完整实时跟随。请保持 PICO 追踪。'
+  const prompt = state.robot?.entry_protocol === 7
+    ? '确认机器人和手指周围空间清空，实体急停可触及？先受检恢复灵巧手自然张开零位，再执行机械臂受检回零；锁定同一次标定目标，先让 J1–J5 到位，再让 J6–J7 到位，手指保持实测位置。两段完成后才开始实时跟随。请保持 PICO 追踪。'
     : '确认机器人周围安全且实体急停可触及？当前网关仍按原流程让灵巧手张开并核验，然后回零及接管；请核对网关版本和手部状态。';
   if (confirm(prompt))
     perform('gateway_key', {key: 'e'});
@@ -553,13 +553,13 @@ function render() {
   const mode = state.processes.teleop?.running ? state.mode : options();
   $('entry-flow-hint').textContent = fresh && !inputHoldReady
     ? `当前网关输入保持协议为 ${robot.input_hold_protocol ?? '未知'}，本机需要 ${REQUIRED_INPUT_HOLD_PROTOCOL}（区分不可达目标保持与输入超时）；同步机器人端代码并在现场确认安全后重启网关，才能启动计算。`
-    : fresh && mode.side !== 'both' && !mode.hand_only && robot.entry_protocol !== 6
-    ? `当前机器人网关接管协议为 ${robot.entry_protocol ?? '未知'}，本机需要 6。预览和正式计算均无法启动；同步机器人端源码、核对配置并重启网关。`
+    : fresh && mode.side !== 'both' && !mode.hand_only && robot.entry_protocol !== 7
+    ? `当前机器人网关接管协议为 ${robot.entry_protocol ?? '未知'}，本机需要 7。预览和正式计算均无法启动；同步机器人端源码、核对配置并重启网关。`
     : fresh && mode.side !== 'both' && !mode.hand_only && robot.entry_keepalive_protocol !== 1
     ? '机器人网关缺少接近阶段保活协议 1；请同步 robot_link 并重启网关后启动计算。'
-    : robot.entry_protocol === 6
-    ? '先开始正式计算，再点击“使能并准备”。机器人手部保持原位；启动路径只让 J1–J5 运动，J6、J7 与手保持当前位置。到位后才开始完整实时跟随。启动检查只覆盖机械臂、腕部，不计算灵巧手掌体和手指包络；请确认手指周围实际空间。'
-    : '当前网关尚未加载启动阶段手部及 J6/J7 锁定流程；当前版本仍会要求灵巧手张开。更新机器人端并重启网关后使用新流程。';
+    : robot.entry_protocol === 7
+    ? '先开始正式计算，再点击“使能并准备”。机器人先受检恢复手部自然张开零位，再回臂；标定后先让 J1–J5 到达标定目标，再让 J6–J7 到达同一次标定目标；手指保持当前位置。两段到位后才开始实时跟随。启动检查只覆盖机械臂、腕部，不计算灵巧手掌体和手指包络；请确认手指周围实际空间。'
+    : '当前网关尚未加载两段标定目标接近流程。更新机器人端并重启网关后使用新流程。';
   // A dual-arm gateway reports feedback under `sides.left/right`, while a
   // single-arm gateway reports the selected side directly in `feedback`.
   // Preserve the real side name so hand geometry and arm status use the same
@@ -699,12 +699,13 @@ function render() {
         returnFailure === 'goal pose not certified safe'
           ? '零位目标未通过几何安全检查；当前手指姿态也参与检查。请查看机器人网关日志中的碰撞部位及间隙，处理原因后再重试。'
           : returnFailure
-      }${robot.last_return.arm_returned === false ? ' 机械臂七轴回零尚未开始或未完成。' : ''}${robot.last_return.disabled === true ? ' 已核验失能。' : ' 尚未核验失能，未恢复 IDLE。'}`
+      }${robot.last_return.arm_returned === false ? ' 机械臂七轴回零尚未开始或未完成。' : ''}${robot.last_return.disabled === true ? ' 已核验失能。' : ' 尚未核验失能，未恢复 IDLE。'} 详细反馈与几何诊断见机器人网关日志。`
     : '';
   $('robot-reason').textContent = state.remote_error
     || (state.auto_handover_error && robot.mode === 'CALIBRATING' ? `自动接管暂停：${state.auto_handover_error}` : '')
     || (returnFailureDetail || robot.reason)
     || '等待网关反馈';
+  if (robot.diagnostics_truncated) $('robot-reason').textContent += ' 状态包已精简诊断；完整记录见机器人网关日志。';
   renderFirstFault(robot);
   $('feedback-age').textContent = fresh ? `${Math.round((robot.age_s + (robot.feedback_cache_age_s || 0)) * 1000)} ms` : '—';
   $('compute-rate').textContent = Number.isFinite(telemetry.rates?.compute_hz) ? `${telemetry.rates.compute_hz.toFixed(1)} Hz` : '—';
@@ -824,7 +825,7 @@ function render() {
   $('control-owner').textContent = state.owner === session ? '本页面控制中' : state.owner ? '其他页面控制中' : '待启动';
   const running = Boolean(state.processes.teleop?.running);
   const entryProtocolReady = mode.side === 'both' || mode.hand_only ||
-    (robot.entry_protocol === 6 && robot.entry_keepalive_protocol === 1);
+    (robot.entry_protocol === 7 && robot.entry_keepalive_protocol === 1);
   $('mode').disabled = running || liveGateway || recoveryBusy;
   for (const id of ['preview', 'run']) $(id).disabled = running || !fresh || !inputHoldReady || !entryProtocolReady
     || robot.mode !== 'IDLE' || !armFeedbackReady;
@@ -837,7 +838,7 @@ function render() {
   if (fresh && robot.mode === 'HOLD_LATCHED') {
     $('runtime-status').textContent = '机器人端已锁存受控保持；需要人工受检恢复。保持状态须以持续新鲜反馈为准。';
   }
-  const returnProtocolReady = mode.hand_only || robot.return_protocol === 2;
+  const returnProtocolReady = mode.hand_only || robot.return_protocol === 3;
   const feedbackMissing = Object.values(members).some(value =>
     ['controller_feedback_stale', 'driver_feedback_stale'].includes(value.controller_fault?.category));
   const canRecover = state.capabilities?.fault_recovery && robot.recovery_supported === true
@@ -854,7 +855,7 @@ function render() {
     : recoveryNeeded && mode.side === 'both' ? '双臂需要现场验证的恢复流程，网页不执行自动回零。'
       : recoveryNeeded && running ? '请先结束本机计算，再执行恢复。'
         : recoveryNeeded && recoveryEnabled ? (sides.every(side => canReturnWhileHolding(state, side))
-          ? '保持使能规划并执行七关节回零，到位后失能，再受检恢复手部；规划拒绝时保留经核验的位置保持。'
+          ? '机械臂受控停稳并保持使能，先受检归零手部，再规划执行七关节回零，到位后失能；规划拒绝时保留经核验的位置保持。'
           : enabledRecoveryRefusal(state, sides.find(side => !canReturnWhileHolding(state, side))))
         : returnFailureDetail ? returnFailureDetail
         : feedbackMissing ? '机械臂 CAN 反馈缺失，不是已确认的急停。恢复先请求遥测并核验七轴；若仍无数据，检查供电、CAN 接线和接口映射，不能强制清除故障。'
@@ -866,7 +867,7 @@ function render() {
                 : robot.mode === 'IDLE' ? '网关已就绪；重新开始计算后才能使能。'
                 : '故障停止后可在这里恢复，无需重启网关。';
   $('can').disabled = canBusy || recoveryBusy || !state.connected || !state.capabilities?.automatic_can_teardown;
-  const mayEnable = !recoveryBusy && fresh && armFeedbackReady && robot.mode === 'IDLE' && state.owner === session && telemetry.age_s < 1
+  const mayEnable = !recoveryBusy && returnProtocolReady && fresh && armFeedbackReady && robot.mode === 'IDLE' && state.owner === session && telemetry.age_s < 1
     && inputFresh && geometryReady && telemetry.targets && telemetry.sent > 0 && !telemetry.preview && Object.values(members).length && !faults.length;
   $('enable').disabled = !mayEnable;
   setStep('step-link', state.connected);

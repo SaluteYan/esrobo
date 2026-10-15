@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 import time
 
-from .protocol import canonical, InputHoldTransition
+from .protocol import canonical, InputHoldTransition, HoldReturnTransition
 
 
 class MockBackend:
@@ -16,7 +16,7 @@ class MockBackend:
                              hand_only=bool(hand_only),
                              input_hold_protocol=2,
                              input_recovery_protocol=1, input_recovery_enabled=False,
-                             return_protocol=2, hold_return_protocol=1,
+                             return_protocol=3, hold_return_protocol=1,
                              arm_unit="URDF radians", hand_unit="L10 physical 0..255",
                              lower_rad=[-1.0] * 7, upper_rad=[1.0] * 7)
         self.q = [0.0] * 7
@@ -228,7 +228,7 @@ class HardwareBackend:
                                  input_hold_protocol=2,
                                  input_recovery_protocol=1,
                                  input_recovery_enabled=getattr(cfg.robot, side+'_input_recovery_verified') is True,
-                                 return_protocol=2, hold_return_protocol=1,
+                                 return_protocol=3, hold_return_protocol=1,
                                  hand_unit="L10 physical 0..255", hand_order=L10_PHYSICAL_JOINT_NAMES,
                                  arm_order=list(getattr(cfg.ik, f"{side}_arm_joints")),
                                  lower_rad=np.minimum(a, b).tolist(), upper_rad=np.maximum(a, b).tolist(),
@@ -236,17 +236,24 @@ class HardwareBackend:
                                  velocity_rad_s=self.arm._joint_rate_limit_vector(side, "max_joint_velocity").tolist(),
                                  acceleration_rad_s2=self.arm._joint_rate_limit_vector(side, "max_joint_acceleration").tolist())
             if not self.hand_only:
-                self.contract["entry_protocol"] = 6
+                self.contract["entry_protocol"] = 7
                 self.contract["entry_keepalive_protocol"] = 1
             self.arm.connect()
         except BaseException:
             self.close()
             raise
 
+    def attach_torque_recorder(self, writer, session, mode):
+        from esrobo_teleop.debug.torque_diagnostics import TorqueRecorder
+        self.arm._torque_recorder = TorqueRecorder(session, self.side, writer, mode)
+
     def fault_diagnostics(self):
-        # The driver has already frozen the rejected command and feedback frame.
-        # Reading this value performs no robot I/O.
-        return self.arm.trajectory_diagnostics
+        # Preserve the exact rejected trajectory and separately frozen torque
+        # evidence, without another CAN read or replacing existing fields.
+        diagnostics = self.arm.trajectory_diagnostics
+        recorder = self.arm.__dict__.get('_torque_recorder')
+        torque = None if recorder is None else recorder.fault_snapshot()
+        return dict(diagnostics or {}, torque=torque) if torque is not None else diagnostics
 
     def snapshot(self):
         full = self.arm.read_control_cycle_joints()
@@ -263,6 +270,8 @@ class HardwareBackend:
             states.append(bool(state.msg.foc_status.driver_enable_status))
         return dict(arm_urdf_rad=None if full is None else full[self._full_slice].tolist(),
                     motion_diagnostics=getattr(self.arm, 'motion_limit_diagnostics', None),
+                    torque_diagnostics=(self.arm._torque_recorder.snapshot()
+                                        if self.arm.__dict__.get('_torque_recorder') is not None else None),
                     arm_feedback_age_s=None if snap is None else max(0.0, time.monotonic() - snap.received_monotonic),
                     feedback_diagnostic=feedback_diagnostic,
                     feedback_request_diagnostic=(getattr(self.arm._arm, "feedback_request_diagnostic", None)
@@ -323,9 +332,6 @@ class HardwareBackend:
         self.preflight_enable(dict(target, arm_urdf_rad=state["arm_urdf_rad"]), entry=True)
         if state.get("driver_fault") or cancelled():
             raise RuntimeError("handover requires healthy fresh feedback/input")
-        if self.np.max(self.np.abs(self.np.asarray(target["arm_urdf_rad"])[5:]
-                                  - self.np.asarray(state["arm_urdf_rad"])[5:])) > self.np.deg2rad(.2):
-            raise RuntimeError("initial approach must hold measured J6/J7; recalibration required")
         held_hand = None if self.hand is None else list(state["hand"]["position_unit"])
         def hand_stationary():
             if self.hand is None:
@@ -361,11 +367,11 @@ class HardwareBackend:
         self._prepare_entry_activation(target, cancelled)
         return dataclasses.asdict(result)
 
-    def _disabled_hand_return_feedback(self, cancelled, *, anchor=None, wait=False):
-        """Read only: reacquire feedback after planning, never reset or enable.
+    def _hand_return_feedback(self, cancelled, *, anchor=None, wait=False, holding=False):
+        """Read only: monitor feedback, never reset or enable.
 
-        The strict reader can require two independent CAN frames after a long
-        geometry calculation. Waiting is allowed only before hand motion (or
+        Controller recovery can require two independent CAN frames. Waiting
+        is allowed only before certification/hand motion (or
         after hand output has stopped), not inside its active safety checks.
         """
         deadline = time.monotonic() + (self.cfg.robot.controller_status_timeout_s if wait else 0.)
@@ -376,8 +382,9 @@ class HardwareBackend:
             states, fault = state.get('enable_states'), state.get('controller_fault')
             q, age = state.get('arm_urdf_rad'), state.get('arm_feedback_age_s')
             transient = False
-            if states is not None and states != [False]*7:
-                reason = 'arm disable lost during hand return'
+            if states is not None and states != ([True]*7 if holding else [False]*7):
+                reason = ('arm enable lost during hand return' if holding else
+                          'arm disable lost during hand return')
             elif state.get('driver_fault'):
                 reason = 'arm driver fault during hand return: '+str(state['driver_fault'])
             elif fault and fault.get('category') not in ('controller_feedback_stale', 'driver_feedback_stale'):
@@ -393,60 +400,84 @@ class HardwareBackend:
                 delta = self.np.degrees(self.np.asarray(q)-anchor)
                 joint = int(self.np.argmax(self.np.abs(delta)))
                 reason = f'arm moved during hand return: J{joint+1} delta={delta[joint]:.3f}deg exceeds 0.2deg'
+            elif holding and (not self.arm._controller_is_safe()
+                              or not self.arm._torque_is_safe(self.arm._arm, self.side)):
+                reason = 'arm safety check failed during held hand return'
             else:
                 return state, ''
             if not transient or time.monotonic() >= deadline:
                 return state, reason
             time.sleep(min(.01, max(0., deadline-time.monotonic())))
 
-    def _restore_hand_before_return(self, result, cancelled, *, after_arm=False):
-        """Verify hand zero at the current disabled arm pose."""
-        result = dict(result, hands_open=False,
-                      stage='hand_open' if after_arm else 'hand_open_before_arm')
+    def _certify_return_hand(self, lower, upper, envelope, near_zero, monitor):
+        from .hand_return_proof import certify
+        proof = certify(self.cfg, self.side, lower, upper, envelope, near_zero, monitor, self.arm._collision_guard)
+        self.arm._collision_guard.last_diagnostics = proof['diagnostics']
+        self._last_hand_return_diagnostics = dict(proof)
+        return proof['certified']
+
+    def return_diagnostics(self):
+        return getattr(self, '_last_hand_return_diagnostics', None)
+
+    def _restore_hand_before_return(self, result, cancelled, *, holding=False):
+        """Verify hand zero at a disabled or verified stationary held arm pose."""
+        result = dict(result, hands_open=False, stage='hand_open_before_arm')
         reason = ''
         last_state = None
+        self._last_hand_return_diagnostics = None
         try:
             if cancelled():
                 raise RuntimeError('cancelled before hand open')
             # Controller recovery can invalidate the cycle snapshot. Reacquire
             # fresh CAN feedback within the existing bounded preflight wait,
             # before certifying geometry or sending any finger command.
-            state, reason = self._disabled_hand_return_feedback(cancelled, wait=True)
+            state, reason = self._hand_return_feedback(cancelled, wait=True, holding=holding)
             last_state = state
             if reason:
+                if holding:
+                    self.arm.cancel_return()
                 raise RuntimeError(reason)
             actual = state.get('arm_urdf_rad')
             anchor = self.np.asarray(actual, dtype=float)
             if anchor.shape != (7,) or not self.np.all(self.np.isfinite(anchor)):
                 raise RuntimeError('invalid arm feedback before hand open')
+            zero_tolerance = self.np.deg2rad(self.cfg.robot.full_arm_return_tolerance_deg)
+            near_zero = bool(self.np.max(self.np.abs(anchor)) <= zero_tolerance)
+            result['near_zero_finger_exemption'] = near_zero
             already_open, _ = self.hand.open_pose_status()
             if already_open:
                 # Fresh measured arrival needs no new hand command or swept
                 # motion certificate. Do not move a hand already at its zero.
-                return dict(result, hands_open=True, reason='')
-            envelope = self.hand.open_return_geometry_state(self.side)
-            if not envelope.valid:
-                raise RuntimeError('hand open geometry unavailable: '+envelope.reason)
+                return dict(result, hands_open=True, disabled=not holding, reason='')
+            envelope = None
+            if near_zero:
+                if not self.hand.feedback_ready():
+                    if holding:
+                        self.arm.cancel_return()
+                    raise RuntimeError('fresh hand feedback required before hand open')
+            else:
+                envelope = self.hand.open_return_geometry_state(self.side)
+                if not envelope.valid:
+                    raise RuntimeError('hand open geometry unavailable: '+envelope.reason)
             full = self.np.zeros(14)
             full[self._full_slice] = anchor
             drift = self.np.zeros(14)
             drift[self._full_slice] = self.np.deg2rad(.2)
-            guard = self.arm._collision_guard
-            if not guard.check_hand_return(full-drift, full+drift, envelope):
-                raise RuntimeError('hand open sweep not certified safe: '+str(guard.last_diagnostics))
-            # Geometry may outlast one feedback period. Obtain fresh frames
-            # BEFORE asking the hand worker to send its first position, while
-            # keeping the original certified arm pose as the fixed anchor.
-            last_state, reason = self._disabled_hand_return_feedback(
-                cancelled, anchor=anchor, wait=True)
-            if reason:
-                raise RuntimeError(reason)
-
             def check():
                 nonlocal reason, last_state
-                last_state, reason = self._disabled_hand_return_feedback(cancelled, anchor=anchor)
+                last_state, reason = self._hand_return_feedback(cancelled, anchor=anchor, holding=holding)
                 if reason:
+                    if holding:
+                        self.arm.cancel_return()  # A real safety loss cannot resume hold.
                     return False
+                if near_zero:
+                    if self.np.max(self.np.abs(last_state['arm_urdf_rad'])) > zero_tolerance:
+                        reason = 'arm left near-zero region during hand return'
+                        return False
+                    if not self.hand.feedback_ready():
+                        reason = 'hand feedback stale during hand return'
+                        return False
+                    return True
                 fresh = self.hand.geometry_state(self.side, 0.)
                 if (not fresh.valid or set(fresh.intervals) != set(envelope.intervals)
                         or any(lo < envelope.intervals[key][0] or hi > envelope.intervals[key][1]
@@ -455,22 +486,39 @@ class HardwareBackend:
                     return False
                 return True
 
+            def monitor():
+                ok = check()
+                if not ok and holding:
+                    self.arm.cancel_return()
+                return ok
+
+            if not self._certify_return_hand(full-drift, full+drift, envelope, near_zero, monitor):
+                raise RuntimeError('hand open sweep not certified safe')
+            # A certificate is useful only while the original feedback, pose
+            # and hand envelope still match. No command precedes this check.
+            if not monitor():
+                raise RuntimeError(reason or 'hand return monitoring failed')
+
             opened, errors = self.hand.align_and_verify_open_pose(
-                cancelled, safety_check=check, force=True)
-            if not opened or not check():
+                cancelled, safety_check=monitor, force=True)
+            if not opened or not monitor():
                 raise RuntimeError(reason or ('hand open feedback not verified: '+
                                              self.hand.describe_open_pose_errors(errors)))
-            return dict(result, hands_open=True, reason='')
+            return dict(result, hands_open=True, disabled=not holding, reason='')
         except Exception as exc:
             # A rejected hand phase must not start the arm or advertise IDLE.
             self.hand.set_enabled(False)
             try:
-                final, _ = self._disabled_hand_return_feedback(cancelled, wait=True)
+                final, _ = self._hand_return_feedback(cancelled, wait=True, holding=holding)
                 disabled = final.get('enable_states') == [False]*7
             except Exception:
                 disabled = False
-            return dict(result, returned=False, disabled=disabled, reason=str(exc),
-                        hand_return_feedback=last_state)
+            from .state_summary import feedback_summary, short_text
+            self._last_hand_return_diagnostics = dict(self._last_hand_return_diagnostics or {},
+                reason=reason or str(exc), feedback=last_state,
+                geometry=dict(getattr(self.arm._collision_guard, 'last_diagnostics', {})))
+            return dict(result, returned=False, disabled=disabled, reason=short_text(reason or str(exc)),
+                        hand_return_feedback=feedback_summary(last_state))
         finally:
             self.hand.set_enabled(False)
 
@@ -647,7 +695,7 @@ class HardwareBackend:
         if request_id is None:
             return dict(returned=False, disabled=False, arm_returned=False,
                         hands_open=False, stage='busy', reason='return already running')
-        hand_first = explicit_recovery and self.hand is not None and not from_hold
+        hand_first = self.hand is not None
         result = dict(returned=False, disabled=False, arm_returned=False, hands_open=False)
         try:
             if self.hand:
@@ -655,23 +703,23 @@ class HardwareBackend:
             if cancelled():
                 self.arm.cancel_return()
                 return dict(result, stage='preflight', reason='cancelled before return')
-            if hand_first:
-                try:
-                    # No implicit disable: an enabled arm may be supporting
-                    # weight. This recovery only accepts verified disabled arms.
-                    result['controller_recovery_before_hand'] = self.arm.recover_disabled_controller(cancelled)
-                except Exception as exc:
-                    disabled = self.arm._arm.get_joint_enable_states() == [False]*7
-                    return dict(result, disabled=disabled,
-                                stage='controller_recovery_before_hand', reason=str(exc))
-                result['disabled'] = True
+            if hand_first and not from_hold:
+                if explicit_recovery:
+                    try:
+                        # Never implicitly disable a load-bearing arm.
+                        result['controller_recovery_before_hand'] = self.arm.recover_disabled_controller(cancelled)
+                    except Exception as exc:
+                        disabled = self.arm._arm.get_joint_enable_states() == [False]*7
+                        return dict(result, disabled=disabled,
+                                    stage='controller_recovery_before_hand', reason=str(exc))
+                    result['disabled'] = True
                 result = self._restore_hand_before_return(result, cancelled)
                 if not result['hands_open']:
                     return result
             if cancelled():
                 self.arm.cancel_return()
                 return dict(result, returned=False, stage='preflight', reason='cancelled before arm return')
-            if hand_first:
+            if hand_first and not from_hold:
                 # Arrival may be lost between the hand worker's final check
                 # and this phase boundary. Never start seven-joint motion on
                 # a cached hands_open flag alone.
@@ -680,16 +728,35 @@ class HardwareBackend:
                     return dict(result, returned=False, stage='hand_open_before_arm',
                                 reason='hand zero lost before arm return: '+
                                 self.hand.describe_open_pose_errors(errors))
+            def open_held_hand():
+                nonlocal result
+                # Called after braking and stationary enabled feedback checks.
+                result = self._restore_hand_before_return(result, cancelled, holding=True)
+                if not result['hands_open']:
+                    return result['reason']
+                result['hands_open'], errors = self.hand.open_pose_status()
+                if not result['hands_open']:
+                    return 'hand zero lost before arm return: '+self.hand.describe_open_pose_errors(errors)
+                return ''
+
+            hand_phase = ({'before_arm_return': open_held_hand}
+                          if hand_first and from_hold else {})
             arm_result = self.arm.safe_return(recover=not from_hold, request_id=request_id,
                 preserve_hold=from_hold,
                 arm_only_collision=arm_only_collision,
-                stationary_hand_check=stationary_hand_check,
-                recognize_inherited_stop=explicit_recovery and not from_hold)
+                near_zero_finger_exemption=hand_first,
+                stationary_hand_check=(stationary_hand_check if stationary_hand_check is not None
+                                       else (lambda: self.hand.open_pose_status()[0]) if hand_first else None),
+                recognize_inherited_stop=explicit_recovery and not from_hold,
+                **hand_phase)
             result.update(dataclasses.asdict(arm_result), arm_returned=arm_result.returned)
             if from_hold:
                 result['holding'] = bool(getattr(self.arm, 'return_hold_preserved', False))
-                if result['returned'] and result['disabled'] and self.hand is not None:
-                    result = self._restore_hand_before_return(result, cancelled, after_arm=True)
+                if result['holding'] and self.hand is not None:
+                    # Restore only the measured-position software command gate;
+                    # this does not send a hand target or resume live following.
+                    result['holding'] = bool(not cancelled() and self.hand.feedback_ready()
+                                             and self.hand.set_enabled(True))
             if explicit_recovery and result['returned'] and result['disabled']:
                 try:
                     result['controller_recovery'] = self.arm.recover_disabled_controller(cancelled)
@@ -697,12 +764,12 @@ class HardwareBackend:
                     disabled = self.arm._arm.get_joint_enable_states() == [False]*7
                     return dict(result, returned=False, disabled=disabled,
                                 stage='controller_recovery', reason=str(exc))
-                if hand_first:
-                    result['hands_open'], errors = self.hand.open_pose_status()
-                    if not result['hands_open']:
-                        return dict(result, returned=False, stage='hand_open_verify',
-                                    reason='hand zero lost during arm return: '+
-                                    self.hand.describe_open_pose_errors(errors))
+            if hand_first and result['returned'] and result['disabled']:
+                result['hands_open'], errors = self.hand.open_pose_status()
+                if not result['hands_open']:
+                    return dict(result, returned=False, stage='hand_open_verify',
+                                reason='hand zero lost during arm return: '+
+                                self.hand.describe_open_pose_errors(errors))
             return result
         finally:
             # Hand preflight may fail before safe_return consumes the request.
@@ -710,54 +777,29 @@ class HardwareBackend:
             self.arm.release_return_request(request_id)
 
     def prepare_session(self, cancelled):
-        """Return the arm to zero, holding any attached hand at fresh feedback."""
-        hands_open = True
-        hands_stationary = False
-        hand_stationary_check = None
-        if self.hand is not None:
-            self.hand.set_enabled(False)
-            if self.hand_only:
-                if not self.hand.open_feedback_calibrated(self.side):
-                    raise RuntimeError(f"{self.side} hand natural-open feedback zero is not calibrated")
-                hands_open, errors = self.hand.align_and_verify_open_pose(cancelled)
-                if not hands_open:
-                    if cancelled():
-                        return {"returned": False, "disabled": True, "hands_open": False,
-                                "stage": "hand_open", "reason": "cancelled"}
-                    detail = self.hand.describe_open_pose_errors(errors)
-                    raise RuntimeError("hand open return was not verified: " +
-                                       (detail or "fresh hand feedback unavailable"))
-            else:
-                sample = self.hand.feedback_snapshot(self.side)
-                held = sample.get("position_unit")
-                if (held is None or sample.get("age_s") is None
-                        or sample["age_s"] > self.cfg.hand.max_stale_time_s):
-                    raise RuntimeError("fresh hand feedback required to hold hand during arm preparation")
-                held = list(held)
-                hands_open = False
-                hands_stationary = True
-                def hand_stationary_check():
-                    latest = self.hand.feedback_snapshot(self.side)
-                    position = latest.get("position_unit")
-                    return bool(position is not None and latest.get("age_s") is not None
-                                and latest["age_s"] <= self.cfg.hand.max_stale_time_s
-                                and max(abs(a-b) for a,b in zip(position, held)) <= 5)
-        if self.hand_only:
-            state = self.snapshot()
-            if state["enable_states"] != [False] * 7:
-                raise RuntimeError("arm must remain verified disabled during hand-only preparation")
-            result = {"returned": True, "disabled": True,
-                      "stage": "hand_only", "reason": ""}
-        else:
-            result = self.return_zero(cancelled, arm_only_collision=hands_stationary,
-                                      stationary_hand_check=hand_stationary_check,
-                                      explicit_recovery=False)
-            if result.get("returned") and hand_stationary_check is not None \
-                    and not hand_stationary_check():
-                raise RuntimeError("held hand moved or feedback expired during preparation")
-            if cancelled() or not result.get("returned") or not result.get("disabled"):
-                return dict(result, hands_open=bool(hands_open), hands_stationary=hands_stationary)
-        return dict(result, hands_open=bool(hands_open), hands_stationary=hands_stationary)
+        """Verify hand zero before arm zero; automatic preparation never resets faults."""
+        if not self.hand_only:
+            result = self.return_zero(cancelled, explicit_recovery=False)
+            if self.hand is None:
+                result['hands_open'] = True
+            return dict(result, hands_stationary=False)
+        # Hand-only preparation keeps its existing behavior; no arm return.
+        self.hand.set_enabled(False)
+        if not self.hand.open_feedback_calibrated(self.side):
+            raise RuntimeError(f"{self.side} hand natural-open feedback zero is not calibrated")
+        hands_open, errors = self.hand.align_and_verify_open_pose(cancelled)
+        if not hands_open:
+            if cancelled():
+                return {"returned": False, "disabled": True, "hands_open": False,
+                        "stage": "hand_open", "reason": "cancelled"}
+            detail = self.hand.describe_open_pose_errors(errors)
+            raise RuntimeError("hand open return was not verified: " +
+                               (detail or "fresh hand feedback unavailable"))
+        state = self.snapshot()
+        if state["enable_states"] != [False] * 7:
+            raise RuntimeError("arm must remain verified disabled during hand-only preparation")
+        return {"returned": True, "disabled": True, "hands_open": True,
+                "hands_stationary": False, "stage": "hand_only", "reason": ""}
 
     def close(self):
         if self.hand and self._owns_hand:
@@ -788,6 +830,12 @@ class DualBackend:
                              input_recovery_enabled=all(c.get('input_recovery_enabled') is True for c in contracts.values()),
                              return_supported=False)
         self.operation_results = {}
+
+    def attach_torque_recorder(self, writer, session, mode):
+        for member in self.members.values():
+            attach = getattr(member, 'attach_torque_recorder', None)
+            if attach is not None:
+                attach(writer, session, mode)
 
     def fault_diagnostics(self):
         return {side: details for side, member in self.members.items()
@@ -823,7 +871,7 @@ class DualBackend:
         return dict(sides=states, last_operation=self.operation_results)
 
     def _abort(self, exc):
-        if isinstance(exc, InputHoldTransition):
+        if isinstance(exc, (InputHoldTransition, HoldReturnTransition)):
             raise exc
         self.cancel()
         try:

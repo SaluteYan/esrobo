@@ -139,12 +139,14 @@ class NeroArm:
     def get_joint_torques(self) -> np.ndarray | None:
         values = []
         timestamps = []
+        self._torque_read_metadata = dict(status='missing', axis_stamp_s=[None]*7)
         for joint_index in range(1, NERO_NUM_JOINTS + 1):
             feedback = self._robot.get_motor_states(joint_index)
             if feedback is None:
                 return None
             values.append(float(feedback.msg.torque))
             timestamps.append(float(feedback.timestamp))
+            self._torque_read_metadata['axis_stamp_s'][joint_index-1] = timestamps[-1]
         torques = np.asarray(values, dtype=np.float64)
         stamp = max(timestamps)
         if (
@@ -153,8 +155,10 @@ class NeroArm:
             or self._last_torque_timestamp is not None
             and stamp <= self._last_torque_timestamp
         ):
+            self._torque_read_metadata['status'] = 'repeated_or_invalid'
             return None
         self._last_torque_timestamp = stamp
+        self._torque_read_metadata['status'] = 'accepted'
         return torques
 
     def connect(self) -> None:
@@ -890,6 +894,9 @@ class NeroDualArmDriver:
     def _capture_arm_torque_baseline(self, arm: NeroArm, side: str, *, cancelled=None) -> bool:
         if not bool(self._cfg.torque_monitor_enabled):
             return True
+        recorder = self.__dict__.get('_torque_recorder')
+        if recorder is not None:
+            recorder.begin_baseline()
         settle_s = max(0.0, float(self._cfg.torque_baseline_settle_s))
         if settle_s > 0.0:
             print(
@@ -912,15 +919,19 @@ class NeroDualArmDriver:
             if cancelled is not None and cancelled():
                 return False
             value = arm.get_joint_torques()
+            self._observe_torque(arm, side, value, None, None, 'baseline_capture', kind='baseline_sample')
             if value is not None:
                 samples.append(value)
             time.sleep(0.02)
         if len(samples) < required:
             self._safety_fault_reason = f"{side} torque baseline unavailable"
+            self._observe_torque(arm, side, None, None, False, 'baseline_failed', fault=True)
             return False
         self._torque_baseline[side] = np.median(np.asarray(samples), axis=0)
         self._torque_trip_counts[side] = np.zeros(7, dtype=int)
         self._last_valid_torque_time[side] = time.monotonic()
+        self._observe_torque(arm, side, None, self._torque_baseline[side], True,
+                             'baseline_ready', kind='baseline_ready')
         print(
             f"[teleop SAFETY] {side} stationary torque baseline(Nm)="
             f"{np.round(self._torque_baseline[side], 2).tolist()}, limits="
@@ -939,14 +950,47 @@ class NeroDualArmDriver:
         )
         return self._joint_limit_vector(value, name)
 
+    def _observe_torque(self, arm, side, current, baseline, passed, phase=None,
+                        *, kind='sample', fault=False):
+        recorder = self.__dict__.get('_torque_recorder')
+        if recorder is None:
+            return
+        try:
+            # Cached values only. Their timestamps remain attached; no getters.
+            snap = arm.__dict__.get('_runtime_feedback')
+            returning = bool(getattr(self, '_return_active', False))
+            state = self.__dict__.get('_trajectory')
+            state = None if state is None else state.state
+            command = self.__dict__.get('_torque_return_command') if returning else None
+            if command is None and state is not None:
+                command = dict(position=state.position, velocity=state.velocity, stamp=state.stamp)
+            motion = dict(
+                feedback_physical_rad=None if snap is None else snap.position,
+                feedback_stamp_s=None if snap is None else snap.stamp,
+                feedback_received_monotonic_s=None if snap is None else snap.received_monotonic,
+                command_physical_rad=None if command is None else command['position'],
+                command_velocity_rad_s=None if command is None else command['velocity'],
+                command_stamp_s=None if command is None else command['stamp'])
+            recorder.record(current=current, baseline=baseline, limits=self._torque_limits_for(side),
+                counts=None if kind == 'baseline_sample' else self._torque_trip_counts.get(side),
+                metadata=arm.__dict__.get('_torque_read_metadata'), motion=motion,
+                phase=phase or (self.__dict__.get('_torque_phase') if returning else None),
+                kind=kind, verdict=passed, fault=fault)
+        except Exception as exc:
+            # Diagnostics can fail, but may never change the protection result.
+            recorder.error = f'{type(exc).__name__}: {exc}'
+
     def _torque_is_safe(self, arm: NeroArm, side: str) -> bool:
         if not bool(self._cfg.torque_monitor_enabled):
             return True
         baseline = self._torque_baseline.get(side)
         current = arm.get_joint_torques()
+        def observed(passed, *, fault=False):
+            self._observe_torque(arm, side, current, baseline, passed, fault=fault)
+            return passed
         if baseline is None:
             self._safety_fault_reason = f"{side} torque baseline unavailable"
-            return False
+            return observed(False, fault=True)
         if current is None:
             last_valid = self._last_valid_torque_time.get(side)
             if (
@@ -954,9 +998,9 @@ class NeroDualArmDriver:
                 and time.monotonic() - last_valid
                 <= max(0.05, float(self._cfg.torque_feedback_timeout_s))
             ):
-                return True
+                return observed(True)
             self._safety_fault_reason = f"{side} torque feedback unavailable"
-            return False
+            return observed(False, fault=True)
         self._last_valid_torque_time[side] = time.monotonic()
         limits = self._torque_limits_for(side)
         deviation = np.abs(current - baseline)
@@ -976,8 +1020,8 @@ class NeroDualArmDriver:
                 f"{side} torque deviation exceeded ({details}); "
                 "following frozen, arm remains enabled"
             )
-            return False
-        return True
+            return observed(False, fault=True)
+        return observed(True)
 
     def connect(self) -> None:
         self._left.connect()
@@ -1638,6 +1682,13 @@ class NeroSingleArmDriver(NeroDualArmDriver):
         start = 0 if self._side == "left" else 7
         qa, qb = np.zeros(14), np.zeros(14)
         qa[start:start+7], qb[start:start+7] = (a-offsets)/directions, (b-offsets)/directions
+        if getattr(self, '_return_near_zero_finger_exemption', False):
+            tolerance = np.deg2rad(self._cfg.full_arm_return_tolerance_deg)
+            if (not np.all(np.isfinite([qa, qb]))
+                    or np.max(np.abs([qa, qb])) > tolerance):
+                guard.last_diagnostics = dict(certified=False,
+                    category='near_zero_return_region_exceeded')
+                return False
         if entry_search_only and entry_coverage_only:
             raise ValueError("entry search checks cannot authorize execution")
         if entry_search_only or getattr(self, "_entry_arm_only_collision", False):
@@ -2954,11 +3005,14 @@ class NeroSingleArmDriver(NeroDualArmDriver):
     def safe_return(self, *, recover=False, request_id=None, handover_goal=None,
                     on_approach=lambda: None, arm_only_collision=False,
                     stationary_hand_check=None,
-                    recognize_inherited_stop=False, preserve_hold=False):
+                    recognize_inherited_stop=False, preserve_hold=False,
+                    before_arm_return=None, near_zero_finger_exemption=False):
         from .return_planner import ReturnPlanner, ReturnResult
         if not self._return_lock.acquire(blocking=False):
             return ReturnResult(False, False, "busy", "return already running")
+        self._torque_return_command = None
         self._entry_arm_only_collision = bool(arm_only_collision or handover_goal is not None)
+        self._return_near_zero_finger_exemption = False
         self._handover_initialization_pending = False
         self._entry_hand_stationary_check = stationary_hand_check
         self._return_execution_failure = None
@@ -2967,9 +3021,23 @@ class NeroSingleArmDriver(NeroDualArmDriver):
         if request_id is None:
             request_id = self.prepare_return()
         stage = "preflight"
+        self._torque_phase = stage
         disabled_confirmed = False
         entry_cache = None
         return_cache = None
+        def select_near_zero_profile(current):
+            # This exception belongs only to zero return, never ACTIVE entry.
+            # Once selected, every checked path/stop box must stay near zero.
+            if not near_zero_finger_exemption or handover_goal is not None or current is None:
+                return
+            directions, offsets = self._mapping(self._side)
+            q = (np.asarray(current)-offsets)/directions
+            if (q.shape == (7,) and np.all(np.isfinite(q))
+                    and np.max(np.abs(q)) <= np.deg2rad(self._cfg.full_arm_return_tolerance_deg)):
+                if not callable(getattr(self._collision_guard, 'check_arm_only', None)):
+                    raise RuntimeError('near-zero arm/wrist/palm collision checker unavailable')
+                self._return_near_zero_finger_exemption = True
+                self._entry_arm_only_collision = True
         def finish(returned=False, reason="", disabled=None):
             if disabled is None:
                 disabled = disabled_confirmed
@@ -2978,7 +3046,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             if not returned:
                 self._return_inhibited = True
                 if (preserve_hold and not recover and hold_was_healthy
-                        and stage in ('preflight', 'planning')):
+                        and stage in ('preflight', 'hand_open_before_arm', 'planning')):
                     try:
                         self.return_hold_preserved = self._resume_stationary_return_hold()
                     except Exception:
@@ -3041,6 +3109,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                     current = self.read_joints()
                     if current is None:
                         return finish(reason="inherited emergency stop lacks fresh seven-joint feedback")
+                    select_near_zero_profile(current)
                     verified, candidate_reason = self._verify_disabled_estop_recovery_candidate(current)
                     if not verified:
                         return finish(reason="inherited emergency stop recovery refused: " + candidate_reason)
@@ -3053,6 +3122,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 # recognition checks before explicit z/q may clear it.
                 stage = ("recovering software stop" if software_stop
                          else "recovering verified inherited stop")
+                self._torque_phase = stage
                 states = self._arm.get_joint_enable_states()
                 current = self.read_joints()
                 if states is None or len(states) != 7 or current is None:
@@ -3060,6 +3130,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 if any(states) and not all(states):
                     return finish(reason="E-stop recovery found mixed motor enable state")
                 disabled_confirmed = not any(states)
+                select_near_zero_profile(current)
                 if not self._check_physical_path(current, current):
                     return finish(reason="current pose unsafe/unverified; manually remove contact")
                 if inherited_stop:
@@ -3115,6 +3186,8 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             if not self._enabled and not recover:
                 return finish(reason="arm disabled; explicit recovery required")
             current = self.read_joints()
+            if not (preserve_hold and not recover):
+                select_near_zero_profile(current)
             if current is None or (not (preserve_hold and not recover)
                     and not self._check_physical_path(current, current)):
                 return finish(reason="current pose unsafe/unverified; manually remove contact")
@@ -3131,6 +3204,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             tolerance = np.deg2rad(self._cfg.full_arm_return_tolerance_deg)
             timeout = self._cfg.full_arm_return_timeout_s
             stage = "braking"
+            self._torque_phase = stage
             self._emit_probe(dict(event="return_stage", stage=stage))
             initial = self._return_start_state
             if preserve_hold and not recover:
@@ -3147,21 +3221,51 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             current = self._return_stationary(allow_disabled=not self._enabled)
             if current is None:
                 return finish(reason="fresh stationary feedback not confirmed")
-            if (recover and recognize_inherited_stop and handover_goal is None
-                    and not self._enabled and np.max(np.abs(current-zero)) <= tolerance):
+            select_near_zero_profile(current)
+            if before_arm_return is not None:
+                stage = "hand_open_before_arm"
+                self._torque_phase = stage
+                self._emit_probe(dict(event="return_stage", stage=stage))
+                reason = before_arm_return()
+                if reason or self._return_cancel.is_set():
+                    return finish(reason=reason or "cancelled during hand return")
+                # Hand geometry and movement may take seconds. Retain the
+                # committed stationary arm command and verify the original
+                # anchor again before any arm-return planning or movement.
+                actual = self._return_stationary(allow_disabled=not self._enabled,
+                    goal=current, tolerance=np.deg2rad(.2))
+                if actual is None:
+                    return finish(reason="stationary arm pose lost during hand return")
+                current = actual
+            if ((recover and recognize_inherited_stop and handover_goal is None
+                    and not self._enabled and np.max(np.abs(current-zero)) <= tolerance)
+                    or self._return_near_zero_finger_exemption):
                 # Explicit recovery at an already reached zero needs no enable
                 # cycle. Require independent stationary zero samples and fresh
                 # disabled/healthy status; hand verification remains in backend.
-                stage = "verifying_disabled_zero"
-                actual = self._return_stationary(allow_disabled=True, goal=zero, tolerance=tolerance)
+                stage = "verifying_disabled_zero" if not self._enabled else "verifying"
+                self._torque_phase = stage
+                was_enabled = self._enabled
+                actual = self._return_stationary(allow_disabled=not was_enabled, goal=zero, tolerance=tolerance)
                 if (actual is None or self._return_cancel.is_set()
-                        or self._arm.get_joint_enable_states() != [False]*7
-                        or not self._controller_is_safe(allow_disabled=True)):
+                        or self._arm.get_joint_enable_states() != [was_enabled]*7
+                        or not self._controller_is_safe(allow_disabled=not was_enabled)
+                        or (self._return_near_zero_finger_exemption
+                            and not self._check_physical_path(actual, actual))):
                     return finish(reason="already-zero disabled verification failed")
+                if was_enabled:
+                    if not self._torque_is_safe(self._arm, self._side) or self._return_cancel.is_set():
+                        return finish(reason="already-zero safety verification failed")
+                    stage = "disabling"
+                    disabled_confirmed = bool(self._arm.disable())
+                    self._enabled = not disabled_confirmed
+                    if not disabled_confirmed:
+                        return finish(reason="zero verified; disable unconfirmed", disabled=False)
                 self._return_inhibited = False
                 self._safety_fault_reason = None
                 return finish(True, "zero and disabled state already verified", True)
             stage = "planning"
+            self._torque_phase = stage
             self._emit_probe(dict(event="return_stage", stage=stage))
             if preserve_hold and not recover:
                 # Now stationary: retain the last controller command through
@@ -3192,12 +3296,11 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 if plan_attempt and return_cache is not None:
                     return_cache.invalidate_entry_certificates()
                 if handover_goal is not None:
-                    # The calibrated arm target supplies J1-J5. Capture the
-                    # stationary measured wrist once for this attempt; no
-                    # planner vertex or MOVE_J command may change J6/J7.
-                    if np.max(np.abs(goal[5:]-current[5:])) > np.deg2rad(.2):
-                        return finish(reason="initial approach must hold measured J6/J7; recalibration required")
-                    goal[5:] = current[5:]
+                    # One frozen calibration supplies BOTH destinations.
+                    # Phase one holds the measured wrist; phase two holds
+                    # J1-J5 at that same calibration's arm destination.
+                    arm_goal = goal.copy()
+                    arm_goal[5:] = current[5:]
                 if handover_goal is None and self._cfg.torso_collision_enabled:
                     from .staged_return_planner import StagedReturnPlanner
                     def return_fk(physical):
@@ -3231,7 +3334,20 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                         max_nodes=self._cfg.return_plan_max_nodes,
                         seed=self._cfg.return_plan_seed,
                         cancelled=self._return_cancel.is_set)
-                plan = planner.plan(current, goal)
+                plan = planner.plan(current, arm_goal if handover_goal is not None else goal)
+                if handover_goal is not None and plan.path:
+                    wrist_planner = ReturnPlanner(lower, upper,
+                        lambda a,b: self._check_physical_path(a,b,entry_search_only=True),
+                        timeout=self._cfg.return_plan_timeout_s,
+                        max_nodes=self._cfg.return_plan_max_nodes,
+                        seed=self._cfg.return_plan_seed,
+                        cancelled=self._return_cancel.is_set,
+                        locked_joints=(0, 1, 2, 3, 4))
+                    wrist_plan = wrist_planner.plan(arm_goal, goal)
+                    if not wrist_plan.path:
+                        return finish(reason="calibrated wrist path: " + wrist_plan.reason)
+                    plan = replace(plan, path=plan.path + wrist_plan.path[1:],
+                                   nodes=plan.nodes + wrist_plan.nodes)
                 self._emit_probe(dict(event="handover_plan" if handover_goal is not None else "return_plan", attempt=plan_attempt + 1,
                     seed=plan.seed, nodes=plan.nodes, reason=plan.reason,
                     start_physical_rad=current.tolist(),
@@ -3272,6 +3388,16 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 # They lie on the original edges; geometry and destination
                 # are unchanged, and every executed edge fits a full proof.
                 plan = replace(plan, path=self._certified_corridor_path)
+            execution_paths = (plan.path,)
+            if handover_goal is not None:
+                # Certification may add vertices, but preserves the original
+                # arm endpoint. Never let lookahead cross this stop boundary.
+                boundary = next(i for i, q in enumerate(plan.path)
+                                if np.array_equal(q, arm_goal))
+                arm_path = plan.path[:boundary+1]
+                wrist_path = plan.path[boundary:]
+                execution_paths = tuple(p if len(p) > 1 else (p[0], p[0])
+                                        for p in (arm_path, wrist_path))
             if self._return_cancel.is_set():
                 return finish(reason="cancelled")
             if handover_goal is not None:
@@ -3286,6 +3412,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 if not self._enabled:
                     disabled_confirmed = False
                     stage = "enabling"
+                    self._torque_phase = stage
                     self._emit_probe(dict(event="return_stage", stage=stage))
                     if self._return_cancel.is_set() or not self._enable_for_return():
                         reason = getattr(self, "_last_return_enable_failure", None)
@@ -3309,21 +3436,26 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                         )
             self._return_start_state = None  # Stationary after bounded search.
             stage = "executing"
+            self._torque_phase = stage
             self._emit_probe(dict(event="return_stage", stage=stage))
-            # Execute the whole certified route as one bounded position stream.
-            # A staged return can contain many short edges; stopping at every
+            # Execute each certified phase as one bounded position stream.
+            # A planned route can contain many short edges; stopping at every
             # vertex would repeatedly settle the controller and may take far
             # longer than the return timeout. Lookahead still checks the full
             # interval from measured and outstanding positions before advancing.
-            execution_path = (plan.path[-1],)
-            for number, waypoint in enumerate(execution_path, 1):
+            for number, execution_path in enumerate(execution_paths, 1):
+                waypoint = execution_path[-1]
+                if handover_goal is not None:
+                    stage = "approaching_arm" if number == 1 else "approaching_wrist"
+                    self._torque_phase = stage
+                    self._emit_probe(dict(event="return_stage", stage=stage))
                 if self._return_cancel.is_set():
                     return finish(reason="cancelled")
                 actual = self.read_joints()
                 self._emit_probe(dict(event="return_waypoint", index=number,
                     target_physical_rad=waypoint.tolist(),
                     feedback_stamp=self._arm.last_feedback_timestamp))
-                first_target = plan.path[1]
+                first_target = execution_path[1]
                 if actual is None or not (
                         self._check_physical_path(actual, first_target) if entry_cache is None
                         else self._check_physical_path(actual, first_target, entry_coverage_only=True)):
@@ -3334,7 +3466,9 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                     # preserve the last command position (never snap to feedback).
                     actual = self._return_stationary()
                     initial = self._return_start_state
-                    if (actual is None or np.max(np.abs(initial.velocity)) > 1e-8
+                    boundary_speed = (np.deg2rad(self._cfg.return_stationary_velocity_deg_s)
+                                      if handover_goal is not None else 1e-8)
+                    if (actual is None or np.max(np.abs(initial.velocity)) > boundary_speed
                             or np.max(np.abs(actual-initial.position)) > tolerance):
                         return finish(reason="waypoint boundary no longer stationary")
                     self._return_start_state = replace(initial, stamp=float(self._arm.last_feedback_timestamp))
@@ -3347,21 +3481,29 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 target = np.zeros(14)
                 target[sl] = (waypoint-zero)/directions
                 self._return_execution_failure = None
-                if not self._return_group_to_zero(target, indices, waypoint, tolerance,
-                        timeout, f"waypoint {number}/{len(execution_path)}",
-                        handover_path=plan.path,
+                wrist_stage = handover_goal is not None and number == 2
+                phase_tolerance = (min(tolerance, np.deg2rad(self._cfg.wrist_return_tolerance_deg))
+                                   if wrist_stage else tolerance)
+                phase_timeout = self._cfg.wrist_return_timeout_s if wrist_stage else timeout
+                if not self._return_group_to_zero(target, indices, waypoint, phase_tolerance,
+                        phase_timeout, (stage if handover_goal is not None else "return"),
+                        handover_path=execution_path,
                         **({'entry_cache': return_cache} if return_cache is not None else {}),
                         require_zero_command_velocity=handover_goal is None,
+                        retain_entry_certificates=(handover_goal is not None
+                                                   and number < len(execution_paths)),
                         entry_approach=handover_goal is not None):
                     return finish(reason=(self._return_execution_failure
                                           or "waypoint execution failed/cancelled"))
             if handover_goal is not None:
                 stage = "handover_arrived"
+                self._torque_phase = stage
                 if self._return_cancel.is_set():
                     return finish(reason="cancelled before handover")
                 self._handover_initialization_pending = True
                 return finish(True, "handover pose verified; awaiting fresh ACTIVE target", False)
             stage = "disabling"
+            self._torque_phase = stage
             if self._return_cancel.is_set():
                 return finish(reason="cancelled before disable")
             disabled = bool(self._arm.disable())
@@ -3376,6 +3518,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             if return_cache is not None:
                 return_cache.end_entry_certificates()
             self._entry_arm_only_collision = False
+            self._return_near_zero_finger_exemption = False
             self._entry_hand_stationary_check = None
             with self._trajectory_lock:
                 self._return_active = False
@@ -3512,7 +3655,8 @@ class NeroSingleArmDriver(NeroDualArmDriver):
         self._certified_corridor_path = tuple(q.copy() for q in points)
         return None
 
-    def _return_group_to_zero(self, *args, entry_approach=False, **kwargs):
+    def _return_group_to_zero(self, *args, entry_approach=False,
+                              retain_entry_certificates=False, **kwargs):
         if not entry_approach:
             return self._execute_return_group(*args, **kwargs)
         from .torso_collision import TorsoCollisionGuard
@@ -3524,13 +3668,16 @@ class NeroSingleArmDriver(NeroDualArmDriver):
         diagnostics = EntryDiagnostics(self._side)
         self._entry_diagnostics = diagnostics
         cadence = EntryCadence(self._return_cancel)
+        completed = False
         try:
-            return self._execute_return_group(*args, **kwargs,
+            completed = self._execute_return_group(*args, **kwargs,
                 entry_cadence=cadence, entry_diagnostics=diagnostics, entry_cache=cache_guard)
+            return completed
         finally:
-            # safe_return owns the session. Invalidate on every exit, including
-            # exceptions; only its finalizer may reopen normal geometry checks.
-            cache_guard.invalidate_entry_certificates()
+            # Only a successful stationary stage may retain the same frozen
+            # session proofs for its next stage. Failures always invalidate.
+            if not (completed and retain_entry_certificates):
+                cache_guard.invalidate_entry_certificates()
             cadence.finish()
             final = getattr(diagnostics, 'final_sample', None)
             if final is not None:
@@ -3556,6 +3703,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
         Lookahead advances only when both measured pose and outstanding
         command have a collision-certified full interval to the next vertex.
         """
+        self._torque_phase = phase_label
         output = entry_diagnostics.message if entry_diagnostics is not None else print
         from .torso_collision import TorsoCollisionGuard
         feedback_cache = getattr(self, '_collision_guard', None)
@@ -3611,6 +3759,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                     command_physical_rad=position.tolist(), command_velocity_rad_s=velocity.tolist(),
                     send_gap_ms=None if last_send is None else 1000*(started-last_send))
             if ok:
+                self._torque_return_command = dict(position=position.copy(), velocity=velocity.copy(), stamp=stamp)
                 last_send = started
             return ok
         target = np.asarray(full_target, dtype=np.float64).reshape(-1)
@@ -3670,7 +3819,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             if entry_cadence is not None:
                 if not entry_cadence.wait() or time.monotonic() >= deadline:
                     break
-                sample = dict(monotonic_s=time.monotonic(), sent=False,
+                sample = dict(monotonic_s=time.monotonic(), phase=phase_label, sent=False,
                               cache_hits=0, reason='feedback_wait')
                 entry_diagnostics.final_sample = sample
             if not self._controller_is_safe() or not self._torque_is_safe(self._arm, self._side):
