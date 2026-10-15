@@ -20,9 +20,10 @@ const app = fs.readFileSync(process.argv[1], 'utf8');
 (async () => {
 const results = {};
 for (const scenario of ['left', 'right', 'disabled', 'hand_only', 'declined',
-                       'legacy', 'estop', 'mixed', 'send_failed', 'double_click']) {
+                       'legacy', 'estop', 'torque', 'mixed', 'send_failed', 'double_click']) {
   const nodes = new Map();
   const element = id => {
+    if (['handover', 'remote-diagnostics', 'remote-sync'].includes(id)) return null;
     if (!nodes.has(id)) nodes.set(id, {value: 'left-hand', options: [], dataset: {}, style: {},
       classList: {toggle() {}}, append() {}, before() {}, after() {}, replaceChildren() {},
       setAttribute() {}, addEventListener() {}});
@@ -33,6 +34,7 @@ for (const scenario of ['left', 'right', 'disabled', 'hand_only', 'declined',
   const arm = {arm_feedback_age_s: .01, arm_urdf_rad: Array(7).fill(0),
                enable_states: Array(7).fill(scenario !== 'disabled')};
   if (scenario === 'estop') arm.controller_fault = {status_name:'EMERGENCY_STOP'};
+  if (scenario === 'torque') arm.driver_fault = 'J7 delta=9.50Nm, limit=5.00Nm';
   if (scenario === 'mixed') arm.enable_states[0] = false;
   const fixture = {connected: true, mode: {side, with_hand: true, hand_only: scenario === 'hand_only'},
     robot: {contract_id:'test', mode:scenario === 'disabled' ? 'FAULT':'HOLD_LATCHED', age_s:.01,
@@ -53,6 +55,12 @@ for (const scenario of ['left', 'right', 'disabled', 'hand_only', 'declined',
   };`, context);
   await vm.runInContext('recoverGateway()', context);
   results[scenario] = {calls, messages, busy:vm.runInContext('recoveryBusy', context)};
+  if (scenario === 'left') {
+    vm.runInContext('buttonActions=[]; perform=async action=>buttonActions.push(action)', context);
+    await nodes.get('motion-stop').onclick();
+    await nodes.get('stop').onclick();
+    results[scenario].buttonActions = vm.runInContext('buttonActions', context);
+  }
 }
 process.stdout.write(JSON.stringify(results));
 })().catch(error => {process.stderr.write(String(error)); process.exitCode=1;});
@@ -60,13 +68,17 @@ process.stdout.write(JSON.stringify(results));
     result = subprocess.run([node, '-e', script, str(ROOT / 'web/app.js')],
                             capture_output=True, text=True, check=True, timeout=20)
     results = json.loads(result.stdout)
+    assert results['left']['buttonActions'] == ['motion_hold', 'stop']
     for scenario, row in results.items():
         assert row['busy'] is False
         assert 'remote_disable' not in row['calls']
-        assert row['calls'] == ([] if scenario in ('declined', 'legacy', 'estop', 'mixed')
+        assert row['calls'] == ([] if scenario in ('declined', 'legacy', 'estop', 'torque', 'mixed')
                                 else ['remote_recover']), scenario
     for scenario in ('legacy', 'estop', 'mixed', 'send_failed'):
         assert results[scenario]['messages']
+    assert '9.50Nm' in results['torque']['messages'][0]
+    assert '单独失能' in results['torque']['messages'][0]
+    assert '回零尚未启动' in results['estop']['messages'][0]
 
 
 def test_start_buttons_accept_current_hold_protocol_and_keep_other_interlocks():

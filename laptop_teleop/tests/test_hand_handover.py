@@ -77,7 +77,7 @@ def test_recorded_first_active_gap_recovers_and_reaches_absolute_hand_target(mon
     assert client.send_entry_keepalive.call_count == 1
 
 
-@pytest.mark.parametrize('kind', ['hand_jump', 'arm_jump', 'no_input'])
+@pytest.mark.parametrize('kind', ['arm_jump', 'no_input'])
 def test_transition_still_rejects_discontinuity_and_expires_at_500ms(monkeypatch, kind):
     c, p, client, state, clock, tick = setup(monkeypatch)
     p.body.ticket.return_value = None
@@ -85,10 +85,7 @@ def test_transition_still_rejects_discontinuity_and_expires_at_500ms(monkeypatch
     assert c.hold_missing_input(state, 'missing')
     if kind != 'no_input':
         p.body.ticket.return_value = {'right_arm': clock[0]}
-        if kind == 'hand_jump':
-            p.solve.return_value['right']['hand_unit'][0] = 218  # source moved 20 units
-        else:
-            p.solve.return_value['right']['arm_urdf_rad'][0] += np.deg2rad(6)
+        p.solve.return_value['right']['arm_urdf_rad'][0] += np.deg2rad(6)
         for _ in range(3):
             assert tick() is None
         assert not c.input_resume_diagnostics['allowed']

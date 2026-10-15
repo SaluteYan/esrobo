@@ -105,6 +105,7 @@ def test_changed_entry_arm_pair_set_invalidates_frozen_certificates():
 
 def test_padded_path_proof_is_checked_before_enable_and_cancel_clears(monkeypatch):
     from test_safe_return import make_driver
+    from esrobo_teleop.robot.return_planner import ReturnPlan
     from esrobo_teleop.robot.handover_planner import HandoverPlanner
     from esrobo_teleop.robot import nero_driver
     d, feedback, zero = make_driver('right')
@@ -125,7 +126,7 @@ def test_padded_path_proof_is_checked_before_enable_and_cancel_clears(monkeypatc
     goal = zero.copy()
     goal[0] += .01
     monkeypatch.setattr(HandoverPlanner, 'plan', lambda *args:
-        SimpleNamespace(path=[zero.copy(), goal.copy()], seed=0, nodes=2, reason='test'))
+        ReturnPlan(path=(zero.copy(), goal.copy()), seed=0, nodes=2, reason='test'))
     monkeypatch.setattr(nero_driver.time, 'sleep', lambda _: None)
 
     def planned():
@@ -142,3 +143,57 @@ def test_padded_path_proof_is_checked_before_enable_and_cancel_clears(monkeypatc
     d._arm.enable.assert_not_called()
     d._arm.move_j.assert_not_called()
     assert g._entry_certificates is None
+
+
+def test_planning_age_jitter_keeps_conservative_mesh_but_expansion_recertifies():
+    g, state, _ = entry_guard()
+    q = np.zeros(14)
+    state.intervals = {'thumb': (-.09, .09)}
+    assert g(q, q)
+    for radius in (.07, .08, .09, .07):
+        state.intervals = {'thumb': (-radius, radius)}
+        assert g(q, q)
+        assert g.last_diagnostics['entry_cache_hit']
+    assert g._build_fingers.call_count == g._clearance.call_count == 1
+    assert dict(g._hand_interval_key) == {'thumb': (-.1, .1)}
+    # A new larger/asymmetric uncertainty must never reuse a smaller proof.
+    state.intervals = {'thumb': (-.07, .13)}
+    assert g(q, q)
+    assert not g.last_diagnostics['entry_cache_hit']
+    assert g._build_fingers.call_count == g._clearance.call_count == 2
+    assert dict(g._hand_interval_key) == {'thumb': (-.1, .14)}
+    assert g.freeze_entry_certificates()
+    state.intervals = {'thumb': (-.07, .15)}
+    assert not g.check_entry_coverage(q, q)
+    assert g._build_fingers.call_count == g._clearance.call_count == 2
+
+
+def test_new_planning_session_and_live_checks_do_not_accumulate_old_envelopes():
+    g, state, _ = entry_guard()
+    q = np.zeros(14)
+    assert g(q, q)
+    g.end_entry_certificates()
+    state.intervals = {'thumb': (-.07, .07)}
+    g.begin_entry_certificates()
+    assert g(q, q)
+    assert dict(g._hand_interval_key) == {'thumb': (-.08, .08)}
+    g.end_entry_certificates()
+    state.intervals = {'thumb': (-.03, .03)}
+    assert g(q, q)
+    assert dict(g._hand_interval_key) == {'thumb': (-.04, .04)}
+
+
+def test_planning_covers_whole_valid_feedback_age_without_accepting_stale_data():
+    calibration = {'left': {'thumb': dict(raw=[0,255], rad=[0.,1.], error_rad=.05,
+                                        max_velocity_rad_s=1., verified=True)}}
+    plan = geometry_state([128], 10., 'left', calibration, ['thumb'], 0., .1,
+                          now=10.001, cover_valid_age=True)
+    assert plan.valid and plan.stamp == 10.
+    for age in (.001, .02, .05, .099):
+        actual = geometry_state([128], 10., 'left', calibration, ['thumb'], 0., .1, now=10.+age)
+        assert actual.valid
+        a,b = actual.intervals['left_thumb']; lo,hi = plan.intervals['left_thumb']
+        assert lo <= a <= b <= hi
+    stale = geometry_state([128], 10., 'left', calibration, ['thumb'], 0., .1,
+                           now=10.101, cover_valid_age=True)
+    assert not stale.valid

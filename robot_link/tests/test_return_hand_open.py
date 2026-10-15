@@ -12,7 +12,7 @@ def backend(side='left'):
     b = HardwareBackend.__new__(HardwareBackend)
     b.side, b.np = side, np
     b._full_slice = slice(0, 7) if side == 'left' else slice(7, 14)
-    b.cfg = SimpleNamespace(robot=SimpleNamespace(command_trajectory_max_dt_s=.1,
+    b.cfg = SimpleNamespace(robot=SimpleNamespace(command_trajectory_max_dt_s=.1, controller_status_timeout_s=.3,
                                                   full_arm_return_tolerance_deg=1.5))
     b.arm, b.hand = Mock(), Mock()
     b.arm.safe_return.return_value = ReturnResult(True, True, 'disabling')
@@ -82,7 +82,7 @@ def test_failed_controller_recovery_blocks_hand_and_preserves_actual_disable(dis
     b.hand.align_and_verify_open_pose.assert_not_called()
 
 
-@pytest.mark.parametrize('stage', ['hand_open_before_arm', 'hand_open_verify'])
+@pytest.mark.parametrize('stage', ['preflight', 'planning', 'hand_open_before_arm', 'hand_open_verify'])
 @pytest.mark.parametrize('failure', ['none', 'enabled', 'stale', 'missing', 'controller', 'driver', 'explicit_stop'])
 def test_hand_open_refusal_does_not_restop_only_verified_disabled_arm(failure, stage):
     from esrobo_link.backends import MockBackend
@@ -286,3 +286,99 @@ def test_refused_held_return_does_not_start_hand_or_reset_controller():
     assert result['holding'] and not result['returned']
     b.arm.recover_disabled_controller.assert_not_called()
     b.hand.align_and_verify_open_pose.assert_not_called()
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+@pytest.mark.parametrize('missing', ['transient', 'persistent', 'enabled', 'controller'])
+def test_post_arm_hand_preflight_reacquires_feedback_without_blind_motion(side, missing, monkeypatch):
+    import copy
+    clock = [10.]
+    monkeypatch.setattr('esrobo_link.backends.time.monotonic', lambda: clock[0])
+    monkeypatch.setattr('esrobo_link.backends.time.sleep', lambda dt: clock.__setitem__(0, clock[0]+dt))
+    b = backend(side)
+    healthy = copy.deepcopy(b.snapshot.return_value)
+    delayed = dict(healthy, arm_urdf_rad=None, arm_feedback_age_s=None)
+    if missing == 'enabled': delayed['enable_states'] = [True]*7
+    if missing == 'controller': delayed['controller_fault'] = {'category': 'emergency_stop'}
+    reads = []
+    def arm_return(**_):
+        def snapshot():
+            reads.append(clock[0])
+            if missing == 'transient' and len(reads) >= 3:
+                return healthy
+            return delayed
+        b.snapshot.side_effect = snapshot
+        return ReturnResult(True, True, 'disabling')
+    b.arm.safe_return.side_effect = arm_return
+    b.arm.return_hold_preserved = False
+    result = b.return_zero(lambda: False, from_hold=True)
+    assert result['arm_returned']
+    if missing == 'transient':
+        assert result['returned'] and result['hands_open'] and result['disabled']
+        assert reads[2] >= 10.02 - 1e-9
+        b.hand.align_and_verify_open_pose.assert_called_once()
+    else:
+        assert not result['returned'] and not result['hands_open']
+        b.hand.align_and_verify_open_pose.assert_not_called()
+        b.arm._collision_guard.check_hand_return.assert_not_called()
+        assert clock[0] <= 10.61
+        if missing in ('enabled', 'controller'):
+            assert clock[0] == 10.
+    b.arm.enable.assert_not_called()
+
+
+@pytest.mark.parametrize('fault', ['missing', 'age', 'status'])
+def test_slow_hand_geometry_reacquires_fresh_frames_before_first_hand_command(fault, monkeypatch):
+    import copy
+    clock = [10.]
+    monkeypatch.setattr('esrobo_link.backends.time.monotonic', lambda: clock[0])
+    monkeypatch.setattr('esrobo_link.backends.time.sleep', lambda dt: clock.__setitem__(0, clock[0]+dt))
+    b = backend()
+    healthy = copy.deepcopy(b.snapshot.return_value)
+    delayed = copy.deepcopy(healthy)
+    if fault == 'missing': delayed['arm_urdf_rad'] = None
+    if fault == 'age': delayed['arm_feedback_age_s'] = .2
+    if fault == 'status': delayed['controller_fault'] = {'category': 'driver_feedback_stale', 'joint': 1}
+    def geometry(*_):
+        clock[0] += .6
+        b.snapshot.side_effect = [delayed, delayed, healthy, healthy, healthy]
+        return True
+    b.arm._collision_guard.check_hand_return.side_effect = geometry
+    original = b.hand.align_and_verify_open_pose.side_effect
+    def hand(*args, **kwargs):
+        assert clock[0] >= 10.62
+        return original(*args, **kwargs)
+    b.hand.align_and_verify_open_pose.side_effect = hand
+    result = b.return_zero(lambda: False)
+    assert result['returned'] and result['hands_open'] and result['disabled']
+    b.arm.enable.assert_not_called()
+    b.arm._arm.reset.assert_not_called()
+
+
+@pytest.mark.parametrize('fault,expected', [
+    ('drift', 'J3 delta='), ('enabled', 'disable lost'),
+    ('controller', 'controller fault'), ('driver', 'driver fault'),
+    ('missing', 'feedback incomplete'), ('invalid', 'invalid seven-joint'),
+])
+def test_post_geometry_refusal_preserves_anchor_and_reports_exact_reason(fault, expected, monkeypatch):
+    clock = [10.]
+    monkeypatch.setattr('esrobo_link.backends.time.monotonic', lambda: clock[0])
+    monkeypatch.setattr('esrobo_link.backends.time.sleep', lambda dt: clock.__setitem__(0, clock[0]+dt))
+    b = backend()
+    def geometry(*_):
+        s = b.snapshot.return_value
+        if fault == 'drift': s['arm_urdf_rad'][2] = .02
+        if fault == 'enabled': s['enable_states'] = [True]*7
+        if fault == 'controller': s['controller_fault'] = {'category': 'controller_fault', 'arm_status': 1}
+        if fault == 'driver': s['driver_fault'] = 'fault'
+        if fault == 'missing': s['arm_urdf_rad'] = None
+        if fault == 'invalid': s['arm_urdf_rad'][0] = float('nan')
+        return True
+    b.arm._collision_guard.check_hand_return.side_effect = geometry
+    result = b.return_zero(lambda: False)
+    assert not result['returned'] and not result['hands_open']
+    assert expected in result['reason']
+    assert result['hand_return_feedback'] is not None
+    assert clock[0] <= 10.61  # bounded preflight and stopped-output cleanup
+    b.hand.align_and_verify_open_pose.assert_not_called()
+    b.arm.safe_return.assert_not_called()

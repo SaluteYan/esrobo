@@ -33,7 +33,6 @@ class Settings:
     input_hold_max_s: float = 0.5
     input_resume_frames: int = 3
     input_resume_arm_delta_deg: float = 5.0
-    input_resume_hand_delta_unit: int = 15
     pico_wrist_max_angle_deg: float = 180.0
 
     def validate(self):
@@ -59,9 +58,7 @@ class Settings:
         if not (0 < self.input_hold_after_s < self.control_gap_timeout_s
                 and self.input_max_age_s < self.input_hold_max_s <= .5
                 and type(self.input_resume_frames) is int and 3 <= self.input_resume_frames <= 5
-                and 0 < self.input_resume_arm_delta_deg <= 5
-                and type(self.input_resume_hand_delta_unit) is int
-                and 0 < self.input_resume_hand_delta_unit <= 15):
+                and 0 < self.input_resume_arm_delta_deg <= 5):
             raise ValueError("invalid bounded input hold limits")
         if not (0 < self.pico_wrist_max_angle_deg <= 180.0):
             raise ValueError("PICO wrist mapping angle must stay within 0..60 degrees")

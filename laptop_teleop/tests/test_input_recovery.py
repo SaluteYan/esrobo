@@ -75,7 +75,7 @@ def test_fresh_unreachable_frames_do_not_become_an_input_gap(monkeypatch, side, 
 
 
 @pytest.mark.parametrize('component', ['arm', 'hand', 'both'])
-def test_recorded_j6_and_finger_excursion_still_rejected(component):
+def test_recorded_excursion_rejects_only_arm_range(component):
     s = Settings(side='left', with_hand=True)
     anchor = targets(s)
     anchor['left']['arm_urdf_rad'][5] = np.deg2rad(24.26008)
@@ -87,12 +87,12 @@ def test_recorded_j6_and_finger_excursion_still_rejected(component):
         candidate['left']['hand_unit'] = [225,134,147,132,136,137,22,122,121,128]
     r = InputRecovery(s)
     r.begin(anchor)
-    with pytest.raises(RecoveryRejected) as exc:
-        r.evaluate(candidate, 1.)
     if component in ('arm', 'both'):
-        assert 'left J6 delta 31.00deg > 15deg' in str(exc.value)
-    if component in ('hand', 'both'):
-        assert 'left hand[5] delta 92 > 30' in str(exc.value)
+        with pytest.raises(RecoveryRejected, match='left J6 delta 31.00deg > 15deg'):
+            r.evaluate(candidate, 1.)
+    else:
+        for i in range(3):
+            assert r.evaluate(candidate, 1.+i*.02) == (i == 2)
     assert r.started is None and r.anchor == InputRecovery.sources(anchor)
 
 
@@ -262,3 +262,50 @@ def test_unreachable_frames_cannot_extend_recovery_deadlines(monkeypatch, starte
     clock[0] = (original_start+3.01 if started else hold_start+.501)
     with pytest.raises(RecoveryRejected, match='3 s' if started else '500 ms'):
         tick()
+
+
+@pytest.mark.parametrize('side,hand_only', [('left', False), ('right', False), ('both', False), ('left', True), ('right', True)])
+def test_hand_recovery_accepts_full_range_and_adjacent_changes(side, hand_only):
+    s = Settings(side=side, with_hand=True, hand_only=hand_only)
+    r = InputRecovery(s); r.begin(targets(s, hand=0))
+    for i, hand in enumerate([255, 0, 255]):
+        assert r.evaluate(targets(s, hand=hand), 1.+i*.02) == (i == 2)
+    assert r.diagnostic['allowed'] and r.diagnostic['adjacent_allowed']
+    assert all(v['hand_limit_unit'] is None for v in r.diagnostic['limits'].values())
+
+
+@pytest.mark.parametrize('bad', [[0]*9, [float('nan')]*10, [float('inf')]*10, [-1]*10, [256]*10])
+def test_hand_recovery_still_rejects_invalid_positions(bad):
+    s = Settings(side='left', with_hand=True)
+    r = InputRecovery(s); r.begin(targets(s))
+    candidate = targets(s); candidate['left']['hand_unit'] = bad
+    with pytest.raises(RecoveryRejected, match='ten valid hand positions'):
+        r.evaluate(candidate, 1.)
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+def test_large_finger_recovery_uses_latest_goal_and_bounded_commands(monkeypatch, side):
+    c,p,client,state,clock,tick = active_fixture(monkeypatch, side, True)
+    # No arm excursion: even ordinary arm recovery must keep the hand ramp.
+    p.solve.return_value[side]['arm_urdf_rad'] = copy.deepcopy(c.recovery.anchor[side]['arm'])
+    state['feedback']['arm_urdf_rad'] = copy.deepcopy(p.solve.return_value[side]['arm_urdf_rad'])
+    goal = p.solve.return_value[side]['hand_unit']
+    goal[2:6] = [249,255,255,255]
+    assert tick() is None; assert tick() is None
+    result = tick()
+    assert c.recovery is not None and c.recovery.started is not None
+    limiter = c.recovery_hands[side]
+    enabled = limiter.enabled
+    actual = np.asarray(state['feedback']['hand']['position_unit'])
+    assert np.max(np.abs(np.asarray(result[side]['hand_unit'])[enabled]-actual[enabled])) <= limiter.lead
+    assert result[side]['hand_unit'][2:6] != goal[2:6]
+    for i in range(100):
+        previous = np.asarray(result[side]['hand_unit'])
+        state['feedback']['hand']['position_unit'] = previous.tolist()
+        if i == 2: goal[2:6] = [0,0,0,0]  # new qualified target replaces old goal
+        result = tick()
+        command = np.asarray(result[side]['hand_unit'])
+        assert np.max(np.abs(command[enabled]-previous[enabled])) <= min(limiter.step, limiter.velocity*.02)+1e-7
+        if c.recovery is None: break
+    assert c.recovery is None
+    np.testing.assert_allclose(command[2:6], goal[2:6], atol=2)

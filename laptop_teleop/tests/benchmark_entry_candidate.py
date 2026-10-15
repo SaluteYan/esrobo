@@ -58,7 +58,7 @@ def run(args):
         repeats = []
         for repeat in range(args.repeats):
             age_s = args.feedback_ages_ms[repeat % len(args.feedback_ages_ms)] / 1000
-            trajectory = CommandTrajectory(driver._joint_rate_limit_vector('right','max_joint_velocity')*cfg.robot.return_speed_scale,
+            trajectory = CommandTrajectory(driver._joint_rate_limit_vector('right','max_joint_velocity'),
                 driver._joint_rate_limit_vector('right','max_joint_acceleration'),
                 driver._joint_rate_limit_vector('right','max_joint_step'),np.deg2rad(cfg.robot.command_trajectory_lead_deg),
                 max_dt=cfg.robot.return_command_trajectory_max_dt_s)
@@ -91,7 +91,7 @@ def run(args):
             t=time.perf_counter();error=None
             try:
                 candidate=trajectory.propose(goal,current,stamp,lower,upper,fk,
-                    cfg.retarget.max_endpoint_translation_velocity_m_s*cfg.robot.return_speed_scale,path_check=check)
+                    cfg.retarget.max_endpoint_translation_velocity_m_s,path_check=check)
                 accepted=check(current,candidate.position)
             except ValueError as exc:
                 error=str(exc);accepted=False

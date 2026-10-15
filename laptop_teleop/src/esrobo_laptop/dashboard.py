@@ -328,7 +328,7 @@ class Console:
 
     def key(self, key):
         # Never type into an exited program's shell. Only the gateway Python pane accepts keys.
-        previous_result = self.robot_state().get('operator_result', {}) if key == 'g' else {}
+        previous_result = self.robot_state().get('operator_result', {}) if key in ('g', 'h') else {}
         previous_seq = previous_result.get('seq', -1)
         panes = self.command(['tmux', 'list-panes', '-a', '-F', '#{session_name}|#{pane_current_command}'])
         command = next((row.split('|', 1)[1] for row in panes.splitlines()
@@ -337,6 +337,18 @@ class Console:
             raise RuntimeError('网关 Python 程序未运行，拒绝发送终端按键')
         self.command(['tmux', 'send-keys', '-t', SESSIONS['gateway'], '-l', key])
         self.command(['tmux', 'send-keys', '-t', SESSIONS['gateway'], 'Enter'])
+        if key == 'h':
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                self.refresh()
+                result = self.robot_state().get('operator_result', {})
+                if result.get('action') == 'h' and result.get('seq', -1) > previous_seq:
+                    if not result.get('accepted'):
+                        raise RuntimeError(result.get('message') or '网关拒绝受控停止')
+                    self.event('受控停止已接受；机器人端保持使能，不自动恢复跟随')
+                    return dict(message=result.get('message'))
+                time.sleep(.05)
+            raise RuntimeError('受控停止未收到网关确认；请检查状态，必要时使用紧急停止')
         if key == 'g':
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
@@ -662,6 +674,23 @@ class Console:
             if session == self.owner:
                 self.heartbeat = time.monotonic()
             return {}
+        if action == 'motion_hold':
+            # Send the distinct hold request before closing the producer. Old
+            # endpoints must never interpret this button as electronic stop.
+            self.refresh()
+            state = self.robot_state()
+            if (not self.connected() or SESSIONS['gateway'] not in self.remote.get('sessions', [])
+                    or state.get('age_s', 999) > 1
+                    or state.get('controlled_stop_protocol') != 1
+                    or state.get('controlled_stop_enabled') is not True
+                    or state.get('mode') not in ('ACTIVE', 'HOLD_LATCHED')):
+                raise RuntimeError('当前状态或网关尚不支持受控停止；需要立即中止时请使用顶部“紧急停止”')
+            try:
+                return self.key('h') or {}
+            finally:
+                # On a commissioned endpoint close/lease expiry also transfers
+                # to robot-owned hold. Never append the generic s command.
+                self.stop_following(explicit_stop=False)
         if action == 'stop' or (action == 'release' and session == self.owner):
             self.stop_following(explicit_stop=action == 'stop')
             if action == 'stop' and SESSIONS['waist'] in self.remote.get('sessions', []):
@@ -823,20 +852,25 @@ class Console:
                     if saved:
                         return dict(log=saved)
                 return dict(log=self.command(['tmux', 'capture-pane', '-p', '-t', SESSIONS[name], '-S', '-180']))
-            elif action in ('remote_diagnostics', 'remote_sync'):
-                if self.running('teleop'):
-                    raise RuntimeError('先停止本机计算再诊断或同步机器人代码')
-                self.refresh()
-                if self.robot_state().get('mode') not in (None, 'IDLE', 'FAULT'):
-                    raise RuntimeError('机器人仍在准备、恢复或运动；暂不诊断或同步')
-                from .robot_maintenance import CAN_DIAGNOSTICS, sync_sources
-                if action == 'remote_diagnostics':
-                    return dict(log=self.command(['python3', '-c', CAN_DIAGNOSTICS], timeout=8))
-                result = sync_sources(self, WORKSPACE, REMOTE)
-                self.event(result['message'])
-                return result
             elif action == 'can':
                 return self.initialize_can(data.get('password', ''))
+            elif action == 'remote_wake_left_zero':
+                if data.get('supported') is not True or data.get('project_zero_confirmed') is not True:
+                    raise RuntimeError('需要现场确认左臂已托稳且仍保持项目受检回零姿态')
+                if self.running('teleop'):
+                    raise RuntimeError('先停止本机计算')
+                self.refresh()
+                if SESSIONS['gateway'] in self.remote.get('sessions', []):
+                    raise RuntimeError('先停止网关，避免多个程序同时控制 CAN')
+                from .robot_maintenance import wake_left_zero_script
+                output = self.command([REMOTE_PYTHON, '-c', wake_left_zero_script(REMOTE)], timeout=20)
+                results = [line.split('=', 1)[1] for line in output.splitlines()
+                           if line.startswith('SDK_WAKE_RESULT=')]
+                if len(results) != 1:
+                    raise RuntimeError('使能恢复未返回核验结果；保持支撑并检查机器人')
+                result = json.loads(results[0])
+                self.event('左臂已知零位 CAN 唤醒完成；核验结果：'+json.dumps(result, ensure_ascii=False))
+                return result
             elif action == 'remote_recover':
                 if self.running('teleop'):
                     raise RuntimeError('先停止本机计算再恢复网关')
@@ -906,81 +940,86 @@ class Console:
                 self.event('手套序列号已配置')
             elif action == 'gateway_key':
                 key = data.get('key')
-                if key not in ('e', 'g', 's', 'x', 'd', 'dl', 'dr', 'dh', 'z', 'q'):
+                if key not in ('e', 's', 'x', 'd', 'dl', 'dr', 'dh', 'z', 'q'):
                     raise ValueError('未知网关命令')
-                self.refresh()
-                if key in ('e', 'g'):
-                    if WAIST_MOVED_FILE.exists():
-                        raise RuntimeError('腰部曾通过页面离开竖直基准；请读取腰部反馈，确认 31/32/33 号回到 139° / 215° / 144°（±0.2°）')
-                    remote_args = self.remote.get('gateway_args', [])
-                    if ('--side' in remote_args
-                            and remote_args[remote_args.index('--side')+1] == 'both'):
-                        raise RuntimeError(
-                            '双臂自动准备尚无双臂互碰扫掠检查，已拒绝回零和使能；'
-                            '请改用单臂模式或执行现场验证过的双臂恢复流程')
-                    state, local = self.robot_state(), self.telemetry()
-                    feedback = state.get('feedback', {})
-                    members = feedback.get('sides', {self.mode['side']: feedback})
-                    if (session != self.owner or not self.running('teleop') or self.mode['preview']
-                            or local.get('age_s', 999) > 1 or not local.get('targets')
-                            or local.get('sent', 0) < 1 or state.get('age_s', 999) > 1
-                            or state.get('mode') != ('CALIBRATING' if key == 'g' else 'IDLE') or not members
-                            or any(v.get('controller_fault') for v in members.values())):
-                        raise RuntimeError('准备/接管需要正式计算、持续有效目标、新鲜对应阶段反馈且控制器无故障')
-                    if key == 'g' and not state.get('entry_ready'):
-                        raise RuntimeError('请保持接管姿态稳定，等待完整目标就绪')
-                    if self.mode.get('with_hand') and not self.mode.get('hand_only'):
-                        incomplete = []
-                        for side, member in members.items():
-                            geometry = (member.get('hand') or {}).get('geometry') or {}
-                            if not geometry.get('ready'):
-                                count = geometry.get('calibrated_joints', 0)
-                                total = geometry.get('total_joints', 10)
-                                incomplete.append(
-                                    f"{'左' if side == 'left' else '右'}手 {count}/{total}"
-                                )
-                        if incomplete:
-                            raise RuntimeError(
-                                '灵巧手碰撞几何标定不完整（' + '、'.join(incomplete) +
-                                '），已在机器人运动前拒绝联合使能。可先选择仅机械臂或仅灵巧手；'
-                                '机械臂与灵巧手联合运动需完成反馈值到 URDF 关节角的几何标定。'
-                            )
-                    if not self.mode.get('hand_only'):
-                        if SESSIONS['waist'] not in self.remote.get('sessions', []):
-                            raise RuntimeError('机械臂使能前需要运行腰部驱动并读取竖直姿态反馈')
-                        try:
-                            axes = self.waist_command('status')['axes']
-                            for axis, reference in WAIST_REFERENCE_DEG.items():
-                                feedback = axes[str(axis)]
-                                position = feedback['position_deg']
-                                velocity = feedback['velocity']
-                                error = feedback['error']
-                                if (not isinstance(position, (int, float)) or not math.isfinite(position)
-                                        or not isinstance(velocity, (int, float)) or not math.isfinite(velocity)
-                                        or abs(position - reference) > WAIST_REFERENCE_TOLERANCE_DEG
-                                        or abs(velocity) > 1.0
-                                        or error not in (0, WAIST_SINGLE_TURN_BATTERY_WARNING)):
-                                    raise RuntimeError(
-                                        f'腰部 {axis} 号未停在 URDF 竖直基准 {reference:g}° ±'
-                                        f'{WAIST_REFERENCE_TOLERANCE_DEG:g}°；当前反馈：位置 {position!r}°，'
-                                        f'速度 {velocity!r}°/s，错误码 {error!r}'
-                                    )
-                        except (KeyError, TypeError, ValueError) as exc:
-                            raise RuntimeError('腰部三轴反馈不完整；拒绝机械臂使能') from exc
-                elif key in ('s', 'x'):
-                    self.stop_following()
-                    return {}
-                elif key in ('d', 'dl', 'dr', 'dh', 'z', 'q') and self.running('teleop'):
-                    raise RuntimeError('请先停止计算')
-                if key == 'z' and '--side' in self.remote.get('gateway_args', []):
-                    argv = self.remote['gateway_args']
-                    if argv[argv.index('--side')+1] == 'both':
-                        raise RuntimeError('双臂网关不支持自动回零；请按机器人恢复流程处理')
-                result = self.key(key)
-                if key == 'g':
-                    return result or {}
+                return self._gateway_key(key, session)
             else:
                 raise ValueError('未知操作')
+        return {}
+
+    def _gateway_key(self, key, session):
+        """Shared preparation checks; g is called only by automatic handover."""
+        self.refresh()
+        if key in ('e', 'g'):
+            if WAIST_MOVED_FILE.exists():
+                raise RuntimeError('腰部曾通过页面离开竖直基准；请读取腰部反馈，确认 31/32/33 号回到 139° / 215° / 144°（±0.2°）')
+            remote_args = self.remote.get('gateway_args', [])
+            if ('--side' in remote_args
+                    and remote_args[remote_args.index('--side')+1] == 'both'):
+                raise RuntimeError(
+                    '双臂自动准备尚无双臂互碰扫掠检查，已拒绝回零和使能；'
+                    '请改用单臂模式或执行现场验证过的双臂恢复流程')
+            state, local = self.robot_state(), self.telemetry()
+            feedback = state.get('feedback', {})
+            members = feedback.get('sides', {self.mode['side']: feedback})
+            if (session != self.owner or not self.running('teleop') or self.mode['preview']
+                    or local.get('age_s', 999) > 1 or not local.get('targets')
+                    or local.get('sent', 0) < 1 or state.get('age_s', 999) > 1
+                    or state.get('mode') != ('CALIBRATING' if key == 'g' else 'IDLE') or not members
+                    or any(v.get('controller_fault') for v in members.values())):
+                raise RuntimeError('准备/接管需要正式计算、持续有效目标、新鲜对应阶段反馈且控制器无故障')
+            if key == 'g' and not state.get('entry_ready'):
+                raise RuntimeError('请保持接管姿态稳定，等待完整目标就绪')
+            if self.mode.get('with_hand') and not self.mode.get('hand_only'):
+                incomplete = []
+                for side, member in members.items():
+                    geometry = (member.get('hand') or {}).get('geometry') or {}
+                    if not geometry.get('ready'):
+                        count = geometry.get('calibrated_joints', 0)
+                        total = geometry.get('total_joints', 10)
+                        incomplete.append(
+                            f"{'左' if side == 'left' else '右'}手 {count}/{total}"
+                        )
+                if incomplete:
+                    raise RuntimeError(
+                        '灵巧手碰撞几何标定不完整（' + '、'.join(incomplete) +
+                        '），已在机器人运动前拒绝联合使能。可先选择仅机械臂或仅灵巧手；'
+                        '机械臂与灵巧手联合运动需完成反馈值到 URDF 关节角的几何标定。'
+                    )
+            if not self.mode.get('hand_only'):
+                if SESSIONS['waist'] not in self.remote.get('sessions', []):
+                    raise RuntimeError('机械臂使能前需要运行腰部驱动并读取竖直姿态反馈')
+                try:
+                    axes = self.waist_command('status')['axes']
+                    for axis, reference in WAIST_REFERENCE_DEG.items():
+                        feedback = axes[str(axis)]
+                        position = feedback['position_deg']
+                        velocity = feedback['velocity']
+                        error = feedback['error']
+                        if (not isinstance(position, (int, float)) or not math.isfinite(position)
+                                or not isinstance(velocity, (int, float)) or not math.isfinite(velocity)
+                                or abs(position - reference) > WAIST_REFERENCE_TOLERANCE_DEG
+                                or abs(velocity) > 1.0
+                                or error not in (0, WAIST_SINGLE_TURN_BATTERY_WARNING)):
+                            raise RuntimeError(
+                                f'腰部 {axis} 号未停在 URDF 竖直基准 {reference:g}° ±'
+                                f'{WAIST_REFERENCE_TOLERANCE_DEG:g}°；当前反馈：位置 {position!r}°，'
+                                f'速度 {velocity!r}°/s，错误码 {error!r}'
+                            )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError('腰部三轴反馈不完整；拒绝机械臂使能') from exc
+        elif key in ('s', 'x'):
+            self.stop_following()
+            return {}
+        elif key in ('d', 'dl', 'dr', 'dh', 'z', 'q') and self.running('teleop'):
+            raise RuntimeError('请先停止计算')
+        if key == 'z' and '--side' in self.remote.get('gateway_args', []):
+            argv = self.remote['gateway_args']
+            if argv[argv.index('--side')+1] == 'both':
+                raise RuntimeError('双臂网关不支持自动回零；请按机器人恢复流程处理')
+        result = self.key(key)
+        if key == 'g':
+            return result or {}
         return {}
 
     def head(self, method, path, body=None):
@@ -1041,7 +1080,8 @@ class Console:
             return
         self.auto_handover_last_attempt = time.monotonic()
         try:
-            self.action(dict(action='gateway_key', key='g', session=self.owner))
+            with self.lock:
+                self._gateway_key('g', self.owner)
             self.auto_handover_error = ''
         except Exception as exc:
             self.auto_handover_error = str(exc)

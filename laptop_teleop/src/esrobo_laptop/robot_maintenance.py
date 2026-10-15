@@ -1,87 +1,70 @@
-"""Fixed, non-motion robot diagnostics and source deployment over existing SSH."""
-import hashlib
-import json
-import posixpath
-import subprocess
-import time
+"""Explicitly supervised SDK commissioning."""
 
 
-CAN_DIAGNOSTICS = r'''
-import collections,json,socket,struct,subprocess,time
-result={'links':json.loads(subprocess.check_output(['ip','-details','-statistics','-json','link','show','type','can'])),'frames':{}}
-for name in ('can_piper1','can_piper2'):
- counts=collections.Counter()
- try:
-  with socket.socket(socket.AF_CAN,socket.SOCK_RAW,socket.CAN_RAW) as bus:
-   bus.bind((name,)); bus.settimeout(.05)
-   deadline=time.monotonic()+1.
-   while time.monotonic()<deadline:
+def wake_confirmed_left_zero(arm, zero, tolerance):
+    """Supervised commissioning only; always finish with bounded disable."""
+    import numpy as np
+    result = dict(wake_attempted=False, zero_verified=False, disabled=False)
     try:
-     frame=bus.recv(16); ident=struct.unpack('=I',frame[:4])[0]
-     counts[hex(ident)]+=1
-    except socket.timeout: pass
-  result['frames'][name]={'count':sum(counts.values()),'ids':dict(counts)}
- except OSError as exc: result['frames'][name]={'error':str(exc)}
-print(json.dumps(result))
-'''
-
-
-def sync_sources(console, workspace, remote):
-    """Upload only tracked runtime sources/config; never restart or command devices."""
-    paths = subprocess.check_output([
-        'git', 'ls-files', '-z', '--', 'robot_link/esrobo_link',
-        'teleoperation/src/esrobo_teleop', 'teleoperation/config',
-        'teleoperation/urdf/esrobo_waist_with_head.urdf',
-    ], cwd=workspace).decode().split('\0')
-    sources = {}
-    for path in filter(None, paths):
-        local = workspace / path
-        if local.is_symlink() or not local.is_file() or workspace.resolve() not in local.resolve().parents:
-            raise RuntimeError('不能同步非普通项目文件：' + path)
-        if local.suffix not in ('.py', '.yaml', '.yml', '.json', '.urdf'):
-            continue
-        sources[path] = local.read_bytes()
-    if not sources:
-        raise RuntimeError('未找到受版本控制的运行文件')
-    # Hash only these fixed local manifest paths; HTTP cannot choose a path or command.
-    script = ('import hashlib,json,pathlib\n'
-              f'root=pathlib.Path({remote!r})\n'
-              f'paths={list(sources)!r}\n'
-              'print(json.dumps({p:hashlib.sha256((root/p).read_bytes()).hexdigest() '
-              'if (root/p).is_file() else None for p in paths}))')
-    hashes = json.loads(console.command(['python3', '-c', script], timeout=30))
-    changed = [p for p, data in sources.items() if hashes.get(p) != hashlib.sha256(data).hexdigest()]
-    if not changed:
-        return dict(changed=0, message='机器人磁盘源码已一致；运行中的网关仍须核对恢复版本。')
-    backup = remote + '/.deploy-backups/' + str(time.time_ns())
-    with console.remote_lock:
-        with console.ssh.open_sftp() as sftp:
-            def mkdirs(path):
+        q = arm.get_joint_angles(timeout=.3)
+        states = arm.get_joint_enable_states()
+        fault = arm.controller_fault(allow_disabled=True, allow_estop=True)
+        if fault and fault.get('category') not in (
+                'controller_feedback_stale', 'driver_feedback_stale'):
+            raise RuntimeError('controller/driver fault refuses commissioning: '+str(fault))
+        if q is not None:
+            if not np.all(np.isfinite(q)) or np.shape(q) != (7,) or np.max(np.abs(q-zero)) > tolerance:
+                raise RuntimeError('measured pose differs from operator-confirmed project zero')
+        if q is None or states is None:
+            result['wake_attempted'] = True
+            q, states = arm.enable_at_known_target(zero, speed_percent=5, timeout=3.)
+        result['zero_verified'] = bool(q is not None and np.shape(q) == (7,)
+            and np.all(np.isfinite(q)) and np.max(np.abs(q-zero)) <= tolerance
+            and states is not None and len(states) == 7)
+        if not result['zero_verified']:
+            raise RuntimeError('wake failed to verify seven-joint zero feedback')
+        result['physical_rad'] = np.asarray(q).tolist()
+        result['enable_states_after_wake'] = states
+    except Exception as exc:
+        result['error'] = str(exc)
+    finally:
+        # An operator has explicitly supported the arm for this operation.
+        # Missing feedback is never reported as successful disable.
+        try:
+            if result['wake_attempted']:
+                result['disabled'] = bool(arm.disable(timeout=3.))
+                if not result['disabled']:
+                    arm.best_effort_disable_once()
+            else:
+                result['disabled'] = arm.get_joint_enable_states() == [False]*7
+            result['final_enable_states'] = arm.get_joint_enable_states()
+            result['disabled'] = bool(result['disabled'] and result['final_enable_states'] == [False]*7)
+            result['controller_fault'] = arm.controller_fault(allow_disabled=True)
+        except Exception as exc:
+            result['cleanup_error'] = str(exc)
+            result['disabled'] = False
+            if result['wake_attempted']:
                 try:
-                    sftp.stat(path)
-                except FileNotFoundError:
-                    mkdirs(posixpath.dirname(path))
-                    sftp.mkdir(path)
-            for path in changed:
-                target = remote + '/' + path
-                temporary = backup + '/new/' + path
-                saved = backup + '/old/' + path
-                mkdirs(posixpath.dirname(temporary))
-                mkdirs(posixpath.dirname(saved))
-                mkdirs(posixpath.dirname(target))
-                if hashes.get(path) is not None:
-                    with sftp.open(target, 'rb') as old, sftp.open(saved, 'wb') as copy:
-                        copy.write(old.read())
-                with sftp.open(temporary, 'wb') as out:
-                    out.write(sources[path])
-                sftp.chmod(temporary, 0o644)
-                with sftp.open(temporary, 'rb') as check:
-                    if hashlib.sha256(check.read()).digest() != hashlib.sha256(sources[path]).digest():
-                        raise RuntimeError('上传校验失败：' + path)
-                # OpenSSH atomic replace: readers never see a partial Python file.
-                sftp.posix_rename(temporary, target)
-    verification = json.loads(console.command(['python3', '-c', script], timeout=30))
-    if any(verification.get(p) != hashlib.sha256(data).hexdigest() for p, data in sources.items()):
-        raise RuntimeError('同步后源码校验不一致；未重启网关，请检查备份：' + backup)
-    return dict(changed=len(changed), backup=backup,
-                message=f'已同步并校验 {len(changed)} 个运行文件；备份：{backup}。尚未重启网关或执行运动。')
+                    arm.best_effort_disable_once()
+                except Exception as disable_exc:
+                    result['disable_send_error'] = str(disable_exc)
+    return result
+
+
+def wake_left_zero_script(remote):
+    """Fixed SDK operation, serialized with the gateway's hardware lock."""
+    import inspect
+    return ('import sys,os,fcntl,json,numpy as np\n'
+        + f'sys.path.insert(0, {remote + "/teleoperation/src"!r})\n'
+        + 'lock=open(f"/tmp/esrobo-robot-link-{os.getuid()}.lock", "a")\n'
+        + 'fcntl.flock(lock, fcntl.LOCK_EX|fcntl.LOCK_NB)\n'
+        + inspect.getsource(wake_confirmed_left_zero)
+        + '\nfrom esrobo_teleop.config import load_config\n'
+        + 'from esrobo_teleop.robot.nero_driver import NeroArm\n'
+        + f'cfg=load_config({remote + "/teleoperation/config/teleop_config.yaml"!r}).robot\n'
+        + 'arm=NeroArm(cfg, "can_piper1", "left")\n'
+        + 'try:\n arm.connect()\n'
+        + ' result=wake_confirmed_left_zero(arm, np.asarray(cfg.left_joint_offsets, float), '
+          'np.deg2rad(cfg.full_arm_startup_zero_tolerance_deg))\n'
+        + ' print("SDK_WAKE_RESULT="+json.dumps(result), flush=True)\n'
+        + 'finally:\n arm.disconnect()\n')

@@ -34,6 +34,112 @@ def test_frozen_checks_cover_whole_interval_without_distance_or_mesh_work():
     g._refresh_hand.assert_not_called()
 
 
+@pytest.mark.parametrize('change', ['none', 'stale', 'hand', 'provider', 'margin', 'pose', 'ended'])
+def test_stationary_preload_checks_existing_full_hand_proof_without_rebuilding(change):
+    g, state, _ = entry_guard()
+    lo, hi = np.full(14, -.01), np.full(14, .01)
+    assert g(lo, hi)
+    g._clearance = Mock(side_effect=AssertionError('distance during preload'))
+    g._build_fingers = Mock(side_effect=AssertionError('mesh during preload'))
+    g._refresh_hand = Mock(side_effect=AssertionError('refresh during preload'))
+    q = np.zeros(14)
+    if change == 'stale': state.valid = False
+    if change == 'hand': state.intervals = {'thumb': (-.2, .2)}
+    if change == 'provider': g.hand_state_provider = lambda _: state
+    if change == 'margin': g.margin += .001
+    if change == 'pose': q[0] = .011
+    if change == 'ended': g.end_entry_certificates()
+    assert g.check_cached_coverage(q, q) == (change == 'none')
+    assert not g._entry_coverage_only  # Return planning is not frozen by this check.
+    g._clearance.assert_not_called()
+    g._build_fingers.assert_not_called()
+    g._refresh_hand.assert_not_called()
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+def test_recovery_preload_uses_scalar_full_hand_proof_after_slow_geometry(side):
+    import time
+    d, _, _ = make_driver(side, initial=np.ones(7)*.03)
+    g, _, _ = entry_guard()
+    d._collision_guard = g
+    d._enabled = False
+    enabled = {'value': False}
+    d._arm.get_joint_enable_states.side_effect = lambda: [enabled['value']]*7
+    d._configure_arm_collision_safety = Mock(return_value=True)
+    d._capture_arm_torque_baseline = Mock(return_value=True)
+
+    def slow_distance(*_, **__):
+        d._return_feedback_received = time.monotonic() - .362
+        g._box_certified = True
+        return 1.
+
+    def enable(**_):
+        enabled['value'] = True
+        return True
+
+    g._clearance.side_effect = slow_distance
+    d._arm.enable.side_effect = enable
+    assert d._enable_for_return()
+    assert g.last_diagnostics['entry_coverage_only']
+    assert g.last_diagnostics['checked_boxes'] == 0
+    d._arm.move_j.assert_called_once()
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+@pytest.mark.parametrize('preparation', [False, True])
+@pytest.mark.parametrize('initial_offset', [.0005, .04])
+def test_return_and_preparation_keep_collision_profile_through_execution(side, preparation, initial_offset):
+    import time
+    from types import SimpleNamespace
+    from unittest import mock
+    from esrobo_link.backends import HardwareBackend
+    d, _, _ = make_driver(side, initial=np.ones(7)*initial_offset)
+    g, _, _ = entry_guard()
+    d._collision_guard = g
+    d._enabled = False
+    enabled = {'value': False}
+    d._arm.get_joint_enable_states.side_effect = lambda: [enabled['value']]*7
+    d._configure_arm_collision_safety = Mock(return_value=True)
+    d._capture_arm_torque_baseline = Mock(return_value=True)
+
+    def distance(*_, **kwargs):
+        assert kwargs.get('include_fingers') is not preparation
+        assert not enabled['value'], 'heavy geometry after enable'
+        d._return_feedback_received = time.monotonic() - .362
+        g._box_certified = True
+        return 1.
+
+    def enable(**_):
+        enabled['value'] = True
+        return True
+
+    def disable():
+        enabled['value'] = False
+        return True
+
+    g._clearance.side_effect = distance
+    d._arm.enable.side_effect = enable
+    d._arm.disable.side_effect = disable
+    with mock.patch('esrobo_teleop.robot.nero_driver.time.sleep'):
+        if preparation:
+            b = HardwareBackend.__new__(HardwareBackend)
+            b.side, b.arm, b.hand_only, b.hand = side, d, False, Mock()
+            b.cfg = SimpleNamespace(hand=SimpleNamespace(max_stale_time_s=.15))
+            b.hand.feedback_snapshot.return_value = dict(position_unit=[128.]*10, age_s=.01)
+            result = b.prepare_session(lambda: False)
+            assert result['returned'] and result['disabled'] and result['hands_stationary'], result
+            b.hand.align_and_verify_open_pose.assert_not_called()
+        else:
+            result = d.safe_return(recover=True, recognize_inherited_stop=True)
+            assert result.returned and result.disabled, result
+    assert not enabled['value']
+    assert g._clearance.call_count > 0
+    if preparation or initial_offset > .01:
+        assert d._arm.move_j.call_count > 1
+    else:
+        d._arm.enable.assert_not_called()
+
+
 @pytest.mark.parametrize('change', ['stale', 'hand', 'missing_joint', 'nan',
     'margin', 'shoulder', 'pair_margin', 'model', 'geometry', 'horizon', 'provider', 'mode'])
 def test_changed_context_or_hand_fails_closed_and_cannot_rebuild(change):
@@ -347,3 +453,48 @@ def test_certificate_invalidated_during_deadline_wait_prevents_send(monkeypatch)
     d, ok, calls, commits, _ = fixture.run_entry()
     assert not ok and not calls and not commits
     assert d._entry_diagnostics.samples[-1]['reason'] == 'entry_certificate_rejected_before_send'
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+@pytest.mark.parametrize('failure', [None, 'stale', 'missing', 'moving', 'drift',
+                                     'candidate', 'controller', 'torque', 'disabled',
+                                     'cancel', 'hand', 'provider'])
+def test_ready_activation_consumes_proof_without_geometry_or_command_reset(side, failure):
+    import time
+    from esrobo_teleop.robot.nero_driver import JointFeedbackSnapshot
+    d, feedback, zero = make_driver(side)
+    d._trajectory.reset(zero, 10.)
+    g, hand, _ = entry_guard()
+    assert g(np.full(14, -.0035), np.full(14, .0035))
+    assert g.freeze_entry_certificates()
+    d._collision_guard = g
+    d._activation_candidate = zero.copy()
+    g._clearance = Mock(side_effect=AssertionError('geometry during ready handshake'))
+    g._build_fingers = Mock(side_effect=AssertionError('mesh during ready handshake'))
+    sample = JointFeedbackSnapshot(feedback, 10.02, time.monotonic(), 'test')
+    def read():
+        d._cycle_feedback = sample
+        return None if failure == 'missing' else np.zeros(14)
+    d.read_control_cycle_joints = Mock(side_effect=read)
+    candidate = zero.copy()
+    if failure == 'stale':
+        sample = JointFeedbackSnapshot(feedback, 10.02, time.monotonic()-.2, 'test')
+    if failure == 'moving': d._trajectory.state.velocity[0] = .01
+    if failure == 'drift':
+        feedback[0] += np.deg2rad(.3)
+        sample = JointFeedbackSnapshot(feedback, 10.02, time.monotonic(), 'test')
+    if failure == 'candidate': candidate[0] += .001
+    if failure == 'controller': d._controller_is_safe = Mock(return_value=False)
+    if failure == 'torque': d._torque_is_safe = Mock(return_value=False)
+    if failure == 'disabled': d._arm.get_joint_enable_states.return_value = [False]*7
+    if failure == 'cancel': d._return_cancel.set()
+    if failure == 'hand': hand.intervals = {'thumb': (-.3, .3)}
+    if failure == 'provider': g.hand_state_provider = lambda _: hand
+    before = d._trajectory.state
+    assert d.verify_tracking_activation(zero, candidate) == (failure is None)
+    assert d._trajectory.state is before
+    assert d._activation_candidate is None
+    assert not d.verify_tracking_activation(zero, candidate)  # no replay of a consumed ticket
+    g._clearance.assert_not_called()
+    g._build_fingers.assert_not_called()
+    d._arm.move_j.assert_not_called()

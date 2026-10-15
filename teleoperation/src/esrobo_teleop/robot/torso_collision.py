@@ -50,6 +50,7 @@ def _sweep_convex_vertices(points, axis, lower, upper):
 class TorsoCollisionGuard:
     _entry_certificates = None
     _entry_certificate_context = None
+    _entry_certificate_provider = None
     _entry_coverage_only = False
     _entry_arm_geometry_only = False
 
@@ -292,6 +293,21 @@ class TorsoCollisionGuard:
         intervals = dict(state.intervals)
         intervals = {name: (float(np.floor(lo/.02)*.02), float(np.ceil(hi/.02)*.02))
                      for name, (lo, hi) in intervals.items()}
+        # During one planning session a fresh packet often makes the age
+        # uncertainty smaller, then the next poll makes it larger again.
+        # Retain a conservative envelope instead of rebuilding every finger
+        # mesh and invalidating every path proof on each such oscillation.
+        # Expansion changes the context below and requires NEW full proofs;
+        # no old certificate is widened or combined. Outside planning, or on
+        # a new session/provider/model, use the current measured envelope.
+        if (self._entry_certificates is not None
+                and self._entry_certificate_context is not None
+                and self._entry_certificate_context == self._certificate_context(True)
+                and self._entry_certificate_provider is getattr(self, 'hand_state_provider', None)):
+            previous = dict(self._hand_interval_key or ())
+            if previous.keys() == intervals.keys():
+                intervals = {name: (min(lo, previous[name][0]), max(hi, previous[name][1]))
+                             for name, (lo, hi) in intervals.items()}
         self._hand_diagnostics['thumb_joint_intervals_rad'] = {
             name: bound for name, bound in intervals.items() if '_thumb_' in name}
         key = tuple(sorted(intervals.items()))
@@ -399,6 +415,7 @@ class TorsoCollisionGuard:
             self._entry_frozen_provider = None
             self._entry_certificates = []
             self._entry_certificate_context = None
+            self._entry_certificate_provider = None
 
     def end_entry_certificates(self):
         with self.lock:
@@ -407,6 +424,7 @@ class TorsoCollisionGuard:
             self._entry_frozen_provider = None
             self._entry_certificates = None
             self._entry_certificate_context = None
+            self._entry_certificate_provider = None
 
     def invalidate_entry_certificates(self):
         with self.lock:
@@ -438,7 +456,19 @@ class TorsoCollisionGuard:
                 return False
             return self._entry_coverage_locked(start, end, include_fingers)
 
-    def _entry_coverage_locked(self, start, end, include_fingers):
+    def check_cached_coverage(self, start, end, *, include_fingers=True):
+        """Validate an existing proof at a stationary preload boundary.
+
+        Unlike a normal planning check this cannot rebuild meshes or certify a
+        cache miss. It does not freeze/unfreeze the surrounding return planner.
+        """
+        start, end = np.asarray(start, float), np.asarray(end, float)
+        if any(q.shape != (14,) or not np.all(np.isfinite(q)) for q in (start, end)):
+            raise ValueError("invalid collision-check joints")
+        with self.lock:
+            return self._entry_coverage_locked(start, end, include_fingers, frozen=False)
+
+    def _entry_coverage_locked(self, start, end, include_fingers, *, frozen=True):
         """Scalar/interval checks only; never refresh meshes, run FK or distance."""
         lo, hi = np.minimum(start, end), np.maximum(start, end)
         def reject(category, reason, *, invalidate=False):
@@ -457,7 +487,9 @@ class TorsoCollisionGuard:
         hand = {}
         if include_fingers and self.include_fingers:
             provider = getattr(self, 'hand_state_provider', None)
-            if provider is not self._entry_frozen_provider:
+            expected_provider = (self._entry_frozen_provider if frozen
+                                 else self._entry_certificate_provider)
+            if provider is not expected_provider:
                 return reject('entry_certificate_invalid', 'hand feedback provider changed', invalidate=True)
             if provider is not None:
                 state = provider(self.hand_motion_horizon_s)
@@ -532,9 +564,12 @@ class TorsoCollisionGuard:
             cache = self._entry_certificates
             if cache is not None:
                 context = self._certificate_context(include_fingers)
-                if context != self._entry_certificate_context:
+                provider = getattr(self, 'hand_state_provider', None)
+                if (context != self._entry_certificate_context
+                        or provider is not self._entry_certificate_provider):
                     cache.clear()
                     self._entry_certificate_context = context
+                    self._entry_certificate_provider = provider
                 for index, (lo, hi, certificate) in enumerate(cache):
                     if np.all(root_lower >= lo) and np.all(root_upper <= hi):
                         cache.append(cache.pop(index))
@@ -543,6 +578,11 @@ class TorsoCollisionGuard:
                         return outcome(True, "certified_cache", 0)
             pending = [(root_lower, root_upper, None)]
             checks = 0
+            # Planning also proves seven-axis tracking/braking boxes. Their
+            # independent drift dimensions can need more than 64 subdivisions
+            # even with positive clearance. Keep a bounded larger proof budget
+            # before motion; frozen execution never enters this calculation.
+            max_checks = 256 if cache is not None else 64
             worst = None
             while pending:
                 a, b, active_pairs = pending.pop()
@@ -566,7 +606,7 @@ class TorsoCollisionGuard:
                     return outcome(False, "geometry_rejected", checks)
                 if self._box_certified:
                     continue
-                if checks >= 64:
+                if checks >= max_checks:
                     self.last_diagnostics["reason"] = "swept path could not be certified within budget"
                     return outcome(False, "certification_budget_exhausted", checks)
                 # Split the joint contributing most to the least-certifiable

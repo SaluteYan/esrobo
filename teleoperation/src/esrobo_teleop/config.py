@@ -121,9 +121,9 @@ class RobotConfig:
         0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633,
     )
     max_joint_velocity: tuple = (
-        0.453786, 0.453786, 0.418879, 0.418879, 0.418879, 0.418879, 0.418879,
+        0.453786, 0.453786, 0.418879, 0.418879, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586,
     )
-    # Wrist telemetry tuning: J5-J7 100 deg/s^2; hardware validation pending.
+    # Wrist candidate: 36 deg/s, 100 deg/s^2, 10 deg lead; hardware validation pending.
     max_joint_acceleration: tuple = (
         0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329,
     )
@@ -132,7 +132,7 @@ class RobotConfig:
         0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633,
     )
     left_max_joint_velocity: Optional[tuple] = (
-        0.453786, 0.453786, 0.418879, 0.523599, 0.418879, 0.418879, 0.418879,
+        0.453786, 0.453786, 0.418879, 0.523599, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586,
     )
     left_max_joint_acceleration: Optional[tuple] = (
         0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329,
@@ -142,7 +142,7 @@ class RobotConfig:
         0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633,
     )
     right_max_joint_velocity: Optional[tuple] = (
-        0.453786, 0.453786, 0.418879, 0.523599, 0.418879, 0.418879, 0.418879,
+        0.453786, 0.453786, 0.418879, 0.523599, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586,
     )
     right_max_joint_acceleration: Optional[tuple] = (
         0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329,
@@ -150,7 +150,7 @@ class RobotConfig:
     synchronize_joint_motion: bool = False
     left_command_trajectory_enabled: bool = True
     right_command_trajectory_enabled: bool = True
-    command_trajectory_lead_deg: tuple = (3.0, 3.0, 3.0, 3.0, 1.5, 1.5, 1.5)
+    command_trajectory_lead_deg: tuple = (3.0, 3.0, 3.0, 3.0, 10.0, 10.0, 10.0)
     command_trajectory_max_dt_s: float = 0.1
     # The planned return performs collision checks on every command. Allow a
     # small scheduling overrun without relaxing the live-following horizon.
@@ -178,7 +178,6 @@ class RobotConfig:
     return_plan_timeout_s: float = 5.0
     return_plan_max_nodes: int = 5000
     return_plan_seed: int = 0
-    return_speed_scale: float = 0.5
     return_stationary_velocity_deg_s: float = 0.5
     return_phase_attempts: int = 2
     disable_on_unconfirmed_return: bool = False

@@ -71,6 +71,8 @@ class TrajectoryTests(unittest.TestCase):
                 # These historical fault frames were recorded at 50 deg/s^2.
                 # Replay their original envelope, independent of later tuning.
                 p.amax[4:] = .872665
+                p.vmax[4:] = .418879
+                p.lead[4:] = np.deg2rad(1.5)
                 p.state = TrajectoryStep(np.array(d['previous_command_physical_rad']),
                                          np.array(d['previous_velocity_physical_rad_s']),
                                          d['previous_command_stamp_s'], np.full(7, np.nan), {})
@@ -89,6 +91,9 @@ class TrajectoryTests(unittest.TestCase):
             for tau in (.03, .05, .08):
                 with self.subTest(side=side, servo_response_s=tau):
                     cfg = build_config().robot
+                    # Historical acceleration-only comparison uses its original speed/lead.
+                    setattr(cfg, side+'_max_joint_velocity', (0.453786, 0.453786, 0.418879, 0.523599, .418879, .418879, .418879))
+                    cfg.command_trajectory_lead_deg = (3, 3, 3, 3, 1.5, 1.5, 1.5)
                     results = []
                     for old in (True, False):
                         acceleration = np.array(getattr(cfg, side+'_max_joint_acceleration'))
@@ -608,6 +613,28 @@ class DriverTrajectoryTests(unittest.TestCase):
         self.assertIsNotNone(driver.read_control_cycle_joints())
         self.assertFalse(driver._arm.runtime_feedback.call_args.kwargs["allow_long_gap_recovery"])
 
+    def test_disabled_estop_revalidates_feedback_without_clearing_fault_or_sending(self):
+        driver = self.driver()
+        driver._enabled = False
+        driver._safety_fault_reason = 'operator emergency stop; explicit recovery required'
+        driver._arm.get_joint_enable_states.return_value = [False]*7
+        stop = dict(category='controller_fault', arm_status=1, err_code=0, ctrl_mode=1)
+        for residual in (None, dict(category='driver_fault', joint=3),
+                         dict(category='controller_feedback_stale')):
+            with self.subTest(residual=residual):
+                driver._arm.controller_fault.side_effect = (
+                    lambda *, allow_disabled=False, allow_estop=False:
+                    residual if allow_estop else stop)
+                driver._arm.runtime_feedback.return_value = JointFeedbackSnapshot(
+                    self.current.copy(), 10.02, time.monotonic(), 'get_joint_angles')
+                driver.read_control_cycle_joints()
+                self.assertEqual(driver._arm.runtime_feedback.call_args.kwargs['allow_long_gap_recovery'],
+                                 residual is None)
+        self.assertIn('emergency stop', driver._safety_fault_reason)
+        driver._arm.reset.assert_not_called()
+        driver._arm.enable.assert_not_called()
+        driver._arm.move_j.assert_not_called()
+
     def test_first_robot_link_cycle_keeps_missing_feedback_closed(self):
         driver = self.driver()
         driver._arm._runtime_feedback = None
@@ -717,6 +744,144 @@ class DriverTrajectoryTests(unittest.TestCase):
         driver._arm.move_j.assert_not_called()
         driver._arm.get_joint_angles.assert_not_called()
         driver._arm.controller_fault.assert_not_called()
+
+    def test_slow_arrival_geometry_refreshes_stationary_feedback_before_following(self):
+        from types import SimpleNamespace
+        from test_entry_execution import guard
+        for side in ('left', 'right'):
+            for failure in (None, 'drift', 'missing', 'cancel', 'hand_context'):
+                with self.subTest(side=side, failure=failure):
+                    driver = self.driver(side)
+                    driver._cfg.left_tracking_control_mode = 'j'
+                    driver._cfg.right_tracking_control_mode = 'j'
+                    driver.invalidate_command_trajectory()
+                    anchor = self.current.copy()
+                    now = [10.]
+                    arm = NeroArm.__new__(NeroArm)
+                    arm._feedback_source = 'get_joint_angles'
+                    arm._runtime_feedback = None
+                    arm._robot = mock.Mock()
+                    arm.move_j = mock.Mock()
+                    driver._arm = arm
+                    driver._controller_is_safe = mock.Mock(return_value=True)
+                    geometry_done = [False]
+                    def source():
+                        if geometry_done[0] and failure == 'missing':
+                            return None
+                        q = anchor.copy()
+                        if geometry_done[0] and failure == 'drift':
+                            q[0] += np.deg2rad(.3)
+                        return SimpleNamespace(msg=q, timestamp=100.+now[0])
+                    arm._robot.get_joint_angles.side_effect = source
+                    g = guard()
+                    def distance(*args, **kwargs):
+                        now[0] += .4  # deterministic geometry stall > 300 ms
+                        geometry_done[0] = True
+                        g._box_certified = True
+                        if failure == 'cancel':
+                            driver._return_cancel.set()
+                        return .1
+                    g._clearance.side_effect = distance
+                    driver._collision_guard = g
+                    original = driver._return_stationary
+                    def stationary(**kwargs):
+                        q = original(**kwargs)
+                        if failure == 'hand_context':
+                            g.margin += .001
+                        return q
+                    driver._return_stationary = stationary
+                    with mock.patch('esrobo_teleop.robot.nero_driver.time.monotonic', side_effect=lambda: now[0]), \
+                            mock.patch('esrobo_teleop.robot.nero_driver.time.sleep', side_effect=lambda dt: now.__setitem__(0, now[0]+dt)):
+                        ok = driver.initialize_command_trajectory()
+                        self.assertEqual(ok, failure is None)
+                        if ok:
+                            self.assertIsNotNone(driver.read_control_cycle_joints())
+                            self.assertLess(now[0]-arm._runtime_feedback.received_monotonic, .1)
+                            self.assertEqual(driver._trajectory.state.stamp, arm.last_feedback_timestamp)
+                            before = driver._trajectory.state.position.copy()
+                            # A second slow proof at ACTIVE acceptance must also
+                            # preserve the committed hold and refresh the clock.
+                            self.assertTrue(driver.prepare_tracking_activation(anchor, anchor))
+                            g._clearance = mock.Mock(side_effect=AssertionError("geometry after readiness"))
+                            arm.get_joint_enable_states = mock.Mock(return_value=[True]*7)
+                            driver._torque_is_safe = mock.Mock(return_value=True)
+                            self.assertTrue(driver.verify_tracking_activation(anchor, anchor))
+                            self.assertFalse(driver.verify_tracking_activation(anchor, anchor))
+                            np.testing.assert_array_equal(driver._trajectory.state.position, before)
+                            self.assertIsNotNone(driver.read_control_cycle_joints())
+                        else:
+                            self.assertIsNone(driver._trajectory.state)
+                    arm.move_j.assert_not_called()
+
+    def test_checked_arrival_initializes_without_any_geometry_work(self):
+        from types import SimpleNamespace
+        for side in ('left', 'right'):
+            for mode in ('j', 'cpv'):
+                for failure in (None, 'missing', 'drift', 'stale', 'not_arrived'):
+                    with self.subTest(side=side, mode=mode, failure=failure):
+                        driver = self.driver(side)
+                        driver._return_start_state = driver._trajectory.state
+                        driver._handover_initialization_pending = failure != 'not_arrived'
+                        driver.invalidate_command_trajectory()
+                        setattr(driver._cfg, side+'_tracking_control_mode', mode)
+                        anchor = self.current.copy()
+                        now, reads = [10.], [0]
+                        arm = NeroArm.__new__(NeroArm)
+                        arm._feedback_source = 'get_joint_angles'
+                        arm._runtime_feedback = None
+                        arm._robot = mock.Mock()
+                        arm.move_j = mock.Mock()
+                        arm.get_joint_enable_states = mock.Mock(return_value=[True]*7)
+                        def setup(*args):
+                            now[0] += .4
+                            return True
+                        arm.prepare_tracking_control = mock.Mock(side_effect=setup)
+                        def source():
+                            reads[0] += 1
+                            if reads[0] > 2 and failure == 'missing':
+                                return None
+                            q = anchor.copy()
+                            if reads[0] > 2 and failure == 'drift':
+                                q[0] += np.deg2rad(.3)
+                            return SimpleNamespace(msg=q, timestamp=100.+now[0])
+                        arm._robot.get_joint_angles.side_effect = source
+                        driver._arm = arm
+                        driver._controller_is_safe = mock.Mock(return_value=True)
+                        driver._check_physical_path = mock.Mock(side_effect=AssertionError('geometry at checked arrival'))
+                        driver._certify_tracking_boundary = mock.Mock(side_effect=AssertionError('new certificate at checked arrival'))
+                        stationary = driver._return_stationary
+                        def sample(**kwargs):
+                            q = stationary(**kwargs)
+                            if q is not None and failure == 'stale':
+                                from dataclasses import replace
+                                arm._runtime_feedback = replace(arm._runtime_feedback, received_monotonic=now[0]-.11)
+                            return q
+                        driver._return_stationary = sample
+                        with mock.patch('esrobo_teleop.robot.nero_driver.time.monotonic', side_effect=lambda: now[0]), \
+                                mock.patch('esrobo_teleop.robot.nero_driver.time.sleep', side_effect=lambda dt: now.__setitem__(0, now[0]+dt)):
+                            ok = driver.initialize_command_trajectory(after_handover=True)
+                            self.assertEqual(ok, failure is None)
+                            if ok:
+                                self.assertIsNotNone(driver.read_control_cycle_joints())
+                                self.assertEqual(driver._trajectory.state.stamp, arm.last_feedback_timestamp)
+                                self.assertFalse(driver._handover_initialization_pending)
+                                # A completed approach cannot authorize a second initialization.
+                                self.assertFalse(driver.initialize_command_trajectory(after_handover=True))
+                            else:
+                                self.assertIsNone(driver._trajectory.state)
+                        driver._check_physical_path.assert_not_called()
+                        driver._certify_tracking_boundary.assert_not_called()
+                        arm.move_j.assert_not_called()
+
+    def test_activation_never_resets_a_moving_trajectory(self):
+        from dataclasses import replace
+        driver = self.driver()
+        state = driver._trajectory.state
+        driver._trajectory.state = replace(state, velocity=np.ones(7)*.01)
+        driver._certify_tracking_boundary = mock.Mock()
+        self.assertFalse(driver.verify_tracking_activation(self.current, self.current))
+        driver._certify_tracking_boundary.assert_not_called()
+        np.testing.assert_allclose(driver._trajectory.state.velocity, .01)
 
     def test_initialization_uses_explicit_snapshot_without_read(self):
         driver = self.driver()

@@ -59,23 +59,23 @@ robot:
   # Initial full-arm J1..J7 commissioning limits. Velocity is rad/s,
   # acceleration is rad/s^2, and step is rad per accepted feedback update.
   max_joint_step: [0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633]
-  max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.418879, 0.418879, 0.418879, 0.418879]
-  # 2026-10-14: J5-J7 acceleration 100 deg/s^2; 24 deg/s and 1.5 deg lead retained.
-  # Offline-tuned from wrist telemetry; new acceleration needs hardware validation.
+  max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.418879, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586]
+  # 2026-10-15 candidate: J5-J7 36 deg/s, 100 deg/s^2 and 10 deg lead in all phases.
+  # Preparation, approach, following and return share these limits; hardware validation pending.
   max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329]
   # Second-stage commissioning limits used by the single-arm PICO paths.
   left_max_joint_step: [0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633]
-  left_max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.523599, 0.418879, 0.418879, 0.418879]
+  left_max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.523599, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586]
   left_max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329]
   right_max_joint_step: [0.048869, 0.048869, 0.043633, 0.043633, 0.043633, 0.043633, 0.043633]
   # Both J4 joints: 30 deg/s; both wrist acceleration overrides match the common limits.
-  right_max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.523599, 0.418879, 0.418879, 0.418879]
+  right_max_joint_velocity: [0.453786, 0.453786, 0.418879, 0.523599, 0.6283185307179586, 0.6283185307179586, 0.6283185307179586]
   right_max_joint_acceleration: [0.698132, 0.698132, 0.785398, 0.872665, 1.745329, 1.745329, 1.745329]
   synchronize_joint_motion: false
   # Both single-arm and arm+hand entries use the same bounded command trajectory.
   left_command_trajectory_enabled: true
   right_command_trajectory_enabled: true
-  command_trajectory_lead_deg: [3, 3, 3, 3, 1.5, 1.5, 1.5]
+  command_trajectory_lead_deg: [3, 3, 3, 3, 10, 10, 10]
   command_trajectory_max_dt_s: 0.1
   return_command_trajectory_max_dt_s: 0.12  # planned return only; live following remains 0.1 s
   # Hold the last controller target during a brief assembled-feedback gap.
@@ -115,7 +115,6 @@ robot:
   return_plan_timeout_s: 5.0
   return_plan_max_nodes: 5000
   return_plan_seed: 0
-  return_speed_scale: 0.5
   return_stationary_velocity_deg_s: 0.5
   return_phase_attempts: 2                    # compatibility setting; planned arm return never retries
   disable_on_unconfirmed_return: false        # keep enabled for an operator s/d/x decision

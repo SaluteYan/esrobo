@@ -7,11 +7,9 @@ export function freshnessWarning(state, mode, paused) {
   if (!frames || !Number.isFinite(age)) {
     return raw ? "尚未收到 Body 骨架数据。" : "所选计算层尚无数据；启动预览并完成输入准备后才会更新。";
   }
-  if (age > 500) {
+  if (!raw && age > 500) {
     const seconds = (age / 1000).toFixed(1);
-    return raw
-      ? `Body 已 ${seconds} 秒未更新（接收序号 ${state.packet.body_sample_sequence ?? "--"}）；画面保留最后一帧。`
-      : `所选计算层已 ${seconds} 秒未更新；画面保留最后一帧，原始／固定映射层可单独查看采集。`;
+    return `所选计算层已 ${seconds} 秒未更新；画面保留最后一帧，原始／固定映射层可单独查看采集。`;
   }
   return "";
 }

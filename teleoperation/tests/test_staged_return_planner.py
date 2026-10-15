@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from esrobo_teleop.config import load_config
 from esrobo_teleop.ik.solver import IkSolver
@@ -134,3 +135,79 @@ def test_20260930_right_idle_pose_has_certified_arm_only_return():
     assert all(certificate["certified"] for certificate in planner.certificates)
     np.testing.assert_allclose(result.path[0], start)
     np.testing.assert_allclose(result.path[-1], zero)
+
+
+@pytest.mark.parametrize('pose', [
+    [.041887902047863905, -.195110357080446, -.47713811091020986,
+     .3974987371417086, 1.0254332954242285, -.3155206221755349, -.028012534494508988],
+    [-.006457718232379019, -.18664551020827358, -.5424832381048775,
+     .3863460832214648, 1.5376699775920444, -.2645046481397407, -.131737451940532],
+])
+def test_20261014_left_return_with_fresh_hand_age_jitter_certifies_execution(pose):
+    """Recorded dropped/disabled pose, real meshes; no CAN or robot commands."""
+    import time
+    from unittest.mock import Mock, patch
+    from esrobo_link.backends import ForwardModel
+    from esrobo_teleop.robot.nero_driver import NeroSingleArmDriver
+    from esrobo_teleop.robot.hand_geometry import geometry_state
+    from esrobo_teleop.robot.linker_hand_driver import L10_PHYSICAL_JOINT_NAMES
+    root = Path(__file__).resolve().parents[1]
+    cfg = load_config(str(root/'config/teleop_config.yaml'))
+    cfg.ik.urdf_path = str(root/'urdf/esrobo_waist_with_head.urdf')
+    model = ForwardModel(cfg.ik)
+    with patch('esrobo_teleop.robot.nero_driver.NeroArm'):
+        driver = NeroSingleArmDriver(cfg.robot, 'left')
+    guard = TorsoCollisionGuard(model, 'left', cfg.robot.collision_package_dirs,
+        cfg.robot.torso_collision_margin_m, cfg.robot.shoulder_collision_margin_m)
+    calls = [0]
+    def hand(_):
+        calls[0] += 1
+        age = [.001, .016, .003, .019][calls[0] % 4]
+        now = time.monotonic()
+        return geometry_state([254]*6+[127,128,127,127], now-age, 'left',
+            cfg.hand.geometry_feedback_calibration, L10_PHYSICAL_JOINT_NAMES,
+            0., cfg.hand.geometry_feedback_timeout_s, now=now,
+            cover_valid_age=not guard._entry_coverage_only)
+    guard.hand_state_provider = hand
+    guard._build_fingers = Mock(wraps=guard._build_fingers)
+    driver._collision_guard = guard
+    driver._entry_arm_only_collision = False
+    direction, zero = driver._mapping('left')
+    lower, upper = driver._effective_position_limits('left')
+    start = zero+direction*np.array(pose)
+    def full(q):
+        out = np.zeros(14); out[:7] = (q-zero)/direction
+        return out
+    fk = model.fk('left')
+    driver.configure_command_trajectory(fk, cfg.retarget.max_endpoint_translation_velocity_m_s)
+    guard.begin_entry_certificates()
+    planner = StagedReturnPlanner(lower, upper, driver._check_physical_path,
+        lambda q: fk(full(q)), direction, timeout=20.,
+        diagnostics=lambda: guard.last_diagnostics)
+    result = planner.plan(start, zero)
+    assert result.path, result.reason
+    assert not driver._certify_entry_corridors(result.path, lower, upper, guard)
+    assert guard._build_fingers.call_count <= 3
+    guard._clearance = Mock(side_effect=AssertionError('geometry after freezing'))
+    for a, b in zip(driver._certified_corridor_path, driver._certified_corridor_path[1:]):
+        assert driver._check_physical_path(a, b, entry_coverage_only=True)
+    # Every point on the original route must remain covered after subdivision;
+    # runtime requires each actual braking request to fit a single proof.
+    for a, b in zip(result.path, result.path[1:]):
+        for fraction in np.linspace(0, 1, 101):
+            q = a+(b-a)*fraction
+            assert driver._check_physical_path(q, q, entry_coverage_only=True)
+    driver._arm.move_j.assert_not_called()
+    # Execute against a fake actuator using the frozen REAL mesh proofs. No
+    # geometry fallback or controller command can reach physical hardware.
+    from test_safe_return import make_driver
+    executor, measured, _ = make_driver('left', initial=direction*np.array(pose))
+    executor._collision_guard = guard
+    executor.configure_command_trajectory(fk, cfg.retarget.max_endpoint_translation_velocity_m_s)
+    executor._return_start_state = None
+    with patch('esrobo_teleop.robot.nero_driver.time.sleep'):
+        assert executor._execute_return_group(
+            np.zeros(14), np.arange(7), zero, np.deg2rad(1.5), 20.,
+            handover_path=driver._certified_corridor_path,
+            require_zero_command_velocity=True), executor._return_execution_failure
+    assert np.max(np.abs(measured-zero)) <= np.deg2rad(1.5)

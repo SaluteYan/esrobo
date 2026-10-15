@@ -48,6 +48,21 @@ def request(c, action, **values):
     return c.action(dict(action=action, session='test-browser-session', **values))
 
 
+def test_sdk_wake_requires_explicit_support_zero_and_exclusive_service(console):
+    console.command = Mock(return_value='SDK_WAKE_RESULT={"disabled":true}\n')
+    for data in ({}, {'supported':True}, {'project_zero_confirmed':True}):
+        with pytest.raises(RuntimeError):
+            request(console, 'remote_wake_left_zero', **data)
+    console.remote = {'sessions':['esrobo_gateway']}
+    with pytest.raises(RuntimeError):
+        request(console, 'remote_wake_left_zero', supported=True, project_zero_confirmed=True)
+    console.command.assert_not_called()
+    console.remote = {'sessions':[]}
+    result = request(console, 'remote_wake_left_zero', supported=True, project_zero_confirmed=True)
+    assert result['disabled'] is True
+    console.command.assert_called_once()
+
+
 def test_cross_origin_and_rebinding_requests_are_rejected():
     c = Mock()
     server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(c, 0))
@@ -233,10 +248,10 @@ def test_recovery_rejects_old_return_implementation_even_with_existing_entry_pro
 
 @pytest.mark.parametrize('action', ['remote_diagnostics', 'remote_sync'])
 @pytest.mark.parametrize('phase', ['ACTIVE', 'RETURNING', 'APPROACHING'])
-def test_maintenance_rejects_busy_robot_without_running_remote_command(console, action, phase):
+def test_removed_maintenance_actions_do_not_run_remote_commands(console, action, phase):
     console.robot_state = Mock(return_value=dict(mode=phase))
     console.command = Mock()
-    with pytest.raises(RuntimeError, match='暂不诊断或同步'):
+    with pytest.raises(ValueError, match='未知操作'):
         request(console, action)
     console.command.assert_not_called()
 
@@ -585,6 +600,41 @@ def test_stop_terminates_computation_before_ssh_even_if_ssh_fails(console):
     assert order == ['local_stop', 'ssh_stop']
     assert console.owner is None
     assert '失败' in console.events[-1]
+
+
+@pytest.mark.parametrize('send_failure', [False, True])
+def test_controlled_stop_requests_hold_before_client_close_never_estop(console, send_failure):
+    order=[]
+    console.connected=Mock(return_value=True)
+    console.remote={'sessions':['esrobo_gateway']}
+    console.robot_state=Mock(return_value=dict(age_s=.01,mode='ACTIVE',
+        controlled_stop_protocol=1,controlled_stop_enabled=True))
+    process=Mock(); process.proc.poll.return_value=None
+    process.stop.side_effect=lambda:order.append('client_close')
+    console.processes['teleop']=process
+    def send(key):
+        order.append(key)
+        if send_failure: raise RuntimeError('SSH failed')
+        return {'message':'held'}
+    console.key.side_effect=send
+    if send_failure:
+        with pytest.raises(RuntimeError): request(console,'motion_hold')
+    else:
+        assert request(console,'motion_hold')['message']=='held'
+    assert order == ['h','client_close']
+    assert console.owner is None
+
+
+@pytest.mark.parametrize('change',[{'controlled_stop_protocol':None},{'controlled_stop_enabled':False},
+                                  {'age_s':2},{'mode':'RETURNING'}])
+def test_controlled_stop_rejects_old_or_uncommissioned_gateway(console,change):
+    console.connected=Mock(return_value=True)
+    console.remote={'sessions':['esrobo_gateway']}
+    state=dict(age_s=.01,mode='ACTIVE',controlled_stop_protocol=1,controlled_stop_enabled=True)
+    state.update(change);console.robot_state=Mock(return_value=state)
+    console.stop_following=Mock()
+    with pytest.raises(RuntimeError):request(console,'motion_hold')
+    console.key.assert_not_called();console.stop_following.assert_not_called()
 
 
 def test_pause_preview_stops_only_local_preview_without_robot_stop(console):
@@ -1008,20 +1058,21 @@ def test_repeated_start_preserves_existing_service_without_starting_workers(monk
         thread.join()
 
 
-def test_handover_button_uses_operator_channel_and_rechecks_waist(console):
+def test_internal_handover_uses_operator_channel_and_rechecks_waist(console):
     ready(console)
     console.mode.update(side='right',with_hand=False)
     console.robot_state.return_value.update(mode='CALIBRATING',entry_ready=True)
-    request(console,'gateway_key',key='g')
+    console._gateway_key('g', console.owner)
     console.key.assert_called_once_with('g')
     console.waist_command.assert_called_once_with('status')
 
 
-def test_auto_handover_uses_same_waist_guard_and_live_owner(console):
+@pytest.mark.parametrize('protocol', [3, 4, 5, 6])
+def test_auto_handover_uses_same_waist_guard_and_live_owner(console, protocol):
     ready(console)
     console.mode.update(side='right', with_hand=False)
     console.heartbeat = time.monotonic()
-    console.robot_state.return_value.update(mode='CALIBRATING', entry_protocol=3, entry_ready=True)
+    console.robot_state.return_value.update(mode='CALIBRATING', entry_protocol=protocol, entry_ready=True)
     console._maybe_auto_handover()
     console.key.assert_called_once_with('g')
     console.waist_command.assert_called_once_with('status')
@@ -1032,7 +1083,7 @@ def test_auto_handover_retries_transient_local_snapshot_gate(console):
     console.mode.update(side='right', with_hand=False)
     console.heartbeat = time.monotonic()
     console.robot_state.return_value.update(mode='CALIBRATING', entry_protocol=3, entry_ready=True)
-    console.action = Mock(side_effect=[
+    console._gateway_key = Mock(side_effect=[
         RuntimeError('准备/接管需要正式计算、持续有效目标、新鲜对应阶段反馈且控制器无故障'),
         {'message': '接管请求已接受'},
     ])
@@ -1041,7 +1092,7 @@ def test_auto_handover_retries_transient_local_snapshot_gate(console):
     assert console.auto_handover_error
     console.auto_handover_last_attempt = 0.
     console._maybe_auto_handover()
-    assert console.action.call_count == 2
+    assert console._gateway_key.call_count == 2
     assert not console.auto_handover_error
 
 
@@ -1063,7 +1114,7 @@ def test_auto_handover_never_bypasses_preconditions(console, bad):
         assert console.auto_handover_error
 
 
-def test_handover_click_reports_gateway_rejection_after_readiness_changes(console):
+def test_handover_reports_gateway_rejection_after_readiness_changes(console):
     console.key = Console.key.__get__(console)
     console.command = Mock(side_effect=lambda argv: 'esrobo_gateway|python\n'
                            if argv[1] == 'list-panes' else '')
@@ -1079,7 +1130,7 @@ def test_handover_click_reports_gateway_rejection_after_readiness_changes(consol
 
 
 @pytest.mark.parametrize('bad',['not_ready','wrong_mode','waist_moved','stale'])
-def test_handover_button_cannot_bypass_preconditions(console,bad):
+def test_internal_handover_cannot_bypass_preconditions(console,bad):
     ready(console)
     console.mode.update(side='right',with_hand=False)
     console.robot_state.return_value.update(mode='CALIBRATING',entry_ready=True)
@@ -1088,7 +1139,7 @@ def test_handover_button_cannot_bypass_preconditions(console,bad):
     if bad=='waist_moved': console.waist_command.return_value['axes']['31']['position_deg']=140.
     if bad=='stale': console.robot_state.return_value['age_s']=2.
     with pytest.raises(RuntimeError):
-        request(console,'gateway_key',key='g')
+        console._gateway_key('g', console.owner)
     console.key.assert_not_called()
 
 
@@ -1110,3 +1161,10 @@ def test_recover_from_hold_requires_capability_and_fresh_healthy_arm(console, fa
     else:
         request(console, 'remote_recover')
         console.key.assert_called_once_with('r')
+
+
+def test_manual_handover_api_is_removed(console):
+    ready(console)
+    with pytest.raises(ValueError, match="未知网关命令"):
+        request(console, "gateway_key", key="g")
+    console.key.assert_not_called()

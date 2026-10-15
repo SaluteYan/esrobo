@@ -211,7 +211,9 @@ class HardwareBackend:
             if with_hand:
                 self.hand = hand_driver if hand_driver is not None else LinkerHandDriver(cfg.hand, udp_host="127.0.0.1",
                                              udp_port=cfg.hand.udp_port, active_sides=(side,))
-                guard.hand_state_provider = lambda horizon: self.hand.geometry_state(side, horizon)
+                guard.hand_state_provider = lambda horizon: self.hand.geometry_state(
+                    side, horizon, cover_valid_age=(guard._entry_certificates is not None
+                                                   and not guard._entry_coverage_only))
             lo, hi = self.arm._effective_position_limits(side)
             direction, offset = self.arm._mapping(side)
             a, b = (lo - offset) / direction, (hi - offset) / direction
@@ -350,30 +352,70 @@ class HardwareBackend:
         # re-enable/reset the controller or human mapping at this boundary.
         if not self.arm.capture_session_start():
             raise RuntimeError('handover session capture failed: complete finite feedback inside hardware limits required')
-        if not self.arm.initialize_command_trajectory():
+        if not self.arm.initialize_command_trajectory(after_handover=True):
             reason = self.arm.safety_fault_reason or 'initialization rejected without driver detail'
             raise RuntimeError(f'handover trajectory initialization failed: {reason}')
+        # The full hand-motion envelope can take longer than a feedback tick.
+        # Finish it under APPROACHING supervision, before publishing readiness
+        # and starting the fresh ready-ack deadline. No finger target is sent.
+        self._prepare_entry_activation(target, cancelled)
         return dataclasses.asdict(result)
+
+    def _disabled_hand_return_feedback(self, cancelled, *, anchor=None, wait=False):
+        """Read only: reacquire feedback after planning, never reset or enable.
+
+        The strict reader can require two independent CAN frames after a long
+        geometry calculation. Waiting is allowed only before hand motion (or
+        after hand output has stopped), not inside its active safety checks.
+        """
+        deadline = time.monotonic() + (self.cfg.robot.controller_status_timeout_s if wait else 0.)
+        while True:
+            if cancelled():
+                return {}, 'cancelled during hand return feedback verification'
+            state = self.snapshot()
+            states, fault = state.get('enable_states'), state.get('controller_fault')
+            q, age = state.get('arm_urdf_rad'), state.get('arm_feedback_age_s')
+            transient = False
+            if states is not None and states != [False]*7:
+                reason = 'arm disable lost during hand return'
+            elif state.get('driver_fault'):
+                reason = 'arm driver fault during hand return: '+str(state['driver_fault'])
+            elif fault and fault.get('category') not in ('controller_feedback_stale', 'driver_feedback_stale'):
+                reason = 'arm controller fault during hand return: '+str(fault)
+            elif states is None or fault or q is None:
+                reason, transient = 'arm feedback incomplete during hand return', True
+            elif self.np.asarray(q).shape != (7,) or not self.np.all(self.np.isfinite(q)):
+                reason = 'invalid seven-joint values during hand return'
+            elif (not isinstance(age, (int, float)) or not self.np.isfinite(age)
+                    or not 0 <= age <= self.cfg.robot.command_trajectory_max_dt_s):
+                reason, transient = 'arm feedback expired during hand return', True
+            elif anchor is not None and self.np.max(self.np.abs(self.np.asarray(q)-anchor)) > self.np.deg2rad(.2):
+                delta = self.np.degrees(self.np.asarray(q)-anchor)
+                joint = int(self.np.argmax(self.np.abs(delta)))
+                reason = f'arm moved during hand return: J{joint+1} delta={delta[joint]:.3f}deg exceeds 0.2deg'
+            else:
+                return state, ''
+            if not transient or time.monotonic() >= deadline:
+                return state, reason
+            time.sleep(min(.01, max(0., deadline-time.monotonic())))
 
     def _restore_hand_before_return(self, result, cancelled, *, after_arm=False):
         """Verify hand zero at the current disabled arm pose."""
         result = dict(result, hands_open=False,
                       stage='hand_open' if after_arm else 'hand_open_before_arm')
         reason = ''
+        last_state = None
         try:
             if cancelled():
                 raise RuntimeError('cancelled before hand open')
-            state = self.snapshot()
+            # Controller recovery can invalidate the cycle snapshot. Reacquire
+            # fresh CAN feedback within the existing bounded preflight wait,
+            # before certifying geometry or sending any finger command.
+            state, reason = self._disabled_hand_return_feedback(cancelled, wait=True)
+            last_state = state
+            if reason:
+                raise RuntimeError(reason)
             actual = state.get('arm_urdf_rad')
-            if (state.get('enable_states') != [False]*7 or actual is None
-                    or state.get('controller_fault') or state.get('driver_fault')
-                    or state.get('arm_feedback_age_s') is None
-                    or not 0 <= state['arm_feedback_age_s'] <= self.cfg.robot.command_trajectory_max_dt_s):
-                raise RuntimeError('fresh healthy disabled arm required before hand open; '
-                                   f"enable_states={state.get('enable_states')}; "
-                                   f"controller_fault={state.get('controller_fault')}; "
-                                   f"driver_fault={state.get('driver_fault')}; "
-                                   f"feedback_age_s={state.get('arm_feedback_age_s')}")
             anchor = self.np.asarray(actual, dtype=float)
             if anchor.shape != (7,) or not self.np.all(self.np.isfinite(anchor)):
                 raise RuntimeError('invalid arm feedback before hand open')
@@ -392,22 +434,18 @@ class HardwareBackend:
             guard = self.arm._collision_guard
             if not guard.check_hand_return(full-drift, full+drift, envelope):
                 raise RuntimeError('hand open sweep not certified safe: '+str(guard.last_diagnostics))
+            # Geometry may outlast one feedback period. Obtain fresh frames
+            # BEFORE asking the hand worker to send its first position, while
+            # keeping the original certified arm pose as the fixed anchor.
+            last_state, reason = self._disabled_hand_return_feedback(
+                cancelled, anchor=anchor, wait=True)
+            if reason:
+                raise RuntimeError(reason)
 
             def check():
-                nonlocal reason
-                if cancelled():
-                    reason = 'cancelled during hand open'
-                    return False
-                latest = self.snapshot()
-                q = latest.get('arm_urdf_rad')
-                if (latest.get('enable_states') != [False]*7 or q is None
-                        or latest.get('controller_fault') or latest.get('driver_fault')
-                        or latest.get('arm_feedback_age_s') is None
-                        or not 0 <= latest['arm_feedback_age_s'] <= self.cfg.robot.command_trajectory_max_dt_s
-                        or self.np.asarray(q).shape != (7,)
-                        or not self.np.all(self.np.isfinite(q))
-                        or self.np.max(self.np.abs(self.np.asarray(q)-anchor)) > self.np.deg2rad(.2)):
-                    reason = 'arm changed or feedback invalid during hand open'
+                nonlocal reason, last_state
+                last_state, reason = self._disabled_hand_return_feedback(cancelled, anchor=anchor)
+                if reason:
                     return False
                 fresh = self.hand.geometry_state(self.side, 0.)
                 if (not fresh.valid or set(fresh.intervals) != set(envelope.intervals)
@@ -425,16 +463,18 @@ class HardwareBackend:
             return dict(result, hands_open=True, reason='')
         except Exception as exc:
             # A rejected hand phase must not start the arm or advertise IDLE.
+            self.hand.set_enabled(False)
             try:
-                final = self.snapshot()
+                final, _ = self._disabled_hand_return_feedback(cancelled, wait=True)
                 disabled = final.get('enable_states') == [False]*7
             except Exception:
                 disabled = False
-            return dict(result, returned=False, disabled=disabled, reason=str(exc))
+            return dict(result, returned=False, disabled=disabled, reason=str(exc),
+                        hand_return_feedback=last_state)
         finally:
             self.hand.set_enabled(False)
 
-    def activate_entry(self, target, cancelled):
+    def _entry_activation_positions(self, target):
         self.monitor_hold()
         if self.hand is not None:
             sample = self.hand.feedback_snapshot(self.side)
@@ -450,19 +490,37 @@ class HardwareBackend:
         direction, offset = self.arm._mapping(self.side)
         current = direction * self.np.asarray(actual) + offset
         candidate = direction * self.np.asarray(target["arm_urdf_rad"]) + offset
-        if not self.arm._check_physical_path(current, candidate):
-            raise RuntimeError("fresh ACTIVE transition path not certified safe")
+        return current, candidate
+
+    def _prepare_entry_activation(self, target, cancelled):
+        current, candidate = self._entry_activation_positions(target)
         if cancelled():
             raise RuntimeError("handover cancelled before activation")
         if self.hand:
             if not self.hand.set_enabled(True):
                 raise RuntimeError("hand enable failed at handover")
             try:
-                if not self.arm._check_physical_path(current, current):
+                if not self.arm.prepare_tracking_activation(current, candidate):
                     raise RuntimeError("hand motion envelope is unsafe at arrival; following not started")
             except BaseException:
                 self.hand.set_enabled(False)
                 raise
+        elif not self.arm.prepare_tracking_activation(current, candidate):
+            raise RuntimeError("stationary ACTIVE transition verification failed")
+        if cancelled():
+            if self.hand:
+                self.hand.set_enabled(False)
+            raise RuntimeError("handover cancelled after activation preparation")
+
+    def activate_entry(self, target, cancelled):
+        try:
+            current, candidate = self._entry_activation_positions(target)
+            if cancelled() or not self.arm.verify_tracking_activation(current, candidate):
+                raise RuntimeError("prepared ACTIVE transition feedback/coverage verification failed")
+        except BaseException:
+            if self.hand:
+                self.hand.set_enabled(False)
+            raise
 
     def prepare_step(self, cancelled):
         if self.hand_only:
@@ -478,7 +536,8 @@ class HardwareBackend:
                 raise RuntimeError("target expired before execution")
             return
         if self.arm.read_control_cycle_joints() is None:
-            raise RuntimeError("fresh seven-joint feedback required before execution")
+            detail = getattr(self.arm, 'feedback_failure_diagnostics', None)
+            raise RuntimeError(f"fresh seven-joint feedback required before execution; {detail}")
         if cancelled():
             raise RuntimeError("target expired before execution")
 

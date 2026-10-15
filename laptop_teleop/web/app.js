@@ -58,7 +58,7 @@ async function api(action, values = {}) {
   const response = await fetch('/api/action', {method: 'POST',
     headers: {'Content-Type': 'application/json', 'X-Head-Control': '1'},
     body: JSON.stringify({...options(), action, ...values}),
-    signal: AbortSignal.timeout(['can', 'remote_sync'].includes(action) ? 90000 : 18000)});
+    signal: AbortSignal.timeout(action === 'can' ? 90000 : 18000)});
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
   return data;
@@ -228,7 +228,7 @@ $('run').onclick = async () => {
   if (await perform('local_start', {name: 'teleop', preview: false})) selectLog('l:teleop');
 };
 $('stop').onclick = () => { recoveryGeneration++; return perform('stop'); };
-$('motion-stop').onclick = () => { recoveryGeneration++; return perform('stop'); };
+$('motion-stop').onclick = () => { recoveryGeneration++; return perform('motion_hold'); };
 $('stop-compute').onclick = () => perform('local_stop', {name: 'teleop'});
 const WAIST_SINGLE_TURN_BATTERY_WARNING = 0x0C26;
 const waistErrorAllowsMotion = code => code === 0 || code === WAIST_SINGLE_TURN_BATTERY_WARNING;
@@ -394,18 +394,34 @@ function recoveryArm(snapshot, side) {
   return feedback.sides?.[side] || feedback;
 }
 
+function canReturnWhileHolding(snapshot, side) {
+  const arm = recoveryArm(snapshot, side);
+  return snapshot?.robot?.mode === 'HOLD_LATCHED'
+    && snapshot.robot.hold_return_protocol === 1
+    && arm.enable_states?.length === 7
+    && arm.enable_states.every(value => value === true)
+    && !arm.controller_fault && !arm.driver_fault;
+}
+
+function enabledRecoveryRefusal(snapshot, side) {
+  const arm = recoveryArm(snapshot, side);
+  const reason = arm.driver_fault || arm.controller_fault?.status_name
+    || snapshot.robot?.reason || '尚未确认健康的锁存保持状态';
+  const label = side === 'right' ? '右臂' : '左臂';
+  return `回零尚未启动。当前故障：${reason}。使能反馈不代表仍在承重保持；`
+    + `请先可靠托稳并排除接触或卡阻，在左侧“${label}驱动”点击“单独失能”，`
+    + '等待七轴全部失能后再点击受检回零。此按钮不会自动撤去承重力。';
+}
+
 async function recoverGateway() {
   if (recoveryBusy || !state) return;
   const side = state.mode?.side;
   const handOnly = Boolean(state?.mode?.hand_only);
   const arm = recoveryArm(state, side);
   const enabled = !handOnly && arm.enable_states?.some(Boolean);
-  const heldReturn = enabled && state.robot?.mode === 'HOLD_LATCHED'
-    && state.robot?.hold_return_protocol === 1
-    && arm.enable_states?.every(value => value === true)
-    && !arm.controller_fault && !arm.driver_fault;
+  const heldReturn = enabled && canReturnWhileHolding(state, side);
   if (enabled && !heldReturn) {
-    notice('当前状态不支持保持使能回零。受检回零不会自动失能；请先核对故障，可靠托稳后使用单独的失能操作。', true);
+    notice(enabledRecoveryRefusal(state, side), true);
     return;
   }
   const message = handOnly
@@ -429,8 +445,6 @@ async function recoverGateway() {
   }
 }
 $('recover').onclick = recoverGateway;
-$('remote-diagnostics').onclick = () => perform('remote_diagnostics', {}, $('remote-diagnostics'));
-$('remote-sync').onclick = () => perform('remote_sync', {}, $('remote-sync'));
 $('disable-all').onclick = () => {
   if (confirm('确认停止当前目标流并失能双臂与双手？腰部需在独立控制区处理。')) {
     recoveryGeneration++;
@@ -444,7 +458,6 @@ $('enable').onclick = () => {
   if (confirm(prompt))
     perform('gateway_key', {key: 'e'});
 };
-$('handover').onclick = () => perform('gateway_key', {key: 'g'}, $('handover'));
 for (const button of document.querySelectorAll('[data-key]')) button.onclick = () => {
   const key = button.dataset.key;
   if (key === 'z' && !confirm('单臂受检回零会产生真实运动；带手模式须先确认机械臂失能，先在当前位置受检恢复手部自然张开姿态，再执行机械臂七关节回零。确认现场安全且已按机器人恢复流程检查？')) return;
@@ -818,8 +831,11 @@ function render() {
   $('run').disabled ||= faults.length > 0;
   $('pause-preview').disabled = !(running && telemetry.preview);
   const recoveryNeeded = ['FAULT', 'HOLD_LATCHED'].includes(robot.mode) || (robot.mode === 'IDLE' && faults.length > 0);
+  $('motion-stop').disabled = !fresh || robot.controlled_stop_protocol !== 1
+    || robot.controlled_stop_enabled !== true || !['ACTIVE', 'HOLD_LATCHED'].includes(robot.mode);
+  $('motion-stop').title = '正常跟随时受控减速并保持使能；准备、回零或硬件故障时请使用顶部紧急停止';
   if (fresh && robot.mode === 'HOLD_LATCHED') {
-    $('runtime-status').textContent = '输入故障：机器人端已锁存受控保持；需要人工受检恢复。保持状态须以持续新鲜反馈为准。';
+    $('runtime-status').textContent = '机器人端已锁存受控保持；需要人工受检恢复。保持状态须以持续新鲜反馈为准。';
   }
   const returnProtocolReady = mode.hand_only || robot.return_protocol === 2;
   const feedbackMissing = Object.values(members).some(value =>
@@ -837,9 +853,9 @@ function render() {
     : !returnProtocolReady ? '机器人仍运行旧版受检恢复；先同步代码，核验现场与反馈后重启网关。CAN 初始化不会加载新代码或清除控制器故障。'
     : recoveryNeeded && mode.side === 'both' ? '双臂需要现场验证的恢复流程，网页不执行自动回零。'
       : recoveryNeeded && running ? '请先结束本机计算，再执行恢复。'
-        : recoveryNeeded && recoveryEnabled ? (robot.mode === 'HOLD_LATCHED' && robot.hold_return_protocol === 1
+        : recoveryNeeded && recoveryEnabled ? (sides.every(side => canReturnWhileHolding(state, side))
           ? '保持使能规划并执行七关节回零，到位后失能，再受检恢复手部；规划拒绝时保留经核验的位置保持。'
-          : '七轴仍使能且不支持连续保持回零；本按钮不会自动失能。请核对故障，可靠托稳后单独处理失能。')
+          : enabledRecoveryRefusal(state, sides.find(side => !canReturnWhileHolding(state, side))))
         : returnFailureDetail ? returnFailureDetail
         : feedbackMissing ? '机械臂 CAN 反馈缺失，不是已确认的急停。恢复先请求遥测并核验七轴；若仍无数据，检查供电、CAN 接线和接口映射，不能强制清除故障。'
         : recoveryNeeded && mode.hand_only ? '停止后核验机械臂失能和手部反馈；恢复不发送位置目标。'
@@ -850,14 +866,9 @@ function render() {
                 : robot.mode === 'IDLE' ? '网关已就绪；重新开始计算后才能使能。'
                 : '故障停止后可在这里恢复，无需重启网关。';
   $('can').disabled = canBusy || recoveryBusy || !state.connected || !state.capabilities?.automatic_can_teardown;
-  for (const id of ['remote-diagnostics', 'remote-sync'])
-    $(id).disabled = !state.connected || running || (robot.mode && !['IDLE', 'FAULT'].includes(robot.mode));
   const mayEnable = !recoveryBusy && fresh && armFeedbackReady && robot.mode === 'IDLE' && state.owner === session && telemetry.age_s < 1
     && inputFresh && geometryReady && telemetry.targets && telemetry.sent > 0 && !telemetry.preview && Object.values(members).length && !faults.length;
   $('enable').disabled = !mayEnable;
-  $('handover').textContent = [3, 4, 5].includes(robot.entry_protocol) ? '标定后自动检查并接管' : '检查并接管 g';
-  $('handover').disabled = recoveryBusy || [3, 4, 5].includes(robot.entry_protocol) || !(fresh && robot.mode === 'CALIBRATING' && robot.entry_ready
-    && state.owner === session && running && !telemetry.preview && inputFresh && geometryReady);
   setStep('step-link', state.connected);
   setStep('step-drivers', fresh);
   setStep('step-reference', telemetry.reference_ready && telemetry.age_s < 1.5);
@@ -885,7 +896,7 @@ function render() {
     : fresh && robot.mode === 'ACTIVE' ? '● 机器人正在运动跟随'
     : fresh && robot.mode === 'RETURNING' ? '○ 机器人正在受检回零'
     : fresh && robot.mode === 'CALIBRATING' && robot.entry_ready ?
-      ([3, 4, 5].includes(robot.entry_protocol) ? '✓ 标定目标已锁定，等待自动检查路径' : '✓ 接管目标稳定，可点击“检查并接管”')
+      '✓ 标定目标已锁定，等待自动检查路径'
       : fresh && robot.mode === 'CALIBRATING' ? '○ 等待标定目标与新鲜 PICO 数据持续 0.5 秒'
         : fresh && robot.mode === 'CHECKING_ENTRY' ? '○ 失能中：检查完整目标与外展路径'
           : fresh && robot.mode === 'APPROACHING' ? '● 沿受检路径慢速接近，请保持 PICO 姿态'
@@ -1022,7 +1033,6 @@ async function poll() {
       $('connection').textContent = '控制台连接中断';
       $('connection-dot').classList.remove('online');
       $('enable').disabled = true;
-      $('handover').disabled = true;
       $('robot-mode').textContent = '状态过期';
       notice(error.message, true);
     }

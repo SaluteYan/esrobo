@@ -47,10 +47,14 @@ class InputRecovery:
                 item.update(arm_delta_deg=delta.tolist(), arm_limit_deg=limits)
                 allowed &= bool(np.all(delta <= np.asarray(limits) + 1e-9))
             if self.settings.with_hand:
-                delta = np.abs(np.asarray(source[side]['hand']) - baseline[side]['hand'])
-                limit = 30 if wide else self.settings.input_resume_hand_delta_unit
-                item.update(hand_delta_unit=delta.tolist(), hand_limit_unit=limit)
-                allowed &= bool(np.all(delta <= limit))
+                hand = np.asarray(source[side]['hand'], dtype=float)
+                if (hand.shape != (10,) or not np.all(np.isfinite(hand))
+                        or np.any((hand < 0) | (hand > 255))):
+                    raise RecoveryRejected(f'{side} recovery requires ten valid hand positions')
+                delta = np.abs(hand - baseline[side]['hand'])
+                # Finger source excursion is diagnostic only. Fresh targets
+                # are approached by the existing feedback-bounded hand limiter.
+                item.update(hand_delta_unit=delta.tolist(), hand_limit_unit=None)
             details[side] = item
         return allowed, details
 
@@ -75,9 +79,6 @@ class InputRecovery:
                         item.get('arm_delta_deg', []), item.get('arm_limit_deg', []))):
                     if delta > limit + 1e-9:
                         violations.append(f'{side} J{index+1} delta {delta:.2f}deg > {limit:g}deg')
-                for index, delta in enumerate(item.get('hand_delta_unit', [])):
-                    if delta > item['hand_limit_unit']:
-                        violations.append(f'{side} hand[{index}] delta {delta:g} > {item["hand_limit_unit"]:g}')
             raise RecoveryRejected('input reacquisition source outside fixed recovery envelope; '
                                    + '; '.join(violations))
         self.count = self.count + 1 if adjacent else 1

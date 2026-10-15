@@ -70,7 +70,7 @@ const fs=require('fs');
     values=json.loads(subprocess.check_output(['/usr/lib/chatgpt/resources/cua_node/bin/node','-e',script,str(path)],text=True))
     assert values[0] == ''
     assert '暂停' in values[1]
-    assert '120.0' in values[2] and '28801' in values[2]
+    assert values[2] == ''
     assert '计算层' in values[3]
     assert '尚未收到' in values[4]
 

@@ -119,6 +119,31 @@ def test_release_unstarted_return_preserves_cancel_and_allows_new_request():
     assert d._return_pending
 
 
+@pytest.mark.parametrize('side', ['left', 'right'])
+def test_explicit_recovery_at_disabled_zero_never_enables_or_sends_position(side):
+    d, _, _ = make_driver(side, initial=np.full(7, .0005))
+    d._enabled = False
+    d._arm.get_joint_enable_states.return_value = [False]*7
+    with mock.patch('esrobo_teleop.robot.nero_driver.time.sleep'):
+        result = d.safe_return(recover=True, recognize_inherited_stop=True)
+    assert result.returned and result.disabled
+    assert result.stage == 'verifying_disabled_zero'
+    d._arm.enable.assert_not_called()
+    d._arm.move_j.assert_not_called()
+    d._arm.disable.assert_not_called()
+
+
+def test_disabled_zero_recovery_cannot_report_success_if_final_feedback_missing():
+    d, _, zero = make_driver()
+    d._enabled = False
+    d._arm.get_joint_enable_states.return_value = [False]*7
+    d._return_stationary = mock.Mock(side_effect=[zero.copy(), None])
+    result = d.safe_return(recover=True, recognize_inherited_stop=True)
+    assert not result.returned and result.stage == 'verifying_disabled_zero'
+    d._arm.enable.assert_not_called()
+    d._arm.move_j.assert_not_called()
+
+
 def test_release_reservation_cannot_end_running_return():
     d, _, _ = make_driver()
     request_id = d.prepare_return()
@@ -168,7 +193,7 @@ def test_return_full_geometry_cache_lifetime_and_context(failure):
     def execute(*args, **kwargs):
         assert g._entry_certificates is not None
         assert not g._entry_arm_geometry_only
-        assert not g._entry_coverage_only
+        assert g._entry_coverage_only
         if failure == 'exception':
             raise RuntimeError('test cancellation cleanup')
         if failure == 'cancel':
@@ -794,9 +819,74 @@ def test_recovery_enable_refreshes_feedback_after_collision_configuration():
     d._controller_is_safe = check_after_mode
     assert d._enable_for_return()
     assert configured_while_enabled == [False, True]
-    assert d.read_joints.call_count == 2
+    assert d.read_joints.call_count == 3
     d._arm.move_j.assert_called_once()
     assert d._last_return_enable_failure is None
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+def test_recovery_preload_refreshes_after_expensive_geometry_and_mode(side):
+    d, feedback, _ = make_driver(side, initial=np.ones(7)*.03)
+    enabled = {'value': False}
+    d._enabled = False
+    d._arm.get_joint_enable_states.side_effect = lambda: [enabled['value']]*7
+    d._configure_arm_collision_safety = mock.Mock(return_value=True)
+    d._capture_arm_torque_baseline = mock.Mock(return_value=True)
+    boxes = []
+
+    def check(a, b, **_):
+        if np.any(a != b):
+            boxes.append((a.copy(), b.copy()))
+            d._return_feedback_received = time.monotonic() - .2
+        return True
+
+    def mode(*_):
+        if not enabled['value']:
+            d._return_feedback_received = time.monotonic() - .2
+            feedback[0] += np.deg2rad(.05)
+
+    def enable(**_):
+        enabled['value'] = True
+        return True
+
+    d._check_physical_path = mock.Mock(side_effect=check)
+    d._arm.set_motion_mode.side_effect = mode
+    d._arm.enable.side_effect = enable
+    assert d._enable_for_return()
+    sent = np.asarray(d._arm.move_j.call_args.args[0])
+    assert len(boxes) == 1
+    assert np.all(sent >= boxes[0][0]) and np.all(sent <= boxes[0][1])
+    np.testing.assert_array_equal(sent, feedback)
+
+
+@pytest.mark.parametrize('failure', ['drift', 'missing', 'geometry', 'expired', 'cancelled'])
+def test_recovery_preload_rejects_changed_boundary_without_enable(failure):
+    d, feedback, _ = make_driver(initial=np.ones(7)*.03)
+    d._enabled = False
+    d._arm.get_joint_enable_states.return_value = [False]*7
+    d._configure_arm_collision_safety = mock.Mock(return_value=True)
+    mode_done = {'value': False}
+
+    def mode(*_):
+        mode_done['value'] = True
+        if failure == 'drift':
+            feedback[0] += np.deg2rad(.3)
+        elif failure == 'missing':
+            d.read_joints.side_effect = lambda: None
+        elif failure == 'cancelled':
+            d.cancel_return()
+
+    def check(*_, **__):
+        if mode_done['value'] and failure == 'expired':
+            d._return_feedback_received = time.monotonic() - .2
+        return not (mode_done['value'] and failure == 'geometry')
+
+    d._arm.set_motion_mode.side_effect = mode
+    d._check_physical_path = mock.Mock(side_effect=check)
+    assert not d._enable_for_return()
+    assert d._last_return_enable_failure
+    d._arm.move_j.assert_not_called()
+    d._arm.enable.assert_not_called()
 
 
 @pytest.mark.parametrize('side', ['left', 'right'])
@@ -1016,3 +1106,94 @@ def test_preserve_hold_cannot_clear_an_existing_driver_latch():
     assert not result.returned and not d.return_hold_preserved
     assert d._return_inhibited
     d._arm.disable.assert_not_called()
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+@pytest.mark.parametrize('moving', [False, True])
+def test_hold_return_brakes_live_state_before_any_full_geometry(side, moving):
+    from dataclasses import replace
+    d, feedback, zero = make_driver(side, initial=np.ones(7)*.04)
+    d._trajectory.reset(feedback, d._arm.last_feedback_timestamp)
+    velocity = np.zeros(7)
+    if moving:
+        velocity[4] = .05
+    d._trajectory.state = replace(d._trajectory.state, velocity=velocity)
+    d._first_follow_hold = False
+    braking_done = []
+    original_brake = d._brake_held_trajectory_for_return
+    original_check = d._check_physical_path
+    def brake(timeout):
+        # No invalidation or velocity reset before the first brake proposal.
+        np.testing.assert_array_equal(d._trajectory.state.velocity, velocity)
+        original_commit = d._trajectory.commit
+        def commit(proposal):
+            before = d._trajectory.state
+            dt = proposal.stamp-before.stamp
+            assert np.all(np.abs(proposal.velocity) <= d._trajectory.vmax+1e-8)
+            assert np.all(np.abs(proposal.velocity-before.velocity) <= d._trajectory.amax*dt+1e-8)
+            assert np.all(np.abs(proposal.position-feedback) <= d._trajectory.lead+1e-8)
+            original_commit(proposal)
+        with mock.patch.object(d._trajectory, 'reset', wraps=d._trajectory.reset) as reset, \
+                mock.patch.object(d._trajectory, 'commit', side_effect=commit):
+            result = original_brake(timeout)
+            reset.assert_not_called()
+        assert result
+        np.testing.assert_array_equal(d._trajectory.state.velocity, np.zeros(7))
+        braking_done.append(True)
+        return result
+    def geometry(a, b, **kw):
+        assert braking_done, 'offline geometry must not block a live brake'
+        return original_check(a, b, **kw)
+    d._brake_held_trajectory_for_return = brake
+    d._check_physical_path = geometry
+    d._arm.disable.side_effect = lambda: bool(np.max(abs(feedback-zero)) <= np.deg2rad(1.5))
+    with mock.patch('esrobo_teleop.robot.nero_driver.time.sleep'):
+        result = d.safe_return(preserve_hold=True)
+    assert result.returned and result.disabled, result
+    d._arm.disable.assert_called_once()
+    d._arm.reset.assert_not_called()
+
+
+@pytest.mark.parametrize('failure', ['feedback', 'cancel', 'enable', 'torque'])
+def test_hold_return_brake_failure_never_starts_geometry_or_claims_hold(failure):
+    d, feedback, _ = make_driver(initial=np.ones(7)*.04)
+    d._trajectory.reset(feedback, d._arm.last_feedback_timestamp)
+    if failure == 'feedback':
+        d.read_control_cycle_joints = mock.Mock(return_value=None)
+    elif failure == 'cancel':
+        d._return_cancel.set()
+    elif failure == 'enable':
+        d._arm.get_joint_enable_states.return_value = [True]*6+[False]
+    else:
+        d._torque_is_safe.return_value = False
+    with mock.patch.object(d, '_check_physical_path') as geometry:
+        assert not d._brake_held_trajectory_for_return(.1)
+        geometry.assert_not_called()
+    d._arm.move_j.assert_not_called()
+    d._arm.disable.assert_not_called()
+
+
+@pytest.mark.parametrize('outcome', ['fresh', 'timeout', 'hardware_fault', 'cancel'])
+def test_disabled_return_enable_waits_only_for_missing_status_without_writes(outcome):
+    d, _, _ = make_driver('left', initial=np.ones(7)*.03)
+    d._enabled = False
+    d._cfg.controller_status_timeout_s = .02
+    d._configure_arm_collision_safety = mock.Mock(return_value=False)
+    stale = {'category': 'driver_feedback_stale', 'joint': 1}
+    values = [stale, None] if outcome == 'fresh' else [stale]
+    if outcome == 'hardware_fault':
+        values = [{'category': 'driver_fault', 'joint': 1, 'flags': ['driver_overcurrent']}]
+    def status(**_):
+        d._arm.enable.assert_not_called()
+        d._arm.move_j.assert_not_called()
+        return values.pop(0) if values else (None if outcome == 'fresh' else stale)
+    d._arm.controller_fault.side_effect = status
+    if outcome == 'cancel':
+        d._return_cancel.wait = mock.Mock(side_effect=lambda _: d._return_cancel.set())
+    # Fresh status reaches configuration; stop there so the test never enables.
+    assert not d._enable_for_return()
+    assert d._configure_arm_collision_safety.call_count == int(outcome == 'fresh')
+    d._arm.enable.assert_not_called()
+    d._arm.move_j.assert_not_called()
+    if outcome == 'hardware_fault':
+        assert 'driver_overcurrent' in d._last_return_enable_failure

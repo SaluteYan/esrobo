@@ -43,6 +43,34 @@ def test_hold_survives_client_teardown_and_requires_local_recovery(monkeypatch):
     finally:g.socket.close()
 
 
+def test_operator_controlled_stop_keeps_hold_across_close_and_repeated_requests(monkeypatch):
+    g,b,now,send=connected(monkeypatch)
+    try:
+        assert g.recovery_status()['controlled_stop_protocol'] == 1
+        g.request('h')
+        assert g.mode == 'HOLD_LATCHED' and not g.cancelled.is_set()
+        assert not g.stop_pending
+        g.tick()
+        send('close'); g.input_fault('client exited')
+        g.request('h')
+        for _ in range(30): now[0]+=.02; g.tick()
+        assert b.enabled and b.stops == 0
+        with pytest.raises(ProtocolError): send()
+        g.request('x'); g.tick()
+        assert b.stops == 1 and g.mode == 'FAULT'
+    finally:g.socket.close()
+
+
+@pytest.mark.parametrize('mode,verified', [('ACTIVE',False),('FAULT',True),('APPROACHING',True),('RETURNING',True)])
+def test_controlled_stop_never_silently_falls_back_to_estop(monkeypatch,mode,verified):
+    g,b,now,send=connected(monkeypatch)
+    try:
+        g.mode=mode; b.contract['input_recovery_enabled']=verified
+        with pytest.raises(RuntimeError): g.request('h')
+        assert g.mode == mode and not g.stop_pending and b.stops == 0
+    finally:g.socket.close()
+
+
 def test_hold_feedback_failure_still_trips_hardware_stop(monkeypatch):
     g,b,now,send=connected(monkeypatch)
     try:

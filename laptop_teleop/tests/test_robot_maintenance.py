@@ -1,72 +1,39 @@
-"""Deployment tests use a local fake SFTP filesystem; no hardware connections."""
-import hashlib
-import os
-from pathlib import Path
-import subprocess
-import threading
-from types import SimpleNamespace
-
+"""Supervised SDK commissioning with mocked hardware."""
+import numpy as np
 import pytest
-
-from esrobo_laptop.robot_maintenance import sync_sources
-
-
-class LocalSftp:
-    def __enter__(self): return self
-    def __exit__(self, *args): pass
-    def stat(self, p): return Path(p).stat()
-    def mkdir(self, p): Path(p).mkdir()
-    def open(self, p, mode): return open(p, mode)
-    def chmod(self, p, mode): os.chmod(p, mode)
-    def posix_rename(self, a, b): os.replace(a, b)
+from unittest.mock import Mock
 
 
-def setup(tmp_path, monkeypatch):
-    workspace = tmp_path/'local'
-    remote = tmp_path/'remote'
-    path = 'robot_link/esrobo_link/backends.py'
-    for root in (workspace, remote):
-        (root/path).parent.mkdir(parents=True)
-    (workspace/path).write_bytes(b'# new code\n')
-    (remote/path).write_bytes(b'# old code\n')
-    real_output = subprocess.check_output
-    def output(args, **kwargs):
-        if args[0] == 'git': return (path+'\0').encode()
-        return real_output(args, **kwargs)
-    monkeypatch.setattr('esrobo_laptop.robot_maintenance.subprocess.check_output', output)
-    c = SimpleNamespace(remote_lock=threading.Lock(),
-        ssh=SimpleNamespace(open_sftp=LocalSftp),
-        command=lambda args, **kwargs: real_output(args).decode())
-    return c, workspace, remote, path
+@pytest.mark.parametrize('case', ['success', 'missing', 'wrong_pose', 'fault', 'exception', 'disable_missing'])
+def test_supervised_sdk_wake_never_skips_feedback_or_cleanup(case):
+    from esrobo_laptop.robot_maintenance import wake_confirmed_left_zero
+    zero = np.array([0, np.pi/2, 0, 0, 0, 0, 0])
+    arm = Mock()
+    arm.get_joint_angles.return_value = zero+.1 if case == 'wrong_pose' else None
+    arm.get_joint_enable_states.side_effect = [None, [False]*7]
+    arm.controller_fault.return_value = {'category':'driver_fault'} if case == 'fault' else None
+    arm.enable_at_known_target.return_value = (None, None) if case == 'missing' else (zero, [True]*7)
+    if case == 'exception': arm.enable_at_known_target.side_effect = RuntimeError('send failed')
+    arm.disable.return_value = case != 'disable_missing'
+    result = wake_confirmed_left_zero(arm, zero, .02)
+    if case in ('wrong_pose', 'fault'):
+        arm.enable_at_known_target.assert_not_called()
+        arm.disable.assert_not_called()
+    else:
+        arm.enable_at_known_target.assert_called_once()
+        np.testing.assert_array_equal(arm.enable_at_known_target.call_args.args[0], zero)
+        assert arm.enable_at_known_target.call_args.kwargs == dict(speed_percent=5, timeout=3.)
+        arm.disable.assert_called_once_with(timeout=3.)
+    assert result['zero_verified'] == (case in ('success', 'disable_missing'))
+    if case == 'disable_missing':
+        arm.best_effort_disable_once.assert_called_once()
+        assert not result['disabled']
 
 
-def test_sync_backs_up_replaces_and_verifies_only_manifest_sources(tmp_path, monkeypatch):
-    c, workspace, remote, path = setup(tmp_path, monkeypatch)
-    (workspace/'secret.key').write_text('never upload')
-    result = sync_sources(c, workspace, str(remote))
-    assert result['changed'] == 1
-    assert (remote/path).read_bytes() == b'# new code\n'
-    assert (Path(result['backup'])/'old'/path).read_bytes() == b'# old code\n'
-    assert not (remote/'secret.key').exists()
-    assert sync_sources(c, workspace, str(remote))['changed'] == 0
-
-
-def test_corrupted_upload_is_not_installed(tmp_path, monkeypatch):
-    c, workspace, remote, path = setup(tmp_path, monkeypatch)
-    class CorruptSftp(LocalSftp):
-        def chmod(self, p, mode):
-            Path(p).write_bytes(b'# damaged upload\n')
-    c.ssh.open_sftp = CorruptSftp
-    with pytest.raises(RuntimeError, match='上传校验失败'):
-        sync_sources(c, workspace, str(remote))
-    assert (remote/path).read_bytes() == b'# old code\n'
-
-
-def test_symlink_source_is_not_uploaded(tmp_path, monkeypatch):
-    c, workspace, remote, path = setup(tmp_path, monkeypatch)
-    (workspace/'secret.key').write_text('never upload')
-    (workspace/path).unlink()
-    (workspace/path).symlink_to(workspace/'secret.key')
-    with pytest.raises(RuntimeError, match='非普通项目文件'):
-        sync_sources(c, workspace, str(remote))
-    assert (remote/path).read_bytes() == b'# old code\n'
+def test_wake_script_is_fixed_and_uses_exclusive_robot_lock():
+    from esrobo_laptop.robot_maintenance import wake_left_zero_script
+    script = wake_left_zero_script('/home/esrobo/Projects/esrobo')
+    compile(script, '<wake-script>', 'exec')
+    assert 'LOCK_EX|fcntl.LOCK_NB' in script
+    assert '"can_piper1", "left"' in script
+    assert 'cfg.left_joint_offsets' in script

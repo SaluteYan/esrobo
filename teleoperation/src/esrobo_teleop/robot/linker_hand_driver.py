@@ -232,7 +232,7 @@ class LinkerHandDriver:
                 self._feedback[side] = values
                 self._feedback_time[side] = time.monotonic()
 
-    def geometry_state(self, side: str, horizon: float):
+    def geometry_state(self, side: str, horizon: float, *, cover_valid_age=False):
         """Receive only; this never enables or commands the hand."""
         from .hand_geometry import geometry_state
         with self._feedback_lock:
@@ -244,7 +244,7 @@ class LinkerHandDriver:
             effective_horizon = horizon if self._enabled else 0.0
             return geometry_state(self._feedback.get(side), self._geometry_feedback_time.get(side),
                 side, self._cfg.geometry_feedback_calibration, names, effective_horizon,
-                self._cfg.geometry_feedback_timeout_s)
+                self._cfg.geometry_feedback_timeout_s, cover_valid_age=cover_valid_age)
 
     def geometry_calibration_status(self, side: str) -> dict:
         """Describe whether collision geometry can use every physical actuator.

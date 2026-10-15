@@ -292,7 +292,7 @@ def test_dual_contract_does_not_advertise_single_arm_handover():
     assert all('entry_protocol' not in c for c in dual.contract['sides'].values())
 
 
-def test_robot_rejects_small_but_unsafe_final_transition_before_hand_enable():
+def test_robot_rejects_missing_prepared_proof_without_new_geometry():
     import numpy as np
     from esrobo_link.backends import HardwareBackend
     backend=HardwareBackend.__new__(HardwareBackend)
@@ -304,10 +304,11 @@ def test_robot_rejects_small_but_unsafe_final_transition_before_hand_enable():
     backend.cfg.hand.max_stale_time_s=.1
     backend.hand.feedback_snapshot.return_value=dict(position_unit=[100]*10,age_s=.01)
     backend.arm._mapping.return_value=(np.ones(7),np.zeros(7))
-    backend.arm._check_physical_path.return_value=False
-    with pytest.raises(RuntimeError,match='transition path'):
+    backend.arm.verify_tracking_activation.return_value=False
+    with pytest.raises(RuntimeError,match='feedback/coverage'):
         backend.activate_entry(dict(arm_urdf_rad=[.01]*7,hand_unit=[100]*10),lambda:False)
-    backend.hand.set_enabled.assert_not_called()
+    backend.arm._check_physical_path.assert_not_called()
+    backend.hand.set_enabled.assert_called_once_with(False)
 
 
 def test_arm_preparation_holds_hand_without_sending_open_command():
@@ -344,9 +345,10 @@ def test_entry_refuses_following_when_enabled_hand_envelope_is_unsafe():
     backend.arm, backend.hand = Mock(), Mock()
     backend.hand.feedback_snapshot.return_value = dict(position_unit=[142]*10, age_s=.01)
     backend.arm._mapping.return_value = (np.ones(7), np.zeros(7))
-    backend.arm._check_physical_path.side_effect = [True, False]
+    backend.arm._check_physical_path.return_value = True
+    backend.arm.prepare_tracking_activation.return_value = False
     with pytest.raises(RuntimeError, match='hand motion envelope'):
-        backend.activate_entry(dict(arm_urdf_rad=[0.]*7, hand_unit=[142]*10), lambda: False)
+        backend._prepare_entry_activation(dict(arm_urdf_rad=[0.]*7, hand_unit=[142]*10), lambda: False)
     assert [c.args[0] for c in backend.hand.set_enabled.call_args_list] == [True, False]
 
 
@@ -369,7 +371,10 @@ def test_entry_excludes_fingers_and_holds_wrist_at_backend_boundary(side, with_h
         backend.hand.feedback_snapshot.return_value = dict(position_unit=held, age_s=.01)
     backend.arm.safe_return.return_value = ReturnResult(True,False,'handover_arrived')
     target = dict(arm_urdf_rad=[.1]*5+actual[5:], hand_unit=held)
+    backend._prepare_entry_activation = Mock()
     backend.approach_entry(target, lambda: False, lambda: None)
+    backend.arm.initialize_command_trajectory.assert_called_once_with(after_handover=True)
+    backend._prepare_entry_activation.assert_called_once()
     backend.arm._check_physical_path.assert_not_called()  # no pre-planning finger point check
     assert backend.arm.safe_return.call_args.kwargs['arm_only_collision'] is True
     assert backend.arm.safe_return.call_args.kwargs['stationary_hand_check']()
@@ -399,3 +404,48 @@ def test_hardware_entry_preflight_accepts_held_hand_without_open_zero():
         backend.preflight_enable(target)
     with pytest.raises(RuntimeError, match='held feedback'):
         backend.preflight_enable(dict(target, hand_unit=[150] * 10), entry=True)
+
+
+def test_slow_hardware_activation_proof_finishes_before_ready_deadline(gateway):
+    import numpy as np
+    from esrobo_link.backends import HardwareBackend
+    from esrobo_teleop.robot.return_planner import ReturnResult
+    g = gateway
+    hardware = HardwareBackend.__new__(HardwareBackend)
+    hardware.side, hardware.np, hardware.hand = 'right', np, None
+    hardware.arm = Mock()
+    hardware.cfg = Mock()
+    hardware.snapshot = Mock(return_value=dict(arm_urdf_rad=[0.]*7, driver_fault=None))
+    hardware.preflight_enable = Mock()
+    hardware.monitor_hold = Mock()
+    hardware.arm._mapping.return_value = (np.ones(7), np.zeros(7))
+    def returned(**kwargs):
+        kwargs['on_approach']()
+        g.backend.enabled = True
+        q = kwargs['handover_goal']
+        hardware.snapshot.return_value['arm_urdf_rad'] = q
+        g.backend.q = q
+        return ReturnResult(True, False, 'handover_arrived')
+    hardware.arm.safe_return.side_effect = returned
+    def geometry(*_):
+        assert g.mode == 'APPROACHING'
+        assert g.entry_ready_deadline is None
+        time.sleep(.15)  # Longer than the laptop's 100 ms feedback freshness.
+        assert g.mode == 'APPROACHING'
+        return True
+    hardware.arm.prepare_tracking_activation.side_effect = geometry
+    hardware.arm.verify_tracking_activation.return_value = True
+    hardware.arm._check_physical_path.side_effect = AssertionError('redundant geometry')
+    g.backend.approach_entry.side_effect = hardware.approach_entry
+    g.backend.activate_entry.side_effect = hardware.activate_entry
+    g.gate.target['arm_urdf_rad'][5:] = [0., 0.]
+    approach(g)
+    assert g.entry_ready_deadline-time.monotonic() > 1.9
+    assert time.monotonic()-g.feedback_time < .1
+    hardware.arm.prepare_tracking_activation.assert_called_once()
+    g.gate.target['entry'].update(phase='ready', token=g.entry_token)
+    g.tick()
+    assert g.mode == 'ACTIVE'
+    hardware.arm.prepare_tracking_activation.assert_called_once()
+    hardware.arm.verify_tracking_activation.assert_called_once()
+    hardware.arm._check_physical_path.assert_not_called()

@@ -13,7 +13,8 @@ class HandGeometryState:
     reason: str = ""
 
 
-def geometry_state(raw, stamp, side, calibration, names, horizon, timeout, now=None):
+def geometry_state(raw, stamp, side, calibration, names, horizon, timeout, now=None,
+                   *, cover_valid_age=False):
     now = time.monotonic() if now is None else now
     if (stamp is None or not np.isfinite(stamp) or not 0 <= now-stamp <= timeout
             or raw is None or len(raw) != len(names) or not np.all(np.isfinite(raw))):
@@ -22,7 +23,10 @@ def geometry_state(raw, stamp, side, calibration, names, horizon, timeout, now=N
     try:
         if not np.isfinite(horizon) or horizon < 0:
             raise ValueError("invalid hand motion horizon")
-        age = now-stamp
+        # A frozen motion certificate must cover any still-valid feedback age,
+        # not only the unusually young sample seen during planning. The raw
+        # timestamp above remains mandatory and is never refreshed here.
+        age = timeout if cover_valid_age else now-stamp
         for i, name in enumerate(names):
             item = calibration.get(side, {}).get(name)
             if item is None:

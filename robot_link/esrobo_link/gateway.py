@@ -204,6 +204,8 @@ class Gateway:
                  'INPUT_WAIT' if self.gate.hold_started_at is not None else self.mode)
         return dict(input_recovery_protocol=self.backend.contract.get('input_recovery_protocol'),
                     input_recovery_enabled=self.backend.contract.get('input_recovery_enabled', False),
+                    controlled_stop_protocol=1,
+                    controlled_stop_enabled=self.backend.contract.get('input_recovery_enabled') is True,
                     recovery_phase=phase,
                     reacquisition_age_s=None if started is None else time.monotonic()-started)
 
@@ -270,7 +272,7 @@ class Gateway:
             self.reason = "完整路径已认证；正在慢速移动至标定目标，保持 PICO 追踪，抵达后再跟随实时姿态"
 
     def request(self, action):
-        """Only the robot operator calls enable/disable/return; the wire supports STOP only."""
+        """Operator commands; h latches commissioned hold, s/x remain E-stop."""
         if action in ("x", "s", "q"):
             self.trip("operator requested stop")
             # Even idle x must send a stop (controller may have external state).
@@ -280,6 +282,13 @@ class Gateway:
                 self.shutdown.set()
             return
         with self.lock:
+            if action == 'h':
+                if (self.backend.contract.get('input_recovery_enabled') is not True
+                        or self.mode not in ('ACTIVE', 'HOLD_LATCHED')
+                        or self.pending or self.stop_pending or self.cancelled.is_set()):
+                    raise RuntimeError('controlled stop requires commissioned ACTIVE/holding gateway; no reset or enable sent')
+                self.input_fault('operator controlled stop; position hold latched; explicit recovery required')
+                return
             held_return = action in ('r', 'z') and self.mode == 'HOLD_LATCHED' and not getattr(self.backend, 'hand_only', False)
             if held_return:
                 fb = self.feedback
@@ -351,7 +360,7 @@ class Gateway:
                 else:
                     raise RuntimeError("dual-arm recovery requires the supervised inter-arm procedure; no motion sent")
             else:
-                raise ValueError("keys: e prepare, g check+approach, s/x stop, d all, dl left, dr right, dh hands, r recover, z return, q exit")
+                raise ValueError("keys: e prepare, g check+approach, h hold, s/x E-stop, d all, dl left, dr right, dh hands, r recover, z return, q exit")
 
     def accept_command(self, message, peer, now):
         """Called under lock; a delayed keepalive cannot cross into ACTIVE."""
@@ -588,13 +597,14 @@ class Gateway:
                         self.mode = 'HOLD_LATCHED'
                         self.reason = f"return planning refused; verified hold retained: {result.get('reason')}"
                     else:
-                        # A failed hand-open check before/after arm return
+                        # A failed offline preflight/plan or hand-open check
                         # must remain FAULT, but need not re-latch E-stop on an
                         # already healthy, freshly verified disabled arm. Never
                         # suppress a pending explicit stop or uncertain state.
                         verified_disabled = False
                         if (result.get('disabled') and result.get('stage') in
-                                ('hand_open', 'hand_open_before_arm', 'hand_open_verify')):
+                                ('preflight', 'planning', 'hand_open',
+                                 'hand_open_before_arm', 'hand_open_verify')):
                             fresh = self.backend.snapshot()
                             age = fresh.get('arm_feedback_age_s')
                             q = fresh.get('arm_urdf_rad')
@@ -719,7 +729,7 @@ def main():
         raise
     print(json.dumps(dict(listening=gateway.address, hardware=args.hardware,
                           contract=backend.contract), ensure_ascii=False), flush=True)
-    print("Robot terminal: e zero+PICO prepare, g check+approach, s/x stop, d all disable, dl/dr arm disable, dh hands disable, r recover, z return, q exit (Enter required)", flush=True)
+    print("Robot terminal: e zero+PICO prepare, g check+approach, h controlled hold, s/x E-stop, d all disable, dl/dr arm disable, dh hands disable, r recover, z return, q exit (Enter required)", flush=True)
     from pathlib import Path
     log_path = Path(args.log_file) if args.log_file else Path(__file__).resolve().parents[1] / "log" / f"gateway_{time.time_ns()}.jsonl"
     try:
@@ -738,12 +748,14 @@ def main():
             try:
                 gateway.request(action)
             except (ValueError, RuntimeError) as exc:
-                if action == "g":
+                if action in ("g", "h"):
                     gateway.record_operator_result(action, False, str(exc))
                 print(f"REFUSED: {exc}", flush=True)
             else:
-                if action == "g":
-                    gateway.record_operator_result(action, True, "接管请求已接受；正在检查目标和路径")
+                if action in ("g", "h"):
+                    gateway.record_operator_result(action, True,
+                        "接管请求已接受；正在检查目标和路径" if action == 'g' else
+                        "受控停止已接受；机器人端减速并锁存位置保持")
         gateway.request("q")  # Losing the operator terminal never leaves following active.
 
     import signal

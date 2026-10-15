@@ -305,18 +305,6 @@ class Controller:
                                       reason=f"{side} J{joint+1} target delta {np.degrees(delta[joint]):.2f}deg "
                                              f"> {limits[joint]:g}deg; return to previous pose")
                     return False
-            if self.settings.with_hand:
-                hand_baseline = (self.last_hand_source if self.hand_handover is not None
-                                 and not self.hand_handover.done else previous["hand_unit"])
-                delta = np.abs(np.asarray(current["hand_unit"])-hand_baseline)
-                index = int(np.argmax(delta))
-                hand_limit = 30 if first_wide else self.settings.input_resume_hand_delta_unit
-                if delta[index] > hand_limit:
-                    diagnostic.update(hand_joint_index=index, hand_delta_unit=float(delta[index]),
-                                      hand_limit_unit=hand_limit,
-                                      reason=f"{side} hand joint {index+1} target delta {delta[index]:g} "
-                                             f"> {hand_limit}; return to previous pose")
-                    return False
         if (self.wrist_handover is not None and not self.wrist_handover.done
                 and self.last_wrist_source is None and self.first_wrist_source is None
                 and not targets[self.settings.side].get('hold')):
@@ -560,8 +548,12 @@ class Controller:
             # sent. Expiry after proposal or send failure is not a recovery.
             resume_ready = True
             if (recovery_candidate is not None and self.recovery.started is None
-                    and self.input_resume_count >= self.settings.input_resume_frames):
-                recovery_candidate = None  # Ordinary narrow recovery needs no new trajectory phase.
+                    and self.input_resume_count >= self.settings.input_resume_frames
+                    and not self.settings.with_hand):
+                # Arm-only narrow recovery needs no new trajectory phase.
+                # Hands always retain their measured-to-latest-target ramp:
+                # their source excursion is no longer restricted by a gate.
+                recovery_candidate = None
         if recovery_candidate is not None:
             raw_recovery_targets = copy.deepcopy(targets)
             recovery_complete = recovery_candidate.arrival(
@@ -1014,6 +1006,9 @@ def main(argv=None):
         if journal:
             journal.submit(dict(unix_ns=time.time_ns(), monotonic_s=time.monotonic(),
                                 record_type='terminal_fault', status=str(exc),
+                                feedback=locals().get('state', {}).get('feedback'),
+                                feedback_cache_age_s=locals().get('state', {}).get('feedback_cache_age_s'),
+                                state_seq=locals().get('state', {}).get('state_seq'),
                                 input_recovery=getattr(locals().get('controller'), 'recovery_diagnostics', None),
                                 input_resume_diagnostics=getattr(locals().get('controller'), 'input_resume_diagnostics', None),
                                 sent=getattr(locals().get('controller'), 'sent', 0),
