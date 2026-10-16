@@ -749,7 +749,7 @@ function render() {
   $('runtime-status').classList.toggle('input-hold', Boolean(telemetry.age_s < 1.5 && telemetry.input_hold_active));
   if (telemetry.age_s < 1.5 && robot.mode === 'ACTIVE') {
     if (robot.recovery_phase === 'REACQUIRING') {
-      $('runtime-status').textContent += ' · 输入恢复：正在限速重新接管（最长 3 秒）';
+      $('runtime-status').textContent += ' · 输入恢复：核验连续新鲜帧，机械臂与手指继续限速衔接';
     }
     if (telemetry.input_hold_active && telemetry.input_resume_diagnostics?.reason) {
       $('runtime-status').textContent += ` · 恢复检查：${telemetry.input_resume_diagnostics.reason}`;
@@ -765,6 +765,11 @@ function render() {
       $('runtime-status').textContent += ` · 手指首次到位过渡 · 拇指过渡目标 ${hand.reference_target?.[0] ?? hand.source_target?.[0] ?? '--'}`
         + ` / 实时目标 ${hand.source_target?.[0] ?? '--'} / 本机指令 ${hand.command?.[0] ?? '--'}`
         + ` / 网关已发 ${robot.feedback?.hand?.command_unit?.[0] ?? '--'} / 反馈 ${robot.feedback?.hand?.position_unit?.[0] ?? '--'}（0–255）`;
+    }
+    for (const [side, hand] of Object.entries(telemetry.hand_following || {})) {
+      if (hand.limited_physical?.length) {
+        $('runtime-status').textContent += ` · ${side === 'left' ? '左' : '右'}手限速中（${hand.limited_physical.length} 轴），可张手释放`;
+      }
     }
   }
   if (telemetry.age_s < 1.5 && robot.entry_keepalive_protocol === 1 &&

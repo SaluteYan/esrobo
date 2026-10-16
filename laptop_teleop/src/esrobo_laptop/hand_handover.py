@@ -1,4 +1,4 @@
-"""Feedback-bounded first hand transition; no sensor extrapolation."""
+"""Feedback-bounded initial transition and rate-limited live fingers."""
 import math
 from dataclasses import dataclass
 
@@ -13,6 +13,7 @@ class HandStep:
     direction: tuple
     reversal_wait: tuple
     reference_target: tuple
+    limited: tuple = ()
 
 
 class HandHandover:
@@ -25,7 +26,10 @@ class HandHandover:
                 and math.isfinite(self.period) and self.period > 0):
             raise ValueError("hand handover requires finite positive motion limits")
         self.enabled = list(cfg.enabled_physical_joints)
-        self.lead = min(15, self.step)
+        lead = getattr(cfg, 'live_feedback_lead', None) if live_goal else min(15, self.step)
+        self.lead = None if lead is None else float(lead)
+        if self.lead is not None and (not math.isfinite(self.lead) or not 0 < self.lead <= 30):
+            raise ValueError('live hand feedback lead must be null or in (0, 30] units')
         self.started = now
         self.command = self.checked(measured)
         self.last_at = now
@@ -34,6 +38,7 @@ class HandHandover:
         self.direction = np.zeros(10, dtype=int)
         self.reversal_wait = ()
         self.reference_target = None
+        self.limited = ()
 
     @staticmethod
     def checked(value):
@@ -50,6 +55,7 @@ class HandHandover:
         self.matched = 0
         self.direction = np.zeros(10, dtype=int)
         self.reversal_wait = ()
+        self.limited = ()
 
     def propose(self, desired, measured, now):
         source, actual = self.checked(desired), self.checked(measured)
@@ -59,7 +65,7 @@ class HandHandover:
         goal = source if self.live_goal or self.reference_target is None else np.asarray(self.reference_target)
         if not math.isfinite(now) or now < self.last_at:
             raise ValueError("hand handover clock moved backwards or is invalid")
-        if now-self.started > 10.:
+        if not self.live_goal and now-self.started > 10.:
             pending = [
                 f"physical[{i}] goal={goal[i]} command={self.command[i]} feedback={actual[i]}"
                 for i in self.enabled
@@ -70,10 +76,19 @@ class HandHandover:
                 "initial hand handover exceeded 10 s; explicit recovery required; " + detail)
         dt = max(0., min(now-self.last_at, self.period))
         budget = min(self.step, int(math.floor(self.velocity*dt+1.e-7)))
-        lower = np.maximum(self.command-budget, actual-self.lead)
-        upper = np.minimum(self.command+budget, actual+self.lead)
+        lower, upper = self.command-budget, self.command+budget
+        if self.lead is not None:
+            lower = np.maximum(lower, actual-self.lead)
+            upper = np.minimum(upper, actual+self.lead)
         for i in self.enabled:
             if lower[i] > upper[i]:
+                if self.live_goal and abs(actual[i]-self.command[i]) <= 2*self.lead:
+                    # Backdrive/delayed feedback can move the feedback band
+                    # outside this tick's rate interval. Back off toward actual
+                    # at the original speed, never deepen the position error.
+                    release = np.clip(actual[i], self.command[i]-budget, self.command[i]+budget)
+                    lower[i] = upper[i] = release
+                    continue
                 raise RuntimeError(
                     f"hand handover joint {i+1} feedback diverged from command; "
                     f"physical[{i}] goal={goal[i]} command={self.command[i]} "
@@ -84,7 +99,7 @@ class HandHandover:
         # separate beyond both limits on the next feedback update. Use the
         # existing two-unit arrival tolerance, not an enlarged feedback band.
         reversing = (np.sign(goal-self.command)*self.direction < 0)
-        waiting = reversing & (np.abs(actual-self.command) > 2)
+        waiting = reversing & (np.abs(actual-self.command) > 2) & (not self.live_goal)
         bounded_goal = np.where(waiting, self.command, goal)
         candidate = actual.copy()
         candidate[self.enabled] = np.clip(bounded_goal[self.enabled], lower[self.enabled], upper[self.enabled])
@@ -99,7 +114,8 @@ class HandHandover:
                         self.matched+1 if matched else 0,
                         tuple(int(v) for v in direction),
                         tuple(i for i in self.enabled if waiting[i]),
-                        tuple(int(v) for v in goal))
+                        tuple(int(v) for v in goal),
+                        tuple(i for i in self.enabled if candidate[i] != goal[i]))
 
     def commit(self, candidate):
         # Only the caller that successfully sent this candidate may commit it.
@@ -109,4 +125,5 @@ class HandHandover:
         self.direction = np.asarray(candidate.direction, dtype=int).copy()
         self.reversal_wait = candidate.reversal_wait
         self.reference_target = candidate.reference_target
+        self.limited = candidate.limited
         self.done = self.matched >= 3

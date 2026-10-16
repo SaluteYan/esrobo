@@ -289,6 +289,7 @@ hand:
   out_max: 255
   max_step: 18
   max_velocity: 400
+  live_feedback_lead: null  # ACTIVE: no command/feedback position-error limit; retain speed/step limits
   home: [255, 128, 255, 255, 255, 255, 128, 128, 128, 128]
   return_open_on_quit: true
   return_open_duration_s: 1.5

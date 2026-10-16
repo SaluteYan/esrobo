@@ -446,6 +446,7 @@ class HandConfig:
     out_max: int = 255
     max_step: int = 18                      # max per-command change per joint
     max_velocity: int = 400                 # max servo units / second
+    live_feedback_lead: float | None = None # None: no ACTIVE position-error gate; initial handover stays at 15
     home: list = field(default_factory=list)  # safe open pose (0..255) per physical joint
     return_open_on_quit: bool = True
     return_open_duration_s: float = 1.5

@@ -558,7 +558,7 @@ class Controller:
                 recovery_candidate = None
         if recovery_candidate is not None:
             raw_recovery_targets = copy.deepcopy(targets)
-            recovery_complete = recovery_candidate.arrival(
+            recovery_complete = recovery_candidate.confirm_tracking(
                 targets, feedback, list(self.pipeline.cfg.hand.enabled_physical_joints)
                 if self.settings.with_hand else []) if self.recovery.started is not None else False
         if first_calibrated_goal:
@@ -623,14 +623,20 @@ class Controller:
                 self.pipeline.check_ticket(frame[0])
                 feedback_for(state, self.settings, self.client.received_at)
             recovery_hand_candidates = {}
-            if recovery_candidate is not None:
+            if (mode == 'ACTIVE' and self.settings.with_hand
+                    and (self.hand_handover is None or self.hand_handover.done)):
                 for side in self.settings.sides:
                     if self.settings.with_hand:
+                        if targets[side].get('hold'):
+                            continue
                         if side not in self.recovery_hands:
                             self.recovery_hands[side] = HandHandover(
                                 feedback[side]['hand']['position_unit'], self.pipeline.cfg.hand,
                                 time.monotonic()-1/self.settings.rate_hz, self.settings.rate_hz,
                                 live_goal=True)
+                            if self.hand_handover is not None and self.recovery is None:
+                                self.recovery_hands[side].command = self.hand_handover.command.copy()
+                                self.recovery_hands[side].last_at = self.hand_handover.last_at
                         proposal = self.recovery_hands[side].propose(
                             targets[side]['hand_unit'], feedback[side]['hand']['position_unit'], time.monotonic())
                         recovery_hand_candidates[side] = proposal
@@ -641,19 +647,23 @@ class Controller:
             self.client.recovery_metadata = (recovery_candidate.metadata(recovery_complete)
                                              if recovery_candidate is not None else self.recovery_completion)
             self._send_targets(targets, self.settings, entry=entry)
+            # Keep the live rate limiter across recovery completion.
+            # A blocked finger must not jump to the full human target on the
+            # first ordinary ACTIVE packet, or stop the arm just for contact.
+            for side, proposal in recovery_hand_candidates.items():
+                self.recovery_hands[side].commit(proposal)
+            if any(target.get('hold') for target in targets.values()):
+                for side, limiter in self.recovery_hands.items():
+                    limiter.hold(feedback[side]['hand']['position_unit'], time.monotonic())
             if recovery_candidate is not None:
                 recovery_candidate.commit(time.monotonic())
-                for side, proposal in recovery_hand_candidates.items():
-                    self.recovery_hands[side].commit(proposal)
                 self.recovery = None if recovery_complete else recovery_candidate
                 self.recovery_diagnostics = recovery_candidate.diagnostics()
                 if recovery_complete:
                     self.recovery_completion = recovery_candidate.metadata(True)
-                    self.recovery_hands = {}
                     self.recovery_diagnostics['phase'] = 'ACTIVE'
             elif resume_ready:
                 self.recovery = None
-                self.recovery_hands = {}
             if hand_candidate is not None:
                 self.hand_handover.commit(hand_candidate)
             elif hand_hold is not None:
@@ -907,6 +917,11 @@ def main(argv=None):
                                   reversal_wait_physical=list(controller.hand_handover.reversal_wait),
                                   age_s=now-controller.hand_handover.started,
                                   matched_frames=controller.hand_handover.matched)),
+                              hand_following={side: dict(
+                                  command=limiter.command.tolist(),
+                                  feedback_lead_unit=limiter.lead,
+                                  limited_physical=list(limiter.limited))
+                                  for side, limiter in controller.recovery_hands.items()},
                               state_seq=state.get("state_seq"), state_rx_gap_s=state_rx_gap_s,
                               state_send_gap_s=state.get("state_send_gap_s"),
                               state_send_gap_max_s=state.get("state_send_gap_max_s"),

@@ -57,7 +57,7 @@ class InputRecovery:
                     raise RecoveryRejected(f'{side} recovery requires ten valid hand positions')
                 delta = np.abs(hand - baseline[side]['hand'])
                 # Finger source excursion is diagnostic only. Fresh targets
-                # are approached by the existing feedback-bounded hand limiter.
+                # are approached by the continuous hand rate limiter.
                 item.update(hand_delta_unit=delta.tolist(), hand_limit_unit=None)
             details[side] = item
         return allowed, details
@@ -96,18 +96,34 @@ class InputRecovery:
         # Keep the diagnostic anchor and original deadline across repeated gaps.
         self.previous, self.count, self.matched = None, 0, 0
 
-    def arrival(self, targets, feedback, enabled_hand_joints):
-        arrived = True
+    def confirm_tracking(self, targets, feedback, enabled_hand_joints):
+        # Recovery qualifies a live input stream, not a stationary pose. The
+        # old 1.5-degree/2-unit arrival gate chased each new human target and
+        # timed out during normal motion or a grasp. Keep these errors visible;
+        # actual motion remains bounded by robot trajectories and hand limiting.
+        # Called on a copied candidate only after ticket/feedback checks; its
+        # counters are committed only after successful transmission.
+        errors = {}
         for side in self.settings.sides:
             target, actual = targets[side], feedback[side]
+            expected = [not self.settings.hand_only] * 7
+            if (actual.get('enable_states') != expected or actual.get('controller_fault')
+                    or actual.get('driver_fault')):
+                raise RecoveryRejected(f'{side} recovery requires healthy arm feedback and enable state')
+            item = {}
             if not self.settings.hand_only:
                 source = target.get('source_arm_urdf_rad', target['arm_urdf_rad'])
-                arrived &= bool(np.all(np.abs(np.asarray(actual['arm_urdf_rad'])-source) <= np.deg2rad(1.5)))
-                arrived &= bool(np.all(np.abs(np.asarray(target['arm_urdf_rad'])-source) <= np.deg2rad(1.5)))
+                item['arm_error_deg'] = np.degrees(np.abs(np.asarray(actual['arm_urdf_rad'])-source)).tolist()
             if self.settings.with_hand:
                 delta = np.abs(np.asarray(actual['hand']['position_unit'])-target['hand_unit'])
-                arrived &= bool(np.all(delta[enabled_hand_joints] <= 2))
-        self.matched = self.matched + 1 if arrived else 0
+                item['hand_error_unit'] = delta[enabled_hand_joints].tolist()
+            errors[side] = item
+        ready = (self.count >= self.settings.input_resume_frames
+                 and self.diagnostic is not None and self.diagnostic['adjacent_allowed']
+                 and not any(t.get('hold') for t in targets.values()))
+        if self.diagnostic is not None:
+            self.diagnostic['tracking_error'] = errors
+        self.matched = self.matched + 1 if ready else 0
         return self.matched >= 3
 
     def metadata(self, complete=False):
