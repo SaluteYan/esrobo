@@ -297,8 +297,23 @@ hand:
   startup_open_tolerance: 12       # 0..255 servo feedback units
   startup_open_verify_timeout_s: 2.0
   # L10 physical indices: 0 thumb flex, 1 thumb spread, 2..5 finger flex,
-  # 6/7/8 finger spread, 9 thumb roll. Keep unverified spread/roll axes held.
+  # 6/7/8 finger spread, 9 thumb roll. Right retains legacy eligibility; left uses all ten.
   enabled_physical_joints: [0, 1, 2, 3, 4, 5, 9]
+  left_enabled_physical_joints: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  left_retarget_mode: urdf_10
+  # Nominal L20Lite command model, not a new measured calibration.
+  # Do not alias feedback calibration: command fitting must not redefine sensors.
+  left_control_calibration:
+    thumb_cmc_pitch: {raw: [255, 0], rad: [0.0, 0.52], allowed_rad: [0.0, 0.44394616544016835]}
+    thumb_cmc_yaw: {raw: [255, 0], rad: [0.0, 1.40], allowed_rad: [0.0, 1.2042771838760873]}
+    index_mcp_pitch: {raw: [255, 0], rad: [0.0, 1.36], allowed_rad: [0.0, 1.3478260869565217]}
+    middle_mcp_pitch: {raw: [255, 0], rad: [0.0, 1.36], allowed_rad: [0.0, 1.3478260869565217]}
+    ring_mcp_pitch: {raw: [255, 0], rad: [0.0, 1.36], allowed_rad: [0.0, 1.3478260869565217]}
+    pinky_mcp_pitch: {raw: [255, 0], rad: [0.0, 1.36], allowed_rad: [0.0, 1.3478260869565217]}
+    index_mcp_roll: {raw: [0, 255], rad: [0.0, 0.19], allowed_rad: [0.0, 0.18675022996339324]}
+    ring_mcp_roll: {raw: [0, 255], rad: [0.0, 0.20], allowed_rad: [0.0, 0.2]}
+    pinky_mcp_roll: {raw: [0, 255], rad: [0.0, 0.30], allowed_rad: [0.0, 0.3]}
+    thumb_cmc_roll: {raw: [0, 255], rad: [0.0, 1.03], allowed_rad: [0.0, 1.03]}
   left_open:   [255, 255, 255, 255, 255, 255, 128, 128, 128, 128]
   # Compatibility zero from the established left-hand-only teleoperation path.
   # That path uses left_open for startup/quit and treats it as the physical

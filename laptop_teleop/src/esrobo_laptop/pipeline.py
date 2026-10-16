@@ -45,6 +45,11 @@ class Pipeline:
         retarget.require_hand_imu_for_active_arm = False
         retarget.hand_imu_max_angle_deg = settings.pico_wrist_max_angle_deg
         self.body = FreshBodyDevice(retarget, settings.sides, settings.with_hand, settings.hand_only)
+        if settings.with_hand and 'left' in settings.sides and cfg.hand.left_retarget_mode == 'urdf_10':
+            from .hand_retarget import HandModel
+            hand_model = HandModel(cfg)
+            self.body.hand_mapping_fingerprint = hand_model.digest
+            self.body.hand_mapping_upper = hand_model.upper.copy()
         self.body._reference_diagnostic_path = ROOT / "log" / f"pico_reference_{time.time_ns()}.jsonl"
         self.wrists = {}
         self.hand_references = {}
@@ -60,6 +65,7 @@ class Pipeline:
             self.body.close()
             raise
         self._last_diagnostics_time = 0.0
+        self.hand_execution_log = ROOT/'log'/f'hand_execution_{time.time_ns()}.jsonl'
 
     def set_diagnostics(self, diagnostics):
         self.diagnostics = diagnostics

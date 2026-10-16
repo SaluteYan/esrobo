@@ -550,10 +550,13 @@ class LinkerHandDriver:
                 dtype=np.float64,
             )
             servo = open_pose + physical_normalized * (closed_pose - open_pose)
+            from .hand_control_mapping import enabled_for, calibrated_units
+            if side == 'left' and getattr(self._cfg, 'left_retarget_mode', 'legacy') == 'urdf_10':
+                servo = calibrated_units(active_rad, self._cfg)
 
             # Preserve unverified axes at measured positions.
             feedback = self._feedback.get(side)
-            enabled = set(int(index) for index in self._cfg.enabled_physical_joints)
+            enabled = set(enabled_for(self._cfg, side))
             if feedback is not None:
                 for index in range(self._physical_count):
                     if index not in enabled:
@@ -683,9 +686,10 @@ class LinkerHandDriver:
             # Publish every accepted request; cap motion by actual elapsed time
             # and at most one nominal period, so bursts gain no extra speed.
             elapsed = now - self._last_sent_time
-            allowed = set(self._cfg.enabled_physical_joints)
+            from .hand_control_mapping import enabled_for
             commands = {key: value.copy() for key, value in self._last_cmd.items()}
             for side, target in checked.items():
+                allowed = set(enabled_for(self._cfg, side))
                 for index in range(10):
                     if index not in allowed:
                         target[index] = self._feedback[side][index]

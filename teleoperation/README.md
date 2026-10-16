@@ -215,8 +215,10 @@ python3 bridges/senseglove_ros_to_esrobo_hand_bridge.py \
 python3 scripts/hand_safe_test.py --side left --joint 0 --delta 8 --confirm-motion
 python3 scripts/hand_safe_test.py --side right --joint 2 --delta 8 --confirm-motion
 ```
-L10 顺序已按硬件 SDK 固定映射。当前启用物理轴 `[0,1,2,3,4,5,9]`（拇指三轴及四指屈伸），
-侧摆和拇指旋转保持读取到的当前位置；逐轴验证后再修改 `hand.enabled_physical_joints`。
+L10 顺序已按硬件 SDK 固定映射。当前左手通过 `left_enabled_physical_joints` 启用全部十轴，
+使用原始 PICO 26 点的 URDF 拟合；右手保留 `[0,1,2,3,4,5,9]` 和既有端点。
+左手新增侧摆及旋转采用当前名义控制模型，不代表完成新增实机标定，见
+[左手十轴重定向](../laptop_teleop/docs/09_LEFT_HAND_RETARGET.md)。
 
 ## 5. 离线测试（无需硬件）
 

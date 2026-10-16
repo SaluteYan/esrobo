@@ -45,6 +45,13 @@ def hand_units(active_rad, feedback, cfg, side, reference_rad=None, *, absolute_
     angles, measured = np.asarray(active_rad, dtype=float), np.asarray(feedback, dtype=float)
     if angles.shape != (10,) or measured.shape != (10,) or not np.all(np.isfinite([angles, measured])):
         raise ValueError("hand mapping requires ten finite angles and feedback values")
+    from esrobo_teleop.robot.hand_control_mapping import enabled_for, calibrated_units
+    if side == 'left' and getattr(cfg, 'left_retarget_mode', 'legacy') == 'urdf_10':
+        result = calibrated_units(angles, cfg)
+        for index in range(10):
+            if index not in enabled_for(cfg, side):
+                result[index] = round(measured[index])
+        return result.tolist()
     upper = np.array([ACTIVE_JOINT_LIMITS_RAD[n][1] for n in ACTIVE_HAND_JOINTS])
     reference = np.zeros(10) if reference_rad is None else np.asarray(reference_rad, dtype=float)
     if reference.shape != (10,) or not np.all(np.isfinite(reference)):
@@ -78,7 +85,7 @@ def hand_units(active_rad, feedback, cfg, side, reference_rad=None, *, absolute_
         # Physical index 0 drives all three linked thumb flexion joints.
         result[0] = max(result[0], cfg.right_thumb_pitch_min_unit)
     for index in range(10):
-        if index not in cfg.enabled_physical_joints:
+        if index not in enabled_for(cfg, side):
             result[index] = measured[index]
     # Robot still applies its commissioned step/velocity limits.
     return np.rint(np.clip(result, 0, 255)).astype(int).tolist()

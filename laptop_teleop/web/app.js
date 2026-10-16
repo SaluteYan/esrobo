@@ -766,6 +766,15 @@ function render() {
         + ` / 实时目标 ${hand.source_target?.[0] ?? '--'} / 本机指令 ${hand.command?.[0] ?? '--'}`
         + ` / 网关已发 ${robot.feedback?.hand?.command_unit?.[0] ?? '--'} / 反馈 ${robot.feedback?.hand?.position_unit?.[0] ?? '--'}（0–255）`;
     }
+    const retarget = telemetry.hand_retarget?.left;
+    if (retarget && Number.isFinite(retarget.solve_ms)) {
+      const errors = retarget.pinch_error_mm || [];
+      $('runtime-status').textContent += ` · 左手十轴 ${retarget.solve_ms.toFixed(1)} ms`
+        + (errors.length ? ` · 模型对捏误差 ${Math.max(...errors).toFixed(1)} mm` : '')
+        + ` · 限位 ${retarget.limited_axes?.length || 0} 轴（完整诊断见本机手部日志）`;
+      $('runtime-status').textContent += ` · 十轴目标 [${telemetry.targets?.left?.hand_unit?.join(', ') ?? '--'}]`
+        + ` / 反馈 [${robot.feedback?.hand?.position_unit?.join(', ') ?? '--'}]`;
+    }
   }
   if (telemetry.age_s < 1.5 && robot.entry_keepalive_protocol === 1 &&
       ['CHECKING_ENTRY', 'APPROACHING', 'WAITING_FOR_ACTIVE_TARGET'].includes(robot.mode)) {

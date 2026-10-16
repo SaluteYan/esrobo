@@ -25,6 +25,13 @@ class SourceExpired(InputUnavailable):
     """Only the source timestamp gate may enter the bounded hold state."""
 
 
+class SourceTicket(dict):
+    """Timestamp mapping with frozen diagnostic identities outside the clock keys."""
+    def __init__(self, stamps, hand_sequences):
+        super().__init__(stamps)
+        self.hand_sequences = dict(hand_sequences)
+
+
 class FreshBodyDevice(BodyDevice):
     def __init__(self, cfg, sides, with_hand, hand_only=False):
         self.input_lock = threading.RLock()
@@ -34,6 +41,9 @@ class FreshBodyDevice(BodyDevice):
         self.source_updates = {}
         self.used = {}
         self.hand_sequences = {}
+        self.hand_mapping_fingerprint = None
+        self.hand_mapping_upper = None
+        self.hand_retarget_diagnostics = {}
         self.pico_hand_targets = {}
         self.pico_hand_status = {}
         self.pico_hand_status_at = None
@@ -386,25 +396,45 @@ class FreshBodyDevice(BodyDevice):
             if side not in meta["physical_sides"]:
                 continue
             sample = message["pico_hands"][side]
+            if side == 'left' and self.hand_mapping_fingerprint is not None:
+                from .hand_retarget import VERSION
+                if (sample.get('mapping_version') != VERSION or
+                        sample.get('mapping_fingerprint') != self.hand_mapping_fingerprint):
+                    raise ValueError('left hand mapping version/model mismatch; restart PICO and laptop')
             angles = np.asarray(sample["joints"], dtype=float)
             stamp, seq = meta["sample_monotonic"][side], sample["sequence"]
             if angles.shape != (10,) or not np.all(np.isfinite(angles)):
                 raise ValueError(f"{side} invalid PICO finger targets")
             from esrobo_teleop.robot.linker_hand_driver import ACTIVE_HAND_JOINTS, ACTIVE_JOINT_LIMITS_RAD
             upper = np.array([ACTIVE_JOINT_LIMITS_RAD[n][1] for n in ACTIVE_HAND_JOINTS])
+            if side == 'left' and self.hand_mapping_upper is not None:
+                upper = self.hand_mapping_upper
             if np.any(angles < 0) or np.any(angles > upper + 1e-6):
                 raise ValueError(f"{side} PICO finger targets out of range")
             if type(seq) is not int or seq <= 0 or type(stamp) not in (int, float) or not np.isfinite(stamp) or not 0 <= now-stamp <= .1:
                 raise ValueError(f"{side} invalid PICO Hand sample time/sequence")
             palm = (None if self.hand_only else checked_rotation(sample["palm_basis"]))
-            validated[side] = (angles, stamp, seq, palm)
+            diagnostics = {}
+            if side == 'left' and self.hand_mapping_fingerprint is not None and sample.get('diagnostics'):
+                values = sample['diagnostics']
+                elapsed = float(values['solve_ms'])
+                tips = np.asarray(values['tip_error_mm'], dtype=float)
+                pinch = np.asarray(values['pinch_error_mm'], dtype=float)
+                limited = values['limited_axes']
+                if (not np.isfinite(elapsed) or not 0 <= elapsed <= 20 or tips.shape != (5,) or pinch.shape != (4,)
+                        or not np.isfinite(tips).all() or not np.isfinite(pinch).all()
+                        or np.any(tips < 0) or np.any(pinch < 0)
+                        or not isinstance(limited, list) or len(limited) > 10 or any(n not in ACTIVE_HAND_JOINTS for n in limited)):
+                    raise ValueError('invalid left hand fit diagnostic summary')
+                diagnostics = dict(solve_ms=elapsed, tip_error_mm=tips.tolist(), pinch_error_mm=pinch.tolist(), limited_axes=list(limited))
+            validated[side] = (angles, stamp, seq, palm, diagnostics)
         return validated
 
     def _commit_pico_hands(self, validated):
         with self.input_lock:
             now = time.monotonic()
             changed = False
-            for side, (angles, stamp, seq, palm) in validated.items():
+            for side, (angles, stamp, seq, palm, diagnostics) in validated.items():
                 if not 0 <= now-stamp <= .1:
                     self.receive_counts['rejected'] += 1
                     self.last_rejection = f'{side} expired PICO Hand before commit'
@@ -416,6 +446,7 @@ class FreshBodyDevice(BodyDevice):
                 if palm is not None:
                     self.palm_history[side].append((float(stamp), palm, seq))
                 self.hand_sequences[side] = seq
+                self.hand_retarget_diagnostics[side] = dict(diagnostics, source_sequence=seq)
                 self.stamps[f"{side}_hand"] = stamp
                 self._record_source_updates({f"{side}_hand": stamp})
                 changed = True
@@ -469,7 +500,7 @@ class FreshBodyDevice(BodyDevice):
             raise InputUnavailable("PICO reference calibration not ready")
         if any(self.stamps[k] <= self.used.get(k, -1) for k in self.required):
             return None
-        return {k: self.stamps[k] for k in self.required}
+        return SourceTicket({k: self.stamps[k] for k in self.required}, self.hand_sequences)
 
     def consume(self, ticket):
         with self.input_lock:

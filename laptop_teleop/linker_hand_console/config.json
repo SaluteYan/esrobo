@@ -1,0 +1,13 @@
+{
+  "ssh_target": "esrobo@192.168.10.100",
+  "remote_dir": "/home/esrobo/linker-hand-console",
+  "service_name": "linker-hand-console",
+  "console_port": 7080,
+  "local_dashboard_url": "http://127.0.0.1:8080",
+  "local_binary": "/home/ddc/下载/dashboard_26.4.0_linux_amd64_1782714255620/dashboard_26.4.0_linux_amd64/dashboard",
+  "binary_sha256": "294517fa352fef3f0b4eed045afda611513be653b889d3144ffa55028ca3550c",
+  "hand_interfaces": {
+    "left": "can_hand2",
+    "right": "can_hand1"
+  }
+}

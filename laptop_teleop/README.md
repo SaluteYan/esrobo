@@ -135,3 +135,5 @@ Body 和 Hand 由一个 SDK 订阅独立提交/转发，控制端按真实时间
 | 源码职责、映射/IK、接近和回零实现 | [08 代码与计算](docs/08_CODE_AND_COMPUTATION.md) |
 
 旧 SenseGlove 脚本保留用于设备维护，当前网页和 PICO 计算无需启动。认证密钥、现场运行记录、构建产物和历史测量汇总不上传远程仓库。
+
+左手 L20Lite 十轴映射、官方手册约束及离线三维回放见 [左手十轴重定向](docs/09_LEFT_HAND_RETARGET.md)。

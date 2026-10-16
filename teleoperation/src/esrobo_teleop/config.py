@@ -453,6 +453,16 @@ class HandConfig:
     startup_open_verify_timeout_s: float = 2.0
     # Right L10 endpoints are SDK-documented; enable all three thumb axes plus flexion.
     enabled_physical_joints: list = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 9])
+    left_enabled_physical_joints: Optional[list] = None
+    right_enabled_physical_joints: Optional[list] = None
+    left_retarget_mode: str = "legacy"
+    # Explicit command calibration; kept independent of measured geometry.
+    left_control_calibration: dict = field(default_factory=dict)
+
+    def enabled_for(self, side):
+        value = getattr(self, f"{side}_enabled_physical_joints")
+        return self.enabled_physical_joints if value is None else value
+
     left_open: list = field(
         default_factory=lambda: [255, 255, 255, 255, 255, 255, 128, 128, 128, 128]
     )

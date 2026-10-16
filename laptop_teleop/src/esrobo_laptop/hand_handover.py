@@ -16,7 +16,7 @@ class HandStep:
 
 
 class HandHandover:
-    def __init__(self, measured, cfg, now, control_hz, *, live_goal=False):
+    def __init__(self, measured, cfg, now, control_hz, *, live_goal=False, side=None):
         self.live_goal = live_goal
         self.velocity = float(cfg.max_velocity)
         self.step = int(cfg.max_step)
@@ -24,7 +24,8 @@ class HandHandover:
         if not (math.isfinite(self.velocity) and self.velocity > 0 and self.step > 0
                 and math.isfinite(self.period) and self.period > 0):
             raise ValueError("hand handover requires finite positive motion limits")
-        self.enabled = list(cfg.enabled_physical_joints)
+        from esrobo_teleop.robot.hand_control_mapping import enabled_for
+        self.enabled = list(cfg.enabled_physical_joints) if side is None else enabled_for(cfg, side)
         self.lead = min(15, self.step)
         self.started = now
         self.command = self.checked(measured)

@@ -106,7 +106,8 @@ class InputRecovery:
                 arrived &= bool(np.all(np.abs(np.asarray(target['arm_urdf_rad'])-source) <= np.deg2rad(1.5)))
             if self.settings.with_hand:
                 delta = np.abs(np.asarray(actual['hand']['position_unit'])-target['hand_unit'])
-                arrived &= bool(np.all(delta[enabled_hand_joints] <= 2))
+                indices = enabled_hand_joints.get(side, []) if isinstance(enabled_hand_joints, dict) else enabled_hand_joints
+                arrived &= bool(np.all(delta[indices] <= 2))
         self.matched = self.matched + 1 if arrived else 0
         return self.matched >= 3
 

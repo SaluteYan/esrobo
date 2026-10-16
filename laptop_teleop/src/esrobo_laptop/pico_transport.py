@@ -107,6 +107,10 @@ class LatestHands:
             self.slots.clear()
             self.condition.notify_all()
 
+    def latest(self, side, fallback):
+        with self.condition:
+            return self.slots.pop(side, fallback)
+
 
 class AsyncRecording:
     """Original JSONL format with real submission times; bounded 64-packet queue."""
@@ -178,6 +182,18 @@ class AsyncRecording:
         return not self.thread.is_alive() and not self.failed and not self.queue
 
 
+def default_hand_mapper():
+    from pathlib import Path
+    from esrobo_teleop.config import load_config
+    cfg = load_config(str(WORKSPACE/'teleoperation/config/teleop_config.yaml'))
+    if not Path(cfg.ik.urdf_path).is_absolute():
+        cfg.ik.urdf_path = str(WORKSPACE/'teleoperation'/cfg.ik.urdf_path)
+    if cfg.hand.left_retarget_mode == 'urdf_10':
+        from .hand_worker import ProcessHandMapper
+        return ProcessHandMapper(cfg)
+    return PicoHands()
+
+
 class PicoForwarder:
     def __init__(self, sdk, bridge, args, *, viewer=None, diagnostics=None, mapper=None, body_socket=None, hand_socket=None, recording=None):
         require_notifications(sdk)
@@ -186,7 +202,8 @@ class PicoForwarder:
         self.stop = threading.Event()
         self.metrics = TransportMetrics()
         self.hands = LatestHands(self.metrics)
-        self.mapper = mapper or PicoHands()
+        self.mapper = default_hand_mapper() if mapper is None else mapper
+        self.hand_log_path = WORKSPACE/'laptop_teleop/log'/f'hand_raw_{time.time_ns()}.jsonl'
         self.body_socket = body_socket or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.hand_socket = hand_socket or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.body_socket.setblocking(False)
@@ -205,6 +222,8 @@ class PicoForwarder:
         self.hands.close()
         if self.hand_thread.is_alive():
             self.hand_thread.join(.6)
+        if callable(getattr(self.mapper, 'close', None)):
+            self.mapper.close()
         if self.summary_thread.is_alive():
             self.summary_thread.join(.3)
         self.body_socket.close()
@@ -226,10 +245,20 @@ class PicoForwarder:
                 break
             side, sample = item
             try:
+                if side == 'left' and hasattr(self.mapper, 'next_due'):
+                    if self.stop.wait(max(0., self.mapper.next_due-time.monotonic())):
+                        break
+                    sample = self.hands.latest(side, sample)
                 mapped = self.mapper.map_sample(side, sample)
                 if mapped is None:
                     self.metrics.count(side+'_duplicate')
                     continue
+                if side == 'left' and self.diagnostics:
+                    self.diagnostics.reference(self.hand_log_path, dict(event='hand_retarget', side=side,
+                        source_sequence=sample['sequence'], sample=sample, result=mapped))
+                # Full geometry is retained locally, never in status/control packets.
+                mapped.pop('target_points', None)
+                mapped.pop('solved_points', None)
                 self.metrics.mark(side+'_map')
                 # Recheck after mapping and immediately before encoding/output.
                 age = time.monotonic()-mapped['sample_monotonic']
@@ -245,6 +274,9 @@ class PicoForwarder:
                     self._send(self.hand_socket, encoded, side)
                 self.metrics.status(side, 'tracking')
             except (ValueError, TypeError, KeyError, OverflowError) as exc:
+                if side == 'left' and self.diagnostics:
+                    self.diagnostics.reference(self.hand_log_path, dict(event='hand_retarget_rejected', side=side,
+                        source_sequence=sample.get('sequence'), sample=sample, error=str(exc)))
                 self.metrics.count(side+('_stale' if 'stale' in str(exc) else '_invalid'))
                 self.metrics.status(side, str(exc))
 

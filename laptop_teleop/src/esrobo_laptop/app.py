@@ -445,7 +445,7 @@ class Controller:
                 self.last_hand_source = copy.deepcopy(self.entry_hand_source)
                 self.hand_handover = HandHandover(
                     feedback[self.settings.side]["hand"]["position_unit"],
-                    self.pipeline.cfg.hand, time.monotonic(), self.settings.rate_hz)
+                    self.pipeline.cfg.hand, time.monotonic(), self.settings.rate_hz, side=self.settings.side)
             self.pipeline.reset_command_start(measured)
             self.mode = mode
         if mode == 'ACTIVE' and self.wrist_handover is not None:
@@ -557,9 +557,10 @@ class Controller:
                 # their source excursion is no longer restricted by a gate.
                 recovery_candidate = None
         if recovery_candidate is not None:
+            from esrobo_teleop.robot.hand_control_mapping import enabled_for
             raw_recovery_targets = copy.deepcopy(targets)
             recovery_complete = recovery_candidate.arrival(
-                targets, feedback, list(self.pipeline.cfg.hand.enabled_physical_joints)
+                targets, feedback, {s: enabled_for(self.pipeline.cfg.hand, s) for s in self.settings.sides}
                 if self.settings.with_hand else []) if self.recovery.started is not None else False
         if first_calibrated_goal:
             self.entry_reference_source = self.pipeline.calibrated_entry_source()
@@ -630,7 +631,7 @@ class Controller:
                             self.recovery_hands[side] = HandHandover(
                                 feedback[side]['hand']['position_unit'], self.pipeline.cfg.hand,
                                 time.monotonic()-1/self.settings.rate_hz, self.settings.rate_hz,
-                                live_goal=True)
+                                live_goal=True, side=side)
                         proposal = self.recovery_hands[side].propose(
                             targets[side]['hand_unit'], feedback[side]['hand']['position_unit'], time.monotonic())
                         recovery_hand_candidates[side] = proposal
@@ -641,6 +642,14 @@ class Controller:
             self.client.recovery_metadata = (recovery_candidate.metadata(recovery_complete)
                                              if recovery_candidate is not None else self.recovery_completion)
             self._send_targets(targets, self.settings, entry=entry)
+            self.last_sent_hand_sequences = dict(getattr(frame[0], 'hand_sequences', {}))
+            sink = getattr(self.pipeline, 'diagnostics', None)
+            if sink is not None and self.settings.with_hand:
+                sink.reference(self.pipeline.hand_execution_log, dict(event='hand_target_sent',
+                    monotonic_s=time.monotonic(), source_sequences=self.last_sent_hand_sequences,
+                    source_times=dict(frame[0]), targets=targets,
+                    feedback_snapshot={s: feedback[s].get('hand') for s in self.settings.sides},
+                    initial_handover=hand_candidate is not None, recovery=recovery_candidate is not None))
             if recovery_candidate is not None:
                 recovery_candidate.commit(time.monotonic())
                 for side, proposal in recovery_hand_candidates.items():
@@ -921,6 +930,9 @@ def main(argv=None):
                                                     now-controller.entry_keepalive_sent_at)
                 record["gateway_entry_keepalive_age_s"] = state.get("entry_keepalive_age_s")
                 with pipeline.body.input_lock:
+                    record['hand_retarget'] = copy.deepcopy(getattr(pipeline.body, 'hand_retarget_diagnostics', {}))
+                    record['hand_source_sequences'] = dict(pipeline.body.hand_sequences)
+                    record['hand_sent_source_sequences'] = dict(getattr(controller, 'last_sent_hand_sequences', {}))
                     record["sources"] = {k: max(0., now-v) for k, v in pipeline.body.stamps.items()}
                     record["source_hz"] = pipeline.body.source_rates(now)
                     record["input_receive_counts"] = dict(pipeline.body.receive_counts)

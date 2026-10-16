@@ -38,6 +38,10 @@ class SyntheticSensors:
                               @ np.diag([-1., -1., 1.] if s == "left" else [1., 1., 1.])).tolist()
                            for s in ("left", "right")}
         self.thread = threading.Thread(target=self.run, daemon=True)
+        self.hand_mapping = {}
+        if pipeline.cfg.hand.left_retarget_mode == 'urdf_10':
+            from .hand_retarget import VERSION, fingerprint
+            self.hand_mapping = dict(mapping_version=VERSION, mapping_fingerprint=fingerprint(pipeline.cfg))
 
     def run(self):
         while not self.stop.is_set():
@@ -47,6 +51,7 @@ class SyntheticSensors:
             hand = dict(pico_hands={s: dict(joints=[0.]*10, sequence=time.monotonic_ns(),
                                           palm_basis=self.palm_bases[s])
                                     for s in ("left", "right")})
+            hand['pico_hands']['left'].update(self.hand_mapping)
             self.socket.sendto(annotate(hand, "pico_hand", dict(left=now, right=now),
                                        ("left", "right")), self.address)
             self.stop.wait(.012)

@@ -77,7 +77,8 @@ def retarget_hand(poses):
 
 
 class PicoHands:
-    def __init__(self):
+    def __init__(self, retargeter=None):
+        self.retargeter = retargeter
         self.last = {}
         self.signatures = {}
         self.status = {}
@@ -113,10 +114,16 @@ class PicoHands:
             self.status[side] = "Hand timestamp/pose frozen"
             return None
         self.signatures[side] = signature
-        angles = retarget_hand(sample["poses"])
+        poses = np.asarray(sample['poses'], dtype=float)
+        if poses.shape != (26, 7) or not np.isfinite(poses).all() or np.any(np.linalg.norm(poses[:, 3:], axis=1) < .5):
+            raise ValueError('invalid PICO hand poses/orientations')
+        fitted = self.retargeter(side, sample['poses']) if self.retargeter else None
+        angles = fitted['joints'] if fitted is not None else retarget_hand(sample["poses"])
         result = dict(joints=angles, sequence=sequence, age_s=age,
                             sample_monotonic=received,
                             palm_basis=palm_basis(sample["poses"]).tolist())
+        if fitted is not None:
+            result.update(fitted)
         self.status[side] = "tracking"
         # Mapping can take time: never send a result that expired during work.
         age = time.monotonic() - received
