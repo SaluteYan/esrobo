@@ -17,7 +17,7 @@ import numpy as np
 
 from .config import WORKSPACE
 from .diagnostics import RuntimeDiagnostics
-from .pico_hand import PicoHands
+from .pico_hand import PicoHands, palm_sample
 
 
 def require_notifications(sdk):
@@ -279,6 +279,7 @@ class PicoForwarder:
             if item is None:
                 break
             side, sample = item
+            published = False
             try:
                 if side == 'left' and hasattr(self.mapper, 'next_due'):
                     if self.stop.wait(max(0., self.mapper.next_due-time.monotonic())):
@@ -297,23 +298,35 @@ class PicoForwarder:
                 # Full geometry is retained locally, never in status/control packets.
                 mapped.pop('target_points', None)
                 mapped.pop('solved_points', None)
+                mapped.pop('reconstructed_points', None)
+                mapped.pop('candidate_id', None)
+                if side == 'left' and 'diagnostics' in mapped:
+                    # Full contact/solver diagnostics were frozen in the local
+                    # log above; retain only the existing UI summary on wire.
+                    mapped['diagnostics'] = {k: v for k, v in mapped['diagnostics'].items()
+                        if k in ('solve_ms', 'tip_error_mm', 'pinch_error_mm', 'limited_axes',
+                                 'structural_tip_error_mm', 'pinch_blend', 'nearest_pinch_error_mm')}
                 self.metrics.mark(side+'_map')
                 # Recheck after mapping and immediately before encoding/output.
                 age = time.monotonic()-mapped['sample_monotonic']
                 if not 0 <= age <= .1:
                     raise ValueError('PICO Hand stream stale before send')
                 mapped['age_s'] = age
-                packet = dict(pico_hands={side: mapped}, laptop_input=dict(
+                packet = dict(pico_hands={side: {k:v for k,v in mapped.items() if k != 'palm_basis'}},
+                    palm_publication_version=1, laptop_input=dict(
                     v=1, kind='pico_hand', sample_monotonic={side: mapped['sample_monotonic']}, physical_sides=[side]))
                 encoded = json.dumps(packet, separators=(',', ':'), allow_nan=False).encode()
                 if time.monotonic()-mapped['sample_monotonic'] > .1:
                     raise ValueError('PICO Hand stream stale after encoding')
                 if not self.stop.is_set() and not self.args.record_only:
                     sent = self._send(self.hand_socket, encoded, side)
+                    published = sent
                     if self.trace is not None:
                         self.trace.emit('hand_forward', side=side, source_sequence=sample.get('sequence'),
                             received_monotonic_ns=sample.get('received_monotonic_ns'),
                             map_started_ns=map_started, sent=sent, joints=mapped['joints'], palm_basis=mapped['palm_basis'])
+                if self.args.record_only and not self.stop.is_set():
+                    published = True
                 self.metrics.status(side, 'tracking')
             except (ValueError, TypeError, KeyError, OverflowError) as exc:
                 if side == 'left' and self.diagnostics:
@@ -323,6 +336,14 @@ class PicoForwarder:
                 self.metrics.status(side, str(exc))
                 if self.trace is not None:
                     self.trace.emit('hand_rejected', side=side, source_sequence=sample.get('sequence'), reason=str(exc))
+            finally:
+                finish = getattr(self.mapper, 'finish', None)
+                if finish is not None:
+                    try:
+                        finish(side, sample.get('sequence'), published)
+                    except ValueError as exc:
+                        self.metrics.count(side+'_invalid')
+                        self.metrics.status(side, str(exc))
 
     def snapshot(self):
         counts, times, status = self.metrics.raw()
@@ -350,6 +371,8 @@ class PicoForwarder:
                     status[side] = 'stale'
         return dict(generated_monotonic_ns=now, sdk=sdk, timing=timing,
                     counts=counts, hand_status=status,
+                    left_hand_backend=getattr(self.mapper, "compute_backend", None),
+                    left_hand_fingerprint=getattr(self.mapper, "fingerprint", None),
                     errors=self.metrics.error_snapshot(),
                     logging=self.diagnostics.stats() if self.diagnostics else {}, web_poll_hz=20.,
                     motion_trace=self.trace.stats() if self.trace is not None else None)
@@ -439,6 +462,15 @@ class PicoForwarder:
                             received = packet['body_sample_monotonic']
                             packet['laptop_input'] = dict(v=1, kind='pico', sample_monotonic=dict(left=received, right=received), physical_sides=['left', 'right'])
                             packet['pico_hand_status'] = self.metrics.status_snapshot()
+                            # Body and raw palm share a receive transaction. Finger
+                            # fitting stays on the worker and cannot delay the palm.
+                            packet['palm_publication_version'] = 1
+                            packet['pico_palms'] = {}
+                            for side in ('left', 'right'):
+                                try:
+                                    packet['pico_palms'][side] = palm_sample(updates[side])
+                                except (ValueError, TypeError, KeyError, OverflowError):
+                                    self.metrics.count(side+'_palm_invalid')
                             encoded = json.dumps(packet, separators=(',', ':'), allow_nan=False).encode()
                             if time.monotonic()-received > .1:
                                 self.metrics.count('body_stale')
@@ -450,7 +482,9 @@ class PicoForwarder:
                                 if self.trace is not None:
                                     self.trace.emit('body_forward', source_sequence=sample['sequence'],
                                         received_monotonic_ns=sample['received_monotonic_ns'], sent_monotonic_ns=sent,
-                                        sent=not self.args.record_only)
+                                        sent=not self.args.record_only,
+                                        palms={s: dict(sequence=v['sequence'], sample_monotonic=v['sample_monotonic'])
+                                               for s,v in packet['pico_palms'].items()})
                                 last_sent_stamp = int(sample['packet_timestamp_ns'])
                                 self.sent_total += 1
                                 # Fixed rate-limit deadlines, rather than adding

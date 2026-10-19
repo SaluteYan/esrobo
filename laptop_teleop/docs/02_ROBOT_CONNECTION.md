@@ -2,6 +2,8 @@
 
 本文负责网络、认证和服务部署。环境安装见 [本机 README](../README.md#环境安装与配置)，日常控制顺序见 [运行手册](03_OPERATION_RUNBOOK.md)。示例本机仓库为 `/home/ddc/DualArmTeleoperation`，机器人仓库为 `/home/esrobo/Projects/esrobo`；新部署按实际路径修改。
 
+左手 v4 求解另需在笔记本构建数值内核：安装环境脚本包含 `build` 依赖（pybind11 头文件），系统需要 C++17 编译器和对应 Python 开发头文件。同步后可先执行 `bash laptop_teleop/scripts/build_hand_native.sh`；PICO 启动脚本也会先核对源码／Python ABI 缓存并构建。编译不在采集循环中运行，不把笔记本的二进制缓存复制给机器人。只更新源码不代表运行进程已加载新版本；仍须按停止、失能核验和指纹核对流程重启。
+
 ## 网络与 SSH
 
 机器人默认地址为 `192.168.10.100`，运动协议使用 UDP `16000`。头显应连接运行 PC Service 的本机局域网地址，不能填写机器人地址或 `127.0.0.1`。

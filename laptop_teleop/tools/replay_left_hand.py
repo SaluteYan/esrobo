@@ -64,6 +64,8 @@ def analyze(records, cfg, execution=()):
         seq = row.get('source_sequence',sample.get('sequence'))
         frame = dict(sequence=seq,target=target.tolist(),solved=predicted.tolist(),legacy=old_points.tolist(),
                      diagnostics=result['diagnostics'],q=result['joints'])
+        if 'reconstructed_points' in result:
+            frame['reconstructed'] = result['reconstructed_points']
         observed = observations.get(seq)
         if observed:
             hand = observed.get('feedback_snapshot',{}).get('left') or {}
@@ -86,14 +88,14 @@ def analyze(records, cfg, execution=()):
 HTML = '''<!doctype html><meta charset="utf-8"><title>左手十轴离线回放</title>
 <style>body{font:16px sans-serif;background:#102027;color:#eee;margin:24px}canvas{background:#162d36;border-radius:8px;width:100%;max-width:1000px}input{width:75%}pre{white-space:pre-wrap}button{padding:8px}span{margin-right:20px}</style>
 <h2>左手十轴离线回放</h2><p>__LABEL__ · 拖动旋转视角；滑动选择帧。本页面不会连接机器人。</p>
-<p><span style="color:#80cbc4">人手目标</span><span style="color:#ffcc80">新映射</span><span style="color:#ef9a9a">旧映射</span><span style="color:#90caf9">发送时反馈快照（如有）</span></p>
+<p><span style="color:#80cbc4">掌宽缩放人手目标</span><span style="color:#b9f6ca">机器人骨长重建目标</span><span style="color:#ffcc80">当前求解</span><span style="color:#ef9a9a">旧启发式映射（非 v2）</span><span style="color:#90caf9">发送时反馈快照（如有）</span></p>
 <canvas id="view" width="1000" height="650"></canvas><p><button id="play">播放 / 暂停</button> <input id="frame" type="range" min="0" value="0" step="1"></p><pre id="detail"></pre>
 <script>const data=__DATA__, report=__REPORT__;
 const canvas=document.getElementById('view'),ctx=canvas.getContext('2d'),slider=document.getElementById('frame');slider.max=Math.max(0,data.length-1);
 let yaw=.6,pitch=-.4,drag=null,playing=false;const chains=[[2,3,4,5],[6,7,8,9,10],[11,12,13,14,15],[16,17,18,19,20],[21,22,23,24,25],[7,12,17,22]];
 function project(p){let x=p[0],y=p[1],z=p[2]-.14;let a=x*Math.cos(yaw)-y*Math.sin(yaw),b=x*Math.sin(yaw)+y*Math.cos(yaw);return [500+2100*a,360-2100*(z*Math.cos(pitch)-b*Math.sin(pitch))];}
 function draw(){ctx.clearRect(0,0,1000,650);const f=data[+slider.value];if(!f){document.getElementById('detail').textContent=JSON.stringify(report,null,2);return;}
-for(const [key,color] of [['legacy','#ef9a9a'],['target','#80cbc4'],['solved','#ffcc80'],['feedback','#90caf9']]){if(!f[key])continue;ctx.strokeStyle=color;ctx.lineWidth=key==='solved'?3:1.5;for(const chain of chains){ctx.beginPath();chain.forEach((id,i)=>{const [x,y]=project(f[key][id]);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();}}
+for(const [key,color] of [['legacy','#ef9a9a'],['target','#80cbc4'],['reconstructed','#b9f6ca'],['solved','#ffcc80'],['feedback','#90caf9']]){if(!f[key])continue;ctx.strokeStyle=color;ctx.lineWidth=key==='solved'?3:1.5;for(const chain of chains){ctx.beginPath();chain.forEach((id,i)=>{const [x,y]=project(f[key][id]);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();}}
 document.getElementById('detail').textContent=JSON.stringify({frame:+slider.value,sequence:f.sequence,...f.diagnostics,feedback_age_s:f.feedback_age_s,feedback_note:f.feedback_note,summary:report},null,2);}
 slider.oninput=draw;canvas.onpointerdown=e=>{drag=[e.clientX,e.clientY];canvas.setPointerCapture(e.pointerId);};canvas.onpointerup=()=>drag=null;canvas.onpointermove=e=>{if(drag){yaw+=(e.clientX-drag[0])*.008;pitch+=(e.clientY-drag[1])*.008;drag=[e.clientX,e.clientY];draw();}};
 document.getElementById('play').onclick=()=>playing=!playing;setInterval(()=>{if(playing&&data.length){slider.value=(+slider.value+1)%data.length;draw();}},50);draw();</script>'''

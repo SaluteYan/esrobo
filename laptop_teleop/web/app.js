@@ -684,7 +684,8 @@ function render() {
 
   $('connection').textContent = state.connected ? 'SSH 已连接' : '机器人未连接';
   $('connection-dot').classList.toggle('online', state.connected);
-  $('robot-mode').textContent = fresh ? (robot.recovery_phase || robot.mode) : '反馈离线';
+  $('robot-mode').textContent = fresh ? (robot.mode === 'HOLD_LATCHED' ? '受控减速／保持（已锁存）'
+    : robot.mode === 'FAULT' ? '故障停止' : (robot.recovery_phase || robot.mode)) : '反馈离线';
   $('robot-mode').className = 'tag ' + (fresh && robot.mode === 'ACTIVE' ? 'active' : fresh && robot.mode === 'FAULT' ? 'fault' : '');
   const returnFailure = fresh && robot.mode === 'FAULT' && robot.last_return?.returned === false
     ? robot.last_return.reason : '';
@@ -769,8 +770,12 @@ function render() {
     const retarget = telemetry.hand_retarget?.left;
     if (retarget && Number.isFinite(retarget.solve_ms)) {
       const errors = retarget.pinch_error_mm || [];
+      const structural = retarget.structural_tip_error_mm;
       $('runtime-status').textContent += ` · 左手十轴 ${retarget.solve_ms.toFixed(1)} ms`
-        + (errors.length ? ` · 模型对捏误差 ${Math.max(...errors).toFixed(1)} mm` : '')
+        + (Array.isArray(structural) && structural.length
+          ? ` · 骨长适配后拇指误差 ${structural[0].toFixed(1)} mm`
+            + (retarget.pinch_blend > 0.8 ? ` · 最近对捏误差 ${retarget.nearest_pinch_error_mm.toFixed(1)} mm` : '')
+          : (errors.length ? ` · 四组模型对捏最大误差 ${Math.max(...errors).toFixed(1)} mm` : ''))
         + ` · 限位 ${retarget.limited_axes?.length || 0} 轴（完整诊断见本机手部日志）`;
       $('runtime-status').textContent += ` · 十轴目标 [${telemetry.targets?.left?.hand_unit?.join(', ') ?? '--'}]`
         + ` / 反馈 [${robot.feedback?.hand?.position_unit?.join(', ') ?? '--'}]`;

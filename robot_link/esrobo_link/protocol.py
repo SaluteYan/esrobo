@@ -25,6 +25,10 @@ class HoldReturnTransition(RuntimeError):
     """Yield an in-flight hold to an accepted robot-owned checked return."""
 
 
+class TrajectoryHoldTransition(RuntimeError):
+    """A validated braking command was committed; latch robot-owned hold."""
+
+
 def key_from_file(path):
     key = Path(path).read_bytes().strip()
     if len(key) < 32:

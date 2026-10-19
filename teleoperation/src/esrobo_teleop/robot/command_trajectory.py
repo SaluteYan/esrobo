@@ -1,6 +1,9 @@
 """Feedback-bounded command-space trajectory; proposals have no side effects."""
 
 from dataclasses import dataclass
+import time
+
+from .joint_velocity_solver import solve_velocity
 
 import numpy as np
 
@@ -57,7 +60,8 @@ class CommandTrajectory:
         self.state = None
 
     def propose(self, target, feedback, stamp, lower, upper, fk, endpoint_speed,
-                *, path_check=None, coordinate_elbow=False, brake_only=False):
+                *, path_check=None, coordinate_elbow=False, brake_only=False,
+                endpoint_jacobian=None):
         state = self.state
         if state is None:
             raise TrajectoryFault("trajectory needs explicit session initialization")
@@ -216,7 +220,8 @@ class CommandTrajectory:
         def endpoints(position):
             result = np.asarray(fk(position), dtype=float)
             if result.shape != (2, 3) or not np.all(np.isfinite(result)):
-                raise TrajectoryFault("command FK must return finite elbow/wrist positions")
+                raise TrajectoryFault("command FK must return finite elbow/wrist positions",
+                                      {"fault_code": "model_invalid"})
             return result
 
         before = endpoints(q)
@@ -231,42 +236,68 @@ class CommandTrajectory:
         )
         if path_check is not None and not path_check(feedback, q):
             raise TrajectoryFault("outstanding command/feedback motion intersects torso safety envelope",
-                                  dict(collision_context, collision_stage="outstanding_motion",
+                                  dict(collision_context, fault_code="collision_rejected", collision_stage="outstanding_motion",
                                        checked_lower_physical_rad=np.minimum(feedback, q).tolist(),
                                        checked_upper_physical_rad=np.maximum(feedback, q).tolist()))
         selected = None
         collision_rejections = 0
+        search_info = dict(search_method="fast", requires_controlled_hold=False)
+        def validate(candidate_velocity):
+            nonlocal collision_rejections
+            candidate = q + dt * candidate_velocity
+            if (not np.all(np.isfinite(candidate))
+                    or np.any(candidate_velocity < vlow-1e-10)
+                    or np.any(candidate_velocity > vhigh+1e-10)
+                    or np.any(candidate < lo-1e-8) or np.any(candidate > hi+1e-8)):
+                return None
+            distance = np.linalg.norm(endpoints(candidate) - before, axis=1)
+            if not np.all(distance <= endpoint_speed * dt + 1e-9):
+                return None
+            if path_check is not None:
+                # Include independently lagging axes and the braking corridor.
+                stop = candidate + candidate_velocity * self.max_dt + (
+                    candidate_velocity * np.abs(candidate_velocity) / (2 * self.amax))
+                vertices = np.array([feedback, q, candidate, stop])
+                box_lower, box_upper = vertices.min(axis=0), vertices.max(axis=0)
+                if not path_check(box_lower, box_upper):
+                    collision_rejections += 1
+                    collision_context.update(
+                        collision_stage="feedback_command_braking_box",
+                        candidate_not_sent_physical_rad=candidate.tolist(),
+                        candidate_velocity_rad_s=candidate_velocity.tolist(),
+                        stopping_physical_rad=stop.tolist(),
+                        checked_lower_physical_rad=box_lower.tolist(),
+                        checked_upper_physical_rad=box_upper.tolist())
+                    return None
+            return distance
+
         for progress in [2.0 ** -i for i in range(11)] + [0.0]:
             candidate_velocity = brake_velocity + progress * (goal_velocity - brake_velocity)
-            candidate = q + dt * candidate_velocity
-            distance = np.linalg.norm(endpoints(candidate) - before, axis=1)
-            if np.all(distance <= endpoint_speed * dt + 1e-9):
-                if path_check is not None:
-                    # MOVE J axes can lag independently across successive
-                    # targets. Separate feedback->q, q->candidate and
-                    # candidate->stop boxes omit mixed combinations, e.g. one
-                    # joint still at feedback while another reaches candidate.
-                    # Certify their entire joint interval before sending.
-                    stop = candidate + candidate_velocity * self.max_dt + (
-                        candidate_velocity * np.abs(candidate_velocity) / (2 * self.amax))
-                    vertices = np.array([feedback, q, candidate, stop])
-                    box_lower, box_upper = vertices.min(axis=0), vertices.max(axis=0)
-                    if not path_check(box_lower, box_upper):
-                        collision_rejections += 1
-                        collision_context.update(
-                            collision_stage="feedback_command_braking_box",
-                            candidate_not_sent_physical_rad=candidate.tolist(),
-                            candidate_velocity_rad_s=candidate_velocity.tolist(),
-                            stopping_physical_rad=stop.tolist(),
-                            checked_lower_physical_rad=box_lower.tolist(),
-                            checked_upper_physical_rad=box_upper.tolist(),
-                        )
-                        continue
-                selected = candidate, candidate_velocity, distance, progress
+            distance = validate(candidate_velocity)
+            if distance is not None:
+                selected = q + dt*candidate_velocity, candidate_velocity, distance, progress
                 break
+        if selected is None and endpoint_jacobian is not None:
+            try:
+                selected, search_info = solve_velocity(
+                    q, velocity, goal_velocity, brake_velocity, vlow, vhigh, self.vmax,
+                    dt, endpoint_speed, before, endpoints, endpoint_jacobian, validate,
+                    brake_only=recovery)
+                if selected is not None:
+                    search_info["requires_controlled_hold"] = (
+                        search_info.get("solver_mode") == "brake" and not brake_only)
+            except Exception as exc:
+                raise TrajectoryFault("joint solver model/evaluation failure", dict(
+                    collision_context, fault_code="model_invalid", detail=str(exc))) from exc
         if selected is None:
-            raise TrajectoryFault("no safe elbow/wrist speed candidate or collision-free braking path",
-                                  dict(collision_context, collision_rejections=collision_rejections))
+            code = search_info.get("fault_code", "endpoint_search_exhausted")
+            if collision_rejections and code != "solver_timeout":
+                code = "collision_rejected"
+            raise TrajectoryFault("no validated elbow/wrist speed candidate", dict(
+                collision_context, **dict(search_info, fault_code=code),
+                collision_rejections=collision_rejections,
+                feasible_velocity_lower_rad_s=vlow.tolist(),
+                feasible_velocity_upper_rad_s=vhigh.tolist()))
         candidate, candidate_velocity, distance, progress = selected
         lead = candidate - feedback
         pushing = (np.abs(lead) >= .9 * self.lead) & ((target - candidate) * lead > 0)
@@ -312,6 +343,7 @@ class CommandTrajectory:
                 lead_progress_threshold_rad=progress_threshold.tolist(),
                 lead_elapsed_s=np.where(pushing, stamp-since, 0).tolist()))
         diagnostics = {
+            **search_info,
             "collision_rejections": collision_rejections,
             "braking_recovery": recovery,
             "reserve_conflict": reserve_conflict,
@@ -358,6 +390,11 @@ class CommandTrajectory:
             "feasible_velocity_lower_rad_s": vlow.tolist(),
             "feasible_velocity_upper_rad_s": vhigh.tolist(),
         }
+        if search_info.get("search_method") == "joint_slsqp":
+            if time.monotonic() >= search_info["solver_deadline_monotonic"]:
+                raise TrajectoryFault("joint solver final validation exceeded budget", dict(
+                    collision_context, **dict(search_info, fault_code="solver_timeout")))
+            diagnostics["solver_elapsed_ms"] = (time.monotonic()-search_info["solver_started_monotonic"])*1000
         return TrajectoryStep(candidate, candidate_velocity, float(stamp), since, diagnostics)
 
     def commit(self, step):

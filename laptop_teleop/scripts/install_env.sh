@@ -28,7 +28,7 @@ else
 fi
 
 LAPTOP_PYTHON="${CONDA_ENV_PREFIX}/bin/python"
-"${LAPTOP_PYTHON}" -m pip install -e "${LAPTOP_ROOT}[test]"
+"${LAPTOP_PYTHON}" -m pip install -e "${LAPTOP_ROOT}[test,build]"
 # Only reuse computation/communication modules; skip teleoperation's unrelated PyPI pink dependency.
 "${LAPTOP_PYTHON}" -m pip install --no-deps \
     -e "${LAPTOP_ROOT}/../teleoperation" -e "${LAPTOP_ROOT}/../robot_link"

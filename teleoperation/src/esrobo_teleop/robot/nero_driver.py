@@ -1453,11 +1453,15 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             raise ValueError(f"{name} requires positive seven-axis limits")
         return lead
 
-    def configure_command_trajectory(self, fk, endpoint_speed):
+    def configure_command_trajectory(self, fk, endpoint_speed, *, endpoint_jacobian=None):
         if not callable(fk) or not np.isfinite(endpoint_speed) or endpoint_speed <= 0:
             raise ValueError("trajectory requires FK and a positive endpoint speed")
         self._trajectory_fk = fk
+        self._trajectory_endpoint_jacobian = endpoint_jacobian
         self._trajectory_endpoint_speed = float(endpoint_speed)
+        if endpoint_jacobian is not None:
+            from .joint_velocity_solver import warmup_solver
+            warmup_solver()
 
     def configure_collision_guard(self, guard):
         if not callable(guard):
@@ -1762,7 +1766,8 @@ class NeroSingleArmDriver(NeroDualArmDriver):
     def _trajectory_fault(self, reason, diagnostics=None):
         first_fault = not self._safety_fault_reason
         diagnostics = dict(diagnostics or {})
-        if "collision" in reason or "torso" in reason:
+        if diagnostics.get("fault_code") in ("collision_rejected", "collision_geometry_unavailable",
+                                              "startup_safety_rejected"):
             self._return_inhibited = True
         if not self._safety_fault_reason:
             self._safety_fault_reason = f"{self._side} command trajectory: {reason}"
@@ -1809,7 +1814,8 @@ class NeroSingleArmDriver(NeroDualArmDriver):
         if not callable(getattr(self, "_trajectory_fk", None)):
             return self._trajectory_fault("FK is unavailable; enable was not sent")
         if self._cfg.torso_collision_enabled and not callable(getattr(self, "_collision_guard", None)):
-            return self._trajectory_fault("torso collision geometry unavailable; enable was not sent")
+            return self._trajectory_fault("torso collision geometry unavailable; enable was not sent",
+                                          {"fault_code": "collision_geometry_unavailable"})
         try:
             points = np.asarray(self._trajectory_fk(np.zeros(14)), dtype=float)
             if points.shape != (2, 3) or not np.all(np.isfinite(points)):
@@ -1848,7 +1854,8 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             if joints is None or not self._within_hard_limits(joints) or stamp is None:
                 return self._trajectory_fault("missing initialization feedback")
             if not self._controller_is_safe():
-                return self._trajectory_fault("startup controller/collision check rejected")
+                return self._trajectory_fault("startup controller/collision check rejected",
+                                              {"fault_code": "startup_safety_rejected"})
             lower, upper = self._effective_position_limits(self._side)
             if np.any(joints < lower) or np.any(joints > upper):
                 outside = np.flatnonzero((joints < lower) | (joints > upper))
@@ -2543,6 +2550,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             return self._command_trajectory_full_urdf(held, brake_only=True)
 
     def _command_trajectory_full_urdf(self, targets, *, brake_only=False):
+        self.trajectory_hold_requested = False
         self.last_command_skipped = False
         self.last_command_skip_reason = None
         if self._safety_fault_reason or not self._enabled:
@@ -2558,7 +2566,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 return False
             targets = np.asarray(targets, dtype=float)
             if targets.shape != (14,) or not np.all(np.isfinite(targets)):
-                raise TrajectoryFault("invalid IK target")
+                raise TrajectoryFault("invalid IK target", {"fault_code": "target_invalid"})
             snapshot = getattr(self, "_cycle_feedback", None)
             if getattr(self, "_motion_trace_enabled", False):
                 # Immutable snapshot retained only until the passive gateway
@@ -2567,13 +2575,13 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             self._cycle_feedback = None
             if snapshot is not None:
                 if time.monotonic() - snapshot.received_monotonic > .1:
-                    raise TrajectoryFault("control-cycle feedback expired before send")
+                    raise TrajectoryFault("control-cycle feedback expired before send", {"fault_code": "feedback_stale"})
                 current, stamp = snapshot.position, snapshot.stamp
             else:
                 current = self.read_joints()
                 stamp = self._arm.last_feedback_timestamp
             if current is None or not self._within_hard_limits(current) or stamp is None:
-                raise TrajectoryFault("missing or invalid feedback")
+                raise TrajectoryFault("missing or invalid feedback", {"fault_code": "feedback_invalid"})
             directions, offsets = self._mapping(self._side)
             start = 0 if self._side == "left" else 7
             side_slice = slice(start, start+7)
@@ -2581,6 +2589,11 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 full = np.zeros(14)
                 full[side_slice] = (physical - offsets) / directions
                 return self._trajectory_fk(full)
+            jacobian_full = getattr(self, "_trajectory_endpoint_jacobian", None)
+            def endpoint_jacobian(physical):
+                full = np.zeros(14)
+                full[side_slice] = (physical-offsets)/directions
+                return jacobian_full(full)/directions
             lower, upper = self._effective_position_limits(self._side)
             physical_target = directions * targets[side_slice] + offsets
             if np.any(physical_target < lower - 1e-8) or np.any(physical_target > upper + 1e-8):
@@ -2668,13 +2681,19 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 path_check=(self._check_physical_path if self._cfg.teleop_torso_collision_enabled else None),
                 coordinate_elbow=True,
                 brake_only=brake_for_feedback,
+                endpoint_jacobian=(endpoint_jacobian if callable(jacobian_full) and not first_hold else None),
             )
             if proposed is None:
                 self.last_command_skipped = True
                 self.last_command_skip_reason = "duplicate_feedback"
                 return True  # Duplicate feedback is a no-op, not a new command.
             if snapshot is not None and time.monotonic() - snapshot.received_monotonic > .1:
-                raise TrajectoryFault("control-cycle feedback expired during trajectory/collision checks")
+                raise TrajectoryFault("control-cycle feedback expired during trajectory/collision checks",
+                                      {"fault_code": "feedback_stale"})
+            request_hold = proposed.diagnostics.get("requires_controlled_hold", False)
+            if request_hold and not getattr(self._cfg, f"{self._side}_input_recovery_verified", False):
+                raise TrajectoryFault("joint braking candidate requires commissioned hold", dict(
+                    proposed.diagnostics, fault_code="hold_not_commissioned"))
             # Commit nothing until the SDK call has returned successfully.
             wire_key = joint_wire_key(proposed.position)
             send_position = (self._backpressure is None or first_hold
@@ -2683,6 +2702,10 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 send_position = self._move_j_waypoint_gate.should_send(
                     proposed.position, current, force=first_hold
                 )
+            solver_deadline = proposed.diagnostics.get("solver_deadline_monotonic")
+            if solver_deadline is not None and time.monotonic() >= solver_deadline:
+                raise TrajectoryFault("joint solver candidate expired before SDK send", dict(
+                    proposed.diagnostics, fault_code="solver_timeout"))
             if send_position:
                 result = (
                     self._arm.move_tracking_positions(proposed.position.tolist())
@@ -2690,7 +2713,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                     else self._arm.move_j(proposed.position.tolist())
                 )
                 if result is False:
-                    raise TrajectoryFault("SDK rejected position command")
+                    raise TrajectoryFault("SDK rejected position command", {"fault_code": "command_send_failed"})
                 self._last_follow_wire_key = wire_key
                 self._last_follow_send_monotonic = time.monotonic()
                 if self._move_j_waypoint_gate is not None:
@@ -2701,6 +2724,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 self.last_command_skipped = True
                 self.last_command_skip_reason = "duplicate_position"
             self._trajectory.commit(proposed)
+            self.trajectory_hold_requested = bool(request_hold)
             self._first_follow_hold = False
             if first_hold:
                 self.record_startup_event("first_follow_hold", proposed.position)

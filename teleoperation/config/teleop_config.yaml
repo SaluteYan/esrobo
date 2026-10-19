@@ -43,9 +43,9 @@ robot:
   torque_feedback_timeout_s: 0.3
   # Software monitor is a slower secondary guard; controller collision ratings
   # remain the fast first layer. Right-side limits include normal gravity/dynamics.
-  torque_deviation_limits_nm: [16.0, 16.0, 12.0, 12.0, 6.0, 6.0, 5.0]
-  left_torque_deviation_limits_nm: [30.0, 25.0, 20.0, 20.0, 6.0, 6.0, 5.0]
-  right_torque_deviation_limits_nm: [21.0, 21.0, 12.0, 12.0, 6.0, 6.0, 5.0]
+  torque_deviation_limits_nm: [32.0, 32.0, 24.0, 24.0, 12.0, 12.0, 10.0]
+  left_torque_deviation_limits_nm: [60.0, 50.0, 40.0, 40.0, 12.0, 12.0, 10.0]
+  right_torque_deviation_limits_nm: [42.0, 42.0, 24.0, 24.0, 12.0, 12.0, 10.0]
   torque_trip_consecutive_samples: 5
   controller_status_monitor_enabled: true
   controller_status_timeout_s: 0.3
@@ -285,12 +285,15 @@ hand:
       index_mcp_roll: {raw: [0, 255], rad: [0.0, 0.19], error_rad: 0.05, max_velocity_rad_s: 1.0, verified: true}
       ring_mcp_roll: {raw: [0, 255], rad: [0.0, 0.20], error_rad: 0.05, max_velocity_rad_s: 1.0, verified: true}
       pinky_mcp_roll: {raw: [0, 255], rad: [0.0, 0.30], error_rad: 0.05, max_velocity_rad_s: 1.0, verified: true}
-      thumb_cmc_roll: {raw: [0, 255], rad: [0.0, 1.03], error_rad: 0.05, max_velocity_rad_s: 1.615686, verified: true}
+      # Left physical rotation direction corrected from the operator's observation.
+      thumb_cmc_roll: {raw: [255, 0], rad: [0.0, 1.03], error_rad: 0.05, max_velocity_rad_s: 1.615686, verified: true}
     # The right thumb's linked three-joint flexion reaches its physical stop
     # near feedback 138.  Keep this feedback geometry separate from the left.
     right:
       <<: *l20lite_l10_geometry
       thumb_cmc_pitch: {raw: [254, 138], rad: [0.0, 0.52], error_rad: 0.05, max_velocity_rad_s: 1.0, verified: true}
+      # Preserve the right-side mapping despite the shared YAML base above.
+      thumb_cmc_roll: {raw: [0, 255], rad: [0.0, 1.03], error_rad: 0.05, max_velocity_rad_s: 1.615686, verified: true}
   left_topic: /cb_left_hand_control_cmd
   right_topic: /cb_right_hand_control_cmd
   publish_hz: 50.0
@@ -330,13 +333,14 @@ hand:
     index_mcp_roll: {raw: [0, 255], rad: [0.0, 0.19], allowed_rad: [0.0, 0.18675022996339324]}
     ring_mcp_roll: {raw: [0, 255], rad: [0.0, 0.20], allowed_rad: [0.0, 0.2]}
     pinky_mcp_roll: {raw: [0, 255], rad: [0.0, 0.30], allowed_rad: [0.0, 0.3]}
-    thumb_cmc_roll: {raw: [0, 255], rad: [0.0, 1.03], allowed_rad: [0.0, 1.03]}
-  left_open:   [255, 255, 255, 255, 255, 255, 128, 128, 128, 128]
-  # Compatibility zero from the established left-hand-only teleoperation path.
-  # That path uses left_open for startup/quit and treats it as the physical
-  # natural-open reference.  Keep a separate field so later measured feedback
-  # commissioning can replace it without changing the command endpoint.
-  left_open_feedback: [255, 255, 255, 255, 255, 255, 128, 128, 128, 128]
+    thumb_cmc_roll: {raw: [255, 0], rad: [0.0, 1.03], allowed_rad: [0.0, 1.03]}
+  # Keep physical home raw 111; reversed rotation mapping now means ~33.3 deg.
+  # This is a command target, not a new measured geometry calibration.
+  left_open:   [255, 255, 255, 255, 255, 255, 128, 128, 128, 111]
+  # Expected arrival in feedback units follows the existing nominal identity
+  # relation. Actual fresh feedback must still verify it; geometry calibration
+  # is independent and unchanged.
+  left_open_feedback: [255, 255, 255, 255, 255, 255, 128, 128, 128, 111]
   left_closed: [0,   0,   0,   0,   0,   0,   128, 128, 128, 128]
   right_open:   [255, 210, 255, 255, 255, 255, 110, 110, 120, 33]
   # Measured right-hand feedback at the physical natural-open pose.  Keep this

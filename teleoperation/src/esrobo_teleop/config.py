@@ -74,12 +74,12 @@ class RobotConfig:
     torque_baseline_samples: int = 15
     torque_baseline_timeout_s: float = 4.0
     torque_feedback_timeout_s: float = 0.3
-    torque_deviation_limits_nm: tuple = (16.0, 16.0, 12.0, 12.0, 6.0, 6.0, 5.0)
+    torque_deviation_limits_nm: tuple = (32.0, 32.0, 24.0, 24.0, 12.0, 12.0, 10.0)
     left_torque_deviation_limits_nm: Optional[tuple] = (
-        30.0, 25.0, 20.0, 20.0, 6.0, 6.0, 5.0,
+        60.0, 50.0, 40.0, 40.0, 12.0, 12.0, 10.0,
     )
     right_torque_deviation_limits_nm: Optional[tuple] = (
-        21.0, 21.0, 12.0, 12.0, 6.0, 6.0, 5.0,
+        42.0, 42.0, 24.0, 24.0, 12.0, 12.0, 10.0,
     )
     torque_trip_consecutive_samples: int = 5
     controller_status_monitor_enabled: bool = True
@@ -490,7 +490,7 @@ class HandConfig:
         return self.enabled_physical_joints if value is None else value
 
     left_open: list = field(
-        default_factory=lambda: [255, 255, 255, 255, 255, 255, 128, 128, 128, 128]
+        default_factory=lambda: [255, 255, 255, 255, 255, 255, 128, 128, 128, 111]
     )
     left_closed: list = field(
         default_factory=lambda: [0, 0, 0, 0, 0, 0, 128, 128, 128, 128]

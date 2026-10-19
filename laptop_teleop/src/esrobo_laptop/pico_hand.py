@@ -10,7 +10,7 @@ from esrobo_teleop.robot.linker_hand_driver import ACTIVE_HAND_JOINTS, ACTIVE_JO
 
 
 def unit(vector):
-    length = np.linalg.norm(vector)
+    length = float(vector @ vector)**.5
     if length < 1e-5:
         raise ValueError("degenerate PICO hand bone")
     return vector / length
@@ -29,13 +29,36 @@ def palm_basis(poses):
     poses = np.asarray(poses, dtype=float)
     if poses.shape != (26, 7) or not np.all(np.isfinite(poses)):
         raise ValueError("PICO hand requires 26 finite xyz+xyzw poses")
+    return _palm_basis_validated(poses)
+
+
+def _palm_basis_validated(poses):
+    # Three-dimensional cross products avoid generic broadcasting/axis setup
+    # on the acquisition owner. Same anatomical construction as palm_basis.
+    def cross(a, b):
+        return np.array([a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]])
     forward = unit(poses[12, :3] - poses[1, :3])
     lateral = unit(poses[7, :3] - poses[22, :3])
-    cross = np.cross(lateral, forward)
-    if np.linalg.norm(cross) < .5:
+    normal_raw = cross(lateral, forward)
+    if float(normal_raw @ normal_raw) < .25:
         raise ValueError("degenerate PICO palm plane")
-    normal = unit(cross)
-    return np.column_stack((normal, np.cross(forward, normal), forward))
+    normal = unit(normal_raw)
+    return np.column_stack((normal, cross(forward, normal), forward))
+
+
+def palm_sample(sample, now=None):
+    """Cheap independent palm observation; never renew the SDK source clock."""
+    now = time.monotonic() if now is None else now
+    stamp = int(sample['received_monotonic_ns']) / 1e9
+    seq = sample['sequence']
+    flags = np.asarray(sample['flags'], dtype=np.uint64)
+    poses = np.asarray(sample['poses'], dtype=float)
+    if (not sample['active'] or type(seq) is not int or seq <= 0 or
+            not 0 <= now-stamp <= .1 or flags.shape != (26,) or
+            np.any((flags & 3) != 3) or poses.shape != (26, 7) or
+            not np.isfinite(poses).all() or np.any(np.sum(poses[:, 3:]**2, axis=1) < .25)):
+        raise ValueError('invalid/stale PICO palm observation')
+    return dict(sequence=seq, sample_monotonic=stamp, palm_basis=_palm_basis_validated(poses).tolist())
 
 
 def retarget_hand(poses):

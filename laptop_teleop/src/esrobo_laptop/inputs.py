@@ -49,6 +49,8 @@ class FreshBodyDevice(BodyDevice):
         self.pico_hand_status_at = None
         self.hand_history = {side: deque(maxlen=120) for side in self.sides}
         self.palm_history = {side: deque(maxlen=120) for side in self.sides}
+        self.independent_palms = set()
+        self.palm_sequences = {}
         self.incoming_body_stamps = {}
         self.wrist_rotations = {}
         self.wrist_references = {}
@@ -365,6 +367,18 @@ class FreshBodyDevice(BodyDevice):
             body_message = {"frames": {k:v for k,v in message["frames"].items() if k in needed}}
             body_message['_trace_source'] = dict(sequence=message.get('body_sample_sequence'),
                 received_monotonic=message.get('body_sample_monotonic'), decoded_monotonic_ns=time.monotonic_ns())
+            if message.get('palm_publication_version') is not None:
+                if message['palm_publication_version'] != 1:
+                    raise ValueError('unsupported palm publication version')
+                body_message['_independent_palms'] = {}
+                for side, sample in message.get('pico_palms', {}).items():
+                    if side not in self.sides or not self.with_hand:
+                        continue
+                    stamp, seq = sample['sample_monotonic'], sample['sequence']
+                    if (type(seq) is not int or seq <= 0 or type(stamp) not in (int, float)
+                            or not np.isfinite(stamp) or not 0 <= now-stamp <= .1):
+                        raise ValueError('invalid independent palm time/sequence')
+                    body_message['_independent_palms'][side] = (stamp, checked_rotation(sample['palm_basis']), seq)
             parsed_frames = self._decode_frames(body_message) if transform else None
             return kind, (body_message, parsed_frames, updates, message.get('pico_hand_status'))
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
@@ -395,6 +409,16 @@ class FreshBodyDevice(BodyDevice):
                     # Repeated publishes of an old ROS sample cannot renew freshness.
                     self._trace_input('input_rejected', component='body', reason='duplicate', source=body_message.get('_trace_source'))
                     return
+                if '_independent_palms' in body_message:
+                    self.independent_palms.update(self.sides)
+                    for side, (stamp, palm, seq) in body_message['_independent_palms'].items():
+                        history = self.palm_history[side]
+                        if (0 <= now-stamp <= .1 and seq > self.palm_sequences.get(side, 0)
+                                and (not history or stamp > history[-1][0])):
+                            history.append((stamp, palm, seq))
+                            self.palm_sequences[side] = seq
+                            self._trace_input('input_committed', component=side+'_palm',
+                                              source_sequence=seq, sample_monotonic=stamp)
                 # Body traffic owns only body frames, never fingers/IMU fields.
                 self.incoming_body_stamps = updates
                 try:
@@ -415,6 +439,9 @@ class FreshBodyDevice(BodyDevice):
         if not self.with_hand:
             return {}
         validated = {}
+        split = message.get('palm_publication_version')
+        if split is not None and split != 1:
+            raise ValueError('unsupported palm publication version')
         for side in self.sides:
             if side not in meta["physical_sides"]:
                 continue
@@ -436,7 +463,7 @@ class FreshBodyDevice(BodyDevice):
                 raise ValueError(f"{side} PICO finger targets out of range")
             if type(seq) is not int or seq <= 0 or type(stamp) not in (int, float) or not np.isfinite(stamp) or not 0 <= now-stamp <= .1:
                 raise ValueError(f"{side} invalid PICO Hand sample time/sequence")
-            palm = (None if self.hand_only else checked_rotation(sample["palm_basis"]))
+            palm = (None if self.hand_only or split == 1 else checked_rotation(sample["palm_basis"]))
             diagnostics = {}
             if side == 'left' and self.hand_mapping_fingerprint is not None and sample.get('diagnostics'):
                 values = sample['diagnostics']
@@ -450,6 +477,16 @@ class FreshBodyDevice(BodyDevice):
                         or not isinstance(limited, list) or len(limited) > 10 or any(n not in ACTIVE_HAND_JOINTS for n in limited)):
                     raise ValueError('invalid left hand fit diagnostic summary')
                 diagnostics = dict(solve_ms=elapsed, tip_error_mm=tips.tolist(), pinch_error_mm=pinch.tolist(), limited_axes=list(limited))
+                if 'structural_tip_error_mm' in values:
+                    structural = np.asarray(values['structural_tip_error_mm'], dtype=float)
+                    blend = float(values['pinch_blend'])
+                    nearest = float(values['nearest_pinch_error_mm'])
+                    if (structural.shape != (5,) or not np.isfinite(structural).all() or np.any(structural < 0)
+                            or not np.isfinite(blend) or not 0 <= blend <= 1
+                            or not np.isfinite(nearest) or nearest < 0):
+                        raise ValueError('invalid structural hand fit diagnostic summary')
+                    diagnostics.update(structural_tip_error_mm=structural.tolist(), pinch_blend=blend,
+                                       nearest_pinch_error_mm=nearest)
             validated[side] = (angles, stamp, seq, palm, diagnostics)
         return validated
 
@@ -468,7 +505,7 @@ class FreshBodyDevice(BodyDevice):
                     continue
                 self.pico_hand_targets[side] = angles
                 self.hand_history[side].append((float(stamp), angles.copy()))
-                if palm is not None:
+                if palm is not None and side not in self.independent_palms:
                     self.palm_history[side].append((float(stamp), palm, seq))
                 self.hand_sequences[side] = seq
                 self.hand_retarget_diagnostics[side] = dict(diagnostics, source_sequence=seq)
@@ -517,14 +554,20 @@ class FreshBodyDevice(BodyDevice):
         return references, "PICO 有效初始手部姿态已采集"
 
     def ticket(self, max_age, *, require_reference=True):
-        """Must be called under input_lock; no cached frame is a new sample."""
+        """Fresh arm/palm drives mixed control; fingers retain their real age.
+
+        Reusing a valid finger target never renews its source clock/sequence.
+        Hand-only control still requires a new hand sample for each ticket.
+        """
         now = time.monotonic()
         missing = [k for k in self.required if k not in self.stamps or not 0 <= now-self.stamps[k] <= max_age]
         if missing:
             raise SourceExpired("PICO 输入缺失或过期: " + ", ".join(missing))
         if require_reference and not self.hand_only and not self.is_ready():
             raise InputUnavailable("PICO reference calibration not ready")
-        if any(self.stamps[k] <= self.used.get(k, -1) for k in self.required):
+        advancing = (self.required if self.hand_only else
+                     tuple(k for k in self.required if not k.endswith('_hand')))
+        if any(self.stamps[k] <= self.used.get(k, -1) for k in advancing):
             return None
         return SourceTicket({k: self.stamps[k] for k in self.required}, self.hand_sequences)
 
@@ -551,7 +594,9 @@ class FreshBodyDevice(BodyDevice):
                     raise InputUnavailable('PICO finger tracking missing')
                 return ticket, None, hand.copy()
             self.trace_sources = dict(body=dict(getattr(self, 'trace_body_source', {})),
-                                      hands=dict(self.hand_sequences), ticket=dict(ticket))
+                                      hands=dict(self.hand_sequences), ticket=dict(ticket),
+                                      hand_target_reused={s: ticket.get(s+'_hand', -1) <= self.used.get(s+'_hand', -2)
+                                                          for s in self.sides if self.with_hand})
             view = copy.copy(self)
             view._frames = {k:v.copy() for k,v in self._frames.items()}
             view.stamps = dict(self.stamps)

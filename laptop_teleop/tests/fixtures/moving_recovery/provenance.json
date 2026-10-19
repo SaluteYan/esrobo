@@ -1,0 +1,26 @@
+{
+  "session_1792136019269569381.jsonl": {
+    "source": "laptop_teleop/log/retained/stop_contact_20261016/session_1792136019269569381.jsonl",
+    "source_sha256": "4a68fd27435f532c5ae34131eafff10bf3b4c632fd62f0cfbfd45126521e84d0",
+    "selected_status": "REACQUIRING",
+    "source_records": 284,
+    "fixture_records": 136,
+    "fixture_sha256": "3b24ba6b59436d5b738cb0a50971d853534be702ce8ef3bcb570c23956d5a8b2"
+  },
+  "session_1792136220133234353.jsonl": {
+    "source": "laptop_teleop/log/retained/stop_contact_20261016/session_1792136220133234353.jsonl",
+    "source_sha256": "6105ee90a1f05b471b3e081b5dfc1d044bf4da4c261e6fb1f234883415140d9b",
+    "selected_status": "REACQUIRING",
+    "source_records": 786,
+    "fixture_records": 110,
+    "fixture_sha256": "45d1648e0d90374c96d4dcd848af4b6239bf4f7a7b0f64434dbb47d388958b6e"
+  },
+  "session_1792136515921626074.jsonl": {
+    "source": "laptop_teleop/log/retained/stop_contact_20261016/session_1792136515921626074.jsonl",
+    "source_sha256": "e6eb87f2d6b0ffa21a7de7862cdb410ea76ef53da04d9f11f2078581dfba2f54",
+    "selected_status": "REACQUIRING",
+    "source_records": 524,
+    "fixture_records": 144,
+    "fixture_sha256": "fafbd910fb5259bf0631b75c39d02e50680393eb392278d27951ddc955d74f8d"
+  }
+}
