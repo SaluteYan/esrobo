@@ -176,13 +176,38 @@ class Pipeline:
             hand = self.body.hand_joints() if self.settings.with_hand else None
             if self.settings.with_hand and hand is None:
                 raise InputUnavailable("PICO finger tracking missing")
+            self.trace_capture_id = self.__dict__.get('trace_capture_id', 0)+1
+            self.trace_context = dict(capture_id=self.trace_capture_id, phase='calibrated_entry',
+                source_times=dict(ticket), sources=dict(body=self.body.__dict__.get('trace_body_source'),
+                                                       hands=dict(self.body.hand_sequences)))
+            trace = self.__dict__.get('motion_trace')
+            if trace is not None:
+                trace.emit('entry_candidate', context=self.trace_context)
             return ticket, poses, hand
 
     def capture(self, *, full_target=False):
-        return self.body.capture_targets(self.settings.input_max_age_s, full_target=full_target)
+        trace = self.__dict__.get('motion_trace')
+        started = time.monotonic_ns()
+        try:
+            frame = self.body.capture_targets(self.settings.input_max_age_s, full_target=full_target)
+        except Exception as exc:
+            if trace is not None:
+                trace.emit('capture_rejected', started_ns=started, reason=str(exc))
+            raise
+        if trace is not None and frame is not None:
+            self.trace_capture_id = self.__dict__.get('trace_capture_id', 0)+1
+            self.trace_context = dict(capture_id=self.trace_capture_id, source_times=dict(frame[0]),
+                                     sources=getattr(self.body, 'trace_sources', None))
+            trace.emit('retarget_candidate', started_ns=started, context=self.trace_context,
+                       stages=getattr(self.body, 'trace_stages', None))
+        return frame
 
     def commit_frame(self, frame, targets):
         self.body.commit_wrist_filters(frame[1], [s for s,t in targets.items() if not t.get('hold')])
+        trace = self.__dict__.get('motion_trace')
+        if trace is not None:
+            trace.emit('frame_committed', context=self.__dict__.get('trace_context'),
+                       source_times=dict(frame[0]), committed_sides=[s for s,t in targets.items() if not t.get('hold')])
 
     def _entry_goal_inside_limits(self, side, joints):
         """Inset only the locked first goal; never clip measured feedback."""
@@ -201,6 +226,24 @@ class Pipeline:
 
     def solve(self, frame, measured, feedback, *, allow_limit_hold=False,
               hold_entry_hand=False):
+        trace = self.__dict__.get('motion_trace')
+        started = time.monotonic_ns()
+        self.trace_context = dict(self.__dict__.get('trace_context') or {}, source_times=dict(frame[0]))
+        try:
+            result = self._solve(frame, measured, feedback, allow_limit_hold=allow_limit_hold,
+                                 hold_entry_hand=hold_entry_hand)
+        except Exception as exc:
+            if trace is not None:
+                trace.emit('solve_rejected', context=self.trace_context, started_ns=started, reason=str(exc))
+            raise
+        if trace is not None:
+            trace.emit('solve_candidate', context=self.trace_context, started_ns=started,
+                       targets=result, measured_rad=measured,
+                       wrist={s:w.last_diagnostics for s,w in self.wrists.items()})
+        return result
+
+    def _solve(self, frame, measured, feedback, *, allow_limit_hold=False,
+               hold_entry_hand=False):
         ticket, poses, hands = frame
         if self.settings.hand_only:
             result = {}

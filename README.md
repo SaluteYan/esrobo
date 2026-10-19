@@ -2,7 +2,7 @@
 
 本仓库包含 ESROBO 移动双臂机器人的 ROS 2 工作空间、底层设备驱动，以及 PICO 遥操作程序。机器人主机运行 CAN/ROS 驱动和运动执行网关；本机采集 PICO Body 与 Hand 数据，完成标定、重定向和逆运动学（IK），再将关节目标发送给机器人。主要环境为 Ubuntu 22.04 与 ROS 2 Humble。
 
-**当前日常入口**是 [`laptop_teleop`](laptop_teleop/README.md) 的网页控制台；[`robot_link`](robot_link/README.md) 负责两机通信和机器人端执行。[`teleoperation`](teleoperation/README.md) 保留模型、运动控制组件及较早的一体式运行入口。第一次接触真机，请先按[逐部件调试记录](HARDWARE_BRINGUP.md)核对设备，再按[部署文档](laptop_teleop/docs/README.md)操作。
+**当前日常入口**是 [`laptop_teleop`](laptop_teleop/README.md) 的网页控制台；[`robot_link`](robot_link/README.md) 负责两机通信和机器人端执行。[`teleoperation`](teleoperation/README.md) 保留模型、运动控制组件及较早的一体式运行入口。第一次接触真机，请先按[逐部件调试记录](HARDWARE_BRINGUP.md)核对设备，再按[部署文档](laptop_teleop/docs/01_README.md)操作。
 
 ## 系统如何工作
 
@@ -76,8 +76,8 @@ flowchart LR
 | 需求 | 文档 |
 | --- | --- |
 | 本机结构、数据流、模式 | [`laptop_teleop/README.md`](laptop_teleop/README.md) |
-| 安装、连接、每日操作、故障排查、网页 | [`laptop_teleop/docs/README.md`](laptop_teleop/docs/README.md) |
-| PICO Body/Hand 输入和计算细节 | [PICO 输入](laptop_teleop/docs/06_PICO_HAND_INPUT.md)、[代码与计算](laptop_teleop/docs/08_CODE_AND_COMPUTATION.md) |
+| 安装、连接、每日操作、故障排查、网页 | [`laptop_teleop/docs/01_README.md`](laptop_teleop/docs/01_README.md) |
+| PICO Body/Hand 输入和计算细节 | [PICO 输入](laptop_teleop/docs/06_PICO_HAND_INPUT.md)、[代码与计算](laptop_teleop/docs/07_CODE_AND_COMPUTATION.md) |
 | 通信协议与机器人收到目标后的行为 | [协议](robot_link/PROTOCOL.md)、[执行流程](robot_link/ROBOT_EXECUTION.md) |
 | 原一体式遥操作及其运行记录 | [`teleoperation/README.md`](teleoperation/README.md)、[旧运行手册](teleoperation/TELEOPERATION_RUNBOOK.md) |
 | 设备逐项调试和现场命令 | [`HARDWARE_BRINGUP.md`](HARDWARE_BRINGUP.md) |

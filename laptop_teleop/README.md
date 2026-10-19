@@ -2,7 +2,7 @@
 
 `laptop_teleop` 在电脑上采集 PICO Body/Hand，完成参考标定、重定向和 IK，再通过认证 UDP 将关节目标发送给机器人 `robot_link` 网关。网页负责服务管理、预览、人工准备、状态和日志；机器人主机运行 CAN/ROS 驱动、反馈校验和轨迹执行。当前输入使用 PICO，不需要 SenseGlove。
 
-本文负责项目入口、**环境安装与配置**；日常操作和实现细节分别放在 [docs](docs/README.md)。
+本文负责项目入口、**环境安装与配置**；日常操作和实现细节分别放在 [docs](docs/01_README.md)。
 
 ## 快速入口
 
@@ -113,7 +113,7 @@ laptop_teleop/
 └── log/                     本机日志和状态，不提交
 ```
 
-Body 和 Hand 由一个 SDK 订阅独立提交/转发，控制端按真实时间和组件序号配对。单臂准备先受检归零灵巧手、再回臂，完成后标定，首次接近先让 J1–J5 到位、再让 J6/J7 到达同一次标定目标，手指保持实测值，两段到位后进行全轴实时跟随；显式受检恢复则先在当前失能臂姿态把手归零，再执行七轴回零。阶段规则和保护见 [计算逻辑](docs/08_CODE_AND_COMPUTATION.md)。
+Body 和 Hand 由一个 SDK 订阅独立提交/转发，控制端按真实时间和组件序号配对。单臂准备先受检归零灵巧手、再回臂，完成后标定，首次接近先让 J1–J5 到位、再让 J6/J7 到达同一次标定目标，手指保持实测值，两段到位后进行全轴实时跟随；显式受检恢复则先在当前失能臂姿态把手归零，再执行七轴回零。阶段规则和保护见 [计算逻辑](docs/07_CODE_AND_COMPUTATION.md)。
 
 源码更新、两机同步、进程加载和真机验收分别完成。软件回归不会启动真实运动接口：
 
@@ -121,7 +121,7 @@ Body 和 Hand 由一个 SDK 订阅独立提交/转发，控制端按真实时间
 ./laptop_teleop/scripts/test.sh
 ```
 
-性能耗时仅由独立 `tests/profile_runtime.py` 等工具测量，正式运行不加载逐周期耗时或分位数统计。测试方式见 [排障指南](docs/04_TROUBLESHOOTING.md#独立测试与耗时测量)。
+性能耗时仅由独立 `tests/tools/profile_runtime.py` 等工具测量，正式运行不加载逐周期耗时或分位数统计。测试方式见 [排障指南](docs/04_TROUBLESHOOTING.md#独立测试与耗时测量)。
 
 ## 文档导航
 
@@ -132,6 +132,6 @@ Body 和 Hand 由一个 SDK 订阅独立提交/转发，控制端按真实时间
 | 超时、频率、控制器、手部和独立测量 | [04 故障排查](docs/04_TROUBLESHOOTING.md) |
 | 网页按钮、模式、骨架层、恢复 | [05 网页控制台](docs/05_WEB_CONSOLE.md) |
 | SDK、组件时间、Body/Hand 转发与同步 | [06 PICO 输入](docs/06_PICO_HAND_INPUT.md) |
-| 源码职责、映射/IK、接近和回零实现 | [08 代码与计算](docs/08_CODE_AND_COMPUTATION.md) |
+| 源码职责、映射/IK、接近和回零实现 | [07 代码与计算](docs/07_CODE_AND_COMPUTATION.md) |
 
 旧 SenseGlove 脚本保留用于设备维护，当前网页和 PICO 计算无需启动。认证密钥、现场运行记录、构建产物和历史测量汇总不上传远程仓库。

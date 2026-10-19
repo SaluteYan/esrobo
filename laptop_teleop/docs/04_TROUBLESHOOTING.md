@@ -30,20 +30,20 @@ ss -lntp | rg '60061|63901|8080|8765|8766'
 
 更换两个无线网络后仍有空档，说明需要按突发输入处理，但不能据此单独认定是 PICO 的固有缺陷。对照当前头显 TCP 连接的内核接收间隔、SDK 原始提交间隔和本机计算耗时；不要把旧网络遗留的 ESTAB 连接混入统计。软件合并积压和有界保持能减少额外延迟，不能生成尚未收到的真实姿态。
 
-`input hold exceeded 500 ms` 也不一定表示连续 500 ms 没有数据：查看 `last recovery check`，新帧可能已经到达却不满足连续性。带手模式恢复使用未滤波掌面映射出的 J5–J7 源目标；腕部滤波只在成功发送后提交，避免把滤波追赶误判为人手跳变。100 ms 时效、40 ms 配对、连续 3 帧和 500 ms 等待上限继续有效；手部已取消源目标差值门限，机械臂仍检查恢复范围。
+`input hold exceeded 500 ms` 也不一定表示连续 500 ms 没有数据：查看 `last recovery check`，新帧可能已经到达却不满足有效性、可达性或首次 ACTIVE 输入准入要求。普通输入恢复不再以机械臂源角度差拒绝；未滤波七轴源目标仍用于诊断，腕部滤波只在成功发送后提交。100 ms 时效、40 ms 配对、连续 3 个新鲜有效帧和 500 ms 等待上限继续有效。首次 ACTIVE 输入的姿态边界与普通恢复不同，不能混用。
 
 可离线核验该边界（不连接物理网关）：
 
 ```bash
 PYTHONPATH=teleoperation:teleoperation/src:robot_link:laptop_teleop/src:laptop_teleop/tests \
-  python laptop_teleop/tests/audit_wrist_filter_recovery.py --output /tmp/wrist-recovery.json
+  python laptop_teleop/tests/tools/audit_wrist_filter_recovery.py --output /tmp/wrist-recovery.json
 ```
 
-输出文件必须尚不存在。恒定源目标应在第三个新鲜匹配帧恢复，真实 8° 源跳变应拒绝并达到原保持期限。脚本中 arm_only 组合是向通用控制器注入腕部滤波的边界测试，不表示纯臂生产模式会使用掌面映射。性能测量继续只通过下文的独立测试入口执行。
+输出文件必须尚不存在。恒定源目标和有效的 8° 源变化均应在第三个新鲜有效帧恢复；源变化保留在诊断中，实际运动继续由机器人轨迹及保护约束。脚本中 arm_only 组合是向通用控制器注入腕部滤波的边界测试，不表示纯臂生产模式会使用掌面映射。性能测量继续只通过下文的独立测试入口执行。
 
 ## 标定未完成、预览没有 IK
 
-旧日志中的 `input reacquisition source outside fixed recovery envelope` 来自此前的 J1–J4 10°、J5–J7 15°固定基准门限，当前已取消此项拒绝条件。`input_recovery.check` 仍保存固定基准、候选源目标与逐轴差值，但 `arm_limit_deg=null`，差值仅供诊断。相邻机械臂源帧仍检查 5°，需连续 3 个新鲜有效帧；接管开始后相邻突变或 3 秒超时仍请求锁存保持。手部不设相对中断前或相邻源帧的差值门限，新鲜有效输入通过限速和反馈约束衔接最新目标。回零几何计算已独立运行，状态包超长会精简可选诊断，详情见网关事件日志。
+旧日志中的 `input reacquisition source outside fixed recovery envelope` 来自此前的 J1–J4 10°、J5–J7 15°固定基准门限，当前已取消此项拒绝条件。`input_recovery.check` 仍保存固定基准、候选源目标与逐轴差值，但 `arm_limit_deg=null`，差值仅供诊断。普通恢复也已取消相邻源角度差门限，需连续 3 个新鲜有效帧；首次 ACTIVE 输入仍单独检查姿态边界，启用恢复能力时还检查 5° 相邻变化。恢复过程的 3 秒期限、反馈健康及使能检查保持。手部不设相对中断前或相邻源帧的差值门限，新鲜有效输入通过限速和反馈约束衔接最新目标。回零几何计算已独立运行，状态包超长会精简可选诊断，详情见网关事件日志。
 
 当前本机标定不再等待姿态稳定、倒计时或 12 帧窗口。若仍出现“掌面仍在移动”等旧提示，检查本机计算进程是否已退出并重新启动，以加载新代码。
 
@@ -83,11 +83,11 @@ CAN 推送请求会核验 SDK 是否实际调用底层发送；反馈缺失时�
 
 ## J6/J7、手指首次接管与恢复
 
-新增有界恢复的能力开关默认关闭。先看 `input_recovery_enabled`，不能因代码已经同步就认为自动重新接管已启用。完整状态与阈值见 [计算逻辑](08_CODE_AND_COMPUTATION.md#输入恢复协议)。
+新增有界恢复的能力开关默认关闭。先看 `input_recovery_enabled`，不能因代码已经同步就认为自动重新接管已启用。完整状态与阈值见 [计算逻辑](07_CODE_AND_COMPUTATION.md#输入恢复协议)。
 
-分析新日志时对照 `input_recovery.check` 内的固定 anchor、候选 source、相邻帧判定与原始时间戳；不要把命令滤波追赶或实测反馈误差当作源目标跳变。`HOLD_LATCHED` 表示输入故障已由机器人端接管保持，恢复检查失败不再自动跟随；反馈中断时不能宣称保持有效。
+分析新日志时对照 `input_recovery.check` 内的固定 anchor、候选 source、有效性判定与原始时间戳；不要把命令滤波追赶或实测反馈误差当作源目标跳变。`HOLD_LATCHED` 表示输入故障已由机器人端接管保持，恢复检查失败不再自动跟随；反馈中断时不能宣称保持有效。
 
-腕部限速分析：在现有项目 PYTHONPATH 下运行 `python laptop_teleop/tests/summarize_wrist_limits.py <session.jsonl>`。报告 J5–J7 的限制占比及采样误差/速度统计。没有 `motion_diagnostics` 的历史日志不能生成有效提速依据。先完成左右臂各自的受控保持、低幅跟随验收，再决定是否修改速度；不要同时放宽速度、领先量与力矩保护。
+腕部限速分析：在现有项目 PYTHONPATH 下运行 `python laptop_teleop/tests/tools/summarize_wrist_limits.py <session.jsonl>`。报告 J5–J7 的限制占比及采样误差/速度统计。没有 `motion_diagnostics` 的历史日志不能生成有效提速依据。先完成左右臂各自的受控保持、低幅跟随验收，再决定是否修改速度；不要同时放宽速度、领先量与力矩保护。
 
 `initial wrist handover exceeded 10 s` 属于旧版 ACTIVE 内追赶实时腕部目标的首次接管路径。新版 `entry_protocol=7` 把 J6/J7 放在第二段固定标定目标接近中；两段完成才进入 ACTIVE。如果仍出现旧报错，核对本机和网关运行版本，不能只更新磁盘文件。新阶段执行失败在日志中区分 `approaching_arm` 和 `approaching_wrist`。
 
@@ -107,7 +107,7 @@ L10 物理索引：0 拇指屈曲，1 拇指侧摆，2–5 食/中/无名/小指
 
 本机上限 50 Hz，配置要求 40 Hz、允许 5 Hz 容差，两秒窗口低于 35 Hz 会停止；有效目标间隔上限 80 ms。ACTIVE 输入间隙进入短时保持，最多 500 ms；持续缺失或无法满足连续 3 帧恢复条件会 FAULT。网关独立检查目标 lease 和机器人反馈。
 
-`waiting for next complete source frame` 表示所需组件尚未全部产生未消费的新鲜样本，即使某个组件仍在更新也可能等待。`last recovery check: J5 target delta ... > 5deg` 表示恢复时已有计算目标，但与上一有效目标的差超过连续性门限；收到这些新帧不会重置 500 ms 保持期限。平均采集频率正常不能排除短时空档，应对照 SDK 真实输入年龄、序号和通知/转发记录。
+`waiting for next complete source frame` 表示所需组件尚未全部产生未消费的新鲜样本，即使某个组件仍在更新也可能等待。旧记录中的 `last recovery check: J5 target delta ... > 5deg` 曾表示源变化超过普通恢复门限，该普通恢复门限现已取消。当前若出现类似信息，需核对是否为首次 ACTIVE 输入阶段或仍运行旧进程；首次准入拒绝不会重置 500 ms 保持期限。平均采集频率正常不能排除短时空档，应对照 SDK 真实输入年龄、序号和通知/转发记录。
 
 急停后七轴可能仍报告使能，不能凭急停状态推断已失能。网页受检恢复不会自动失能：控制器急停且七轴仍使能时，须先确认机械支撑并使用独立失能入口，取得新鲜七轴失能反馈后才提交恢复。健康的使能锁存保持则走保持承重回零路径，到位后才失能。初始化 CAN 和重复点击回零均不能替代状态核验。
 
@@ -120,14 +120,14 @@ L10 物理索引：0 拇指屈曲，1 拇指侧摆，2–5 食/中/无名/小指
 ```bash
 export PYTHONPATH="$PWD/laptop_teleop/src:$PWD/laptop_teleop/tests:$PWD/robot_link:$PWD/teleoperation/src:$PWD/teleoperation:$PWD/teleoperation/tests"
 PY=/home/ddc/miniforge3/envs/esrobo_laptop/bin/python
-"$PY" laptop_teleop/tests/profile_runtime.py preview --synthetic --seconds 60 --output /tmp/esrobo-preview.jsonl
+"$PY" laptop_teleop/tests/tools/profile_runtime.py preview --synthetic --seconds 60 --output /tmp/esrobo-preview.jsonl
 ```
 
 真实采集测量需要停止普通采集，并加载 SDK 库路径：
 
 ```bash
 export LD_LIBRARY_PATH="$PWD/laptop_teleop/external/XRoboToolkit-PC-Service-Pybind/lib:/home/ddc/miniforge3/envs/esrobo_laptop/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-"$PY" laptop_teleop/tests/profile_runtime.py acquisition --seconds 60 --output /tmp/esrobo-acquisition.jsonl
+"$PY" laptop_teleop/tests/tools/profile_runtime.py acquisition --seconds 60 --output /tmp/esrobo-acquisition.jsonl
 ```
 
 真实预览使用 `preview`，不加 `--synthetic`；它连接独立模拟网关，不调用物理运动接口，输入端口仍要求唯一接收者。验收必须有实际 arm/wrist IK 调用和有效目标，未完成参考不算计算负载通过。`benchmark_pico_forwarding.py` 可用同一模拟输入比较转发比例、慢手部计算和阻塞日志；其他 `benchmark_*.py` 是离线反馈/几何对照工具，参数用 `--help` 查看。
@@ -175,7 +175,7 @@ PYTHONPATH=teleoperation/src python -m esrobo_teleop.debug.log_retention --apply
 
 ### 力矩偏差超限后的数据
 
-出现 `torque deviation exceeded` 时，先定位对应 `gateway_<timestamp>.jsonl` 的 `first_fault` 及同会话 `torque_<timestamp>.jsonl`。确认 `torque_diagnostics.logging` 无写入错误，检查序号缺口，再按侧别、阶段、基准编号分析；不要把接近、实时跟随、回零的不同基准混为同一统计。只有 J4 故障触发值不能推导其余关节需要增加多少门限。当前记录版本不调高门限，实机复测仍由现场执行，保护停止后保留记录，不自动重启跟随。统计命令见 [七轴力矩记录](08_CODE_AND_COMPUTATION.md#七轴力矩记录)。
+出现 `torque deviation exceeded` 时，先定位对应 `gateway_<timestamp>.jsonl` 的 `first_fault` 及同会话 `torque_<timestamp>.jsonl`。确认 `torque_diagnostics.logging` 无写入错误，检查序号缺口，再按侧别、阶段、基准编号分析；不要把接近、实时跟随、回零的不同基准混为同一统计。只有 J4 故障触发值不能推导其余关节需要增加多少门限。当前记录版本不调高门限，实机复测仍由现场执行，保护停止后保留记录，不自动重启跟随。统计命令见 [七轴力矩记录](07_CODE_AND_COMPUTATION.md#七轴力矩记录)。
 
 ### 近零位张手提示拇指包络与腰部重叠
 
@@ -192,3 +192,22 @@ PYTHONPATH=teleoperation/src python -m esrobo_teleop.debug.log_retention --apply
 另一次为 `physical[3] goal=182 command=166 feedback=190 budget=8 lead=15`：24 单位反馈偏差使两组允许区间不相交。随后按现场要求将 `live_feedback_lead` 设为 `null`：ACTIVE 和输入恢复不再根据手指指令/反馈差值限幅或拒绝，原 30/60 单位门限均不生效；目标只按原速度、单步和行程限制趋近人手目标，允许反向张手。受阻不动时指令仍可继续变化。首次接管仍严格到位，反馈过期、输入跳变及碰撞/力矩故障继续阻止运动。此次没有放宽启动阶段的 `entry_certificate_miss` 几何认证；日志中的两次接近阶段失败属于另一类保护。
 
 离线记录位于 `laptop_teleop/log/retained/stop_contact_20261016/`；这些是位置反馈，只能确认指令/反馈滞后，不能量化抓持力。
+
+## 回归测试历史失败清理
+
+2026-10-19 对此前 37 项失败的归因、保留／删除依据和验证结果，见 [修改日志中的回归测试清理记录](08_CHANGELOG.md#2026-10-19-回归测试清理)。历史测试日志中的失败数量不代表当前回归状态，也不代表实机已完成全部验证。
+
+## 日志与测试目录维护
+
+`laptop_teleop/log/` 根目录由运行程序自动写入，不手工重命名仍被进程打开的文件；`dashboard_teleop.json` 等是状态文件，不按普通日志删除。自动保留器保护打开文件、近期变化文件及带 `.keep` 的目录。
+
+`log/retained/` 保存需要复核的故障、现场回放输入和验收汇总。人工清理时：
+
+- 现场数据和有效故障证据保留；关闭的 PICO 原始采集／传输文件可无损压缩到 `retained/sessions/<会话>/`，压缩后校验解压 SHA256 再移除原文件。
+- 当前 J6/J7 回放所需 `motion`、标定和执行记录仍保留原 JSONL 路径。完全相同的副本只保留一份，删除前比较内容哈希。
+- `compute.jsonl`／`pico.jsonl`／`execution.jsonl` 若来自明确的模拟性能实验，可清理明细；保留对应 `result.json`、性能汇总、输入生成工具、最终验收和失败记录。不按文件扩展名批量删除现场 JSONL。
+- `retained/maintenance/` 保存整理清单，记录删除理由、归档路径与 SHA256；源码和文档整理前的备份放在项目 `.deploy-backups/`。
+
+读取压缩现场记录时先解压到临时目录供现有 JSONL 工具使用，例如 `gzip -dc <archive.jsonl.gz> > /tmp/field-session.jsonl`。归档文件名保留原始会话编号，不能把文件修改时间当作采样时间。容量目标不是硬上限；活动采集仍会持续占用空间。
+
+`tests/` 只存有效回归、固定 `fixtures/` 与独立 `tools/`。完整日志和一次性输出不放进测试目录。当前结构及运行入口见 [测试索引](../tests/README.md)；可清理字节码缓存，不能依据测试年限或文件数量删除有效用例。

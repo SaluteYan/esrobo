@@ -137,6 +137,33 @@ def normalize_vector(vector: np.ndarray) -> np.ndarray | None:
     return (vector / norm).astype(np.float32)
 
 
+def continuous_direction_deadband(previous, target, deadband_rad):
+    """Move along the shortest spherical arc only by the excess over deadband.
+
+    Return (unit direction, input gap, output step). Float64 angle arithmetic
+    avoids float32 acos quantization at the small angles used for micro-motion.
+    Antipodal directions use a deterministic orthogonal tangent.
+    """
+    first, second = np.asarray(previous, dtype=float), np.asarray(target, dtype=float)
+    first, second = first / np.linalg.norm(first), second / np.linalg.norm(second)
+    cosine = float(np.clip(first @ second, -1., 1.))
+    sine = float(np.linalg.norm(np.cross(first, second)))
+    gap = float(np.arctan2(sine, cosine))
+    step = max(0., gap - deadband_rad)
+    if step <= 1.e-12:
+        return first.copy(), gap, 0.
+    if deadband_rad == 0:
+        return second.copy(), gap, gap
+    tangent = second - cosine * first
+    length = float(np.linalg.norm(tangent))
+    if length <= 1.e-12:
+        basis = np.eye(3)[int(np.argmin(np.abs(first)))]
+        tangent = basis - (basis @ first) * first
+        length = float(np.linalg.norm(tangent))
+    result = np.cos(step) * first + np.sin(step) * tangent / length
+    return result / np.linalg.norm(result), gap, step
+
+
 def scale_vector_to_length(
     vector: np.ndarray, length: float, fallback: np.ndarray
 ) -> np.ndarray | None:

@@ -156,7 +156,12 @@ class FreshBodyDevice(BodyDevice):
         if self._cfg.auto_start_reference_require_waist:
             source_to_local = mu.pose_array_to_matrix(self._frames["waist"])[:3, :3].T @ source_to_local
         local = reference.update(
-            points, wrist[:3, :3], max_step_deg=self._cfg.hand_imu_max_step_deg,
+            points, wrist[:3, :3], sample_time=body_stamp,
+            min_cutoff_hz=self._cfg.wrist_orientation_filter_min_cutoff_hz,
+            max_cutoff_hz=self._cfg.wrist_orientation_filter_max_cutoff_hz,
+            speed_coefficient=self._cfg.wrist_orientation_filter_speed_coefficient,
+            deadband_deg=self._cfg.wrist_orientation_deadband_deg,
+            max_interval_s=self._cfg.max_stale_time_s,
             palm_rotation=source_to_local @ palm, full_target=full_target)
         self.wrist_rotations[target_side] = local
         self.wrist_input_diagnostics[target_side] = dict(reference.diagnostics)
@@ -230,6 +235,11 @@ class FreshBodyDevice(BodyDevice):
                           if len(samples) > 1 and samples[-1] > samples[0] else 0.)
         return rates
 
+    def _trace_input(self, event, **fields):
+        trace = self.__dict__.get('motion_trace')
+        if trace is not None and trace.enabled:
+            trace.emit(event, **fields)
+
     def _receive_loop(self):
         """Drain a bounded UDP batch, keeping the newest valid components.
 
@@ -268,6 +278,8 @@ class FreshBodyDevice(BodyDevice):
             if kind == 'pico':
                 if body is not None:
                     self.receive_counts['body_coalesced'] += 1
+                    self._trace_input('input_coalesced', component='body',
+                        previous=body[0].get('_trace_source'), candidate=data[0].get('_trace_source'))
                     if any(t <= body[2][k] for k,t in data[2].items()):
                         continue
                 body = data
@@ -276,6 +288,8 @@ class FreshBodyDevice(BodyDevice):
                     previous = hands.get(side)
                     if previous is not None:
                         self.receive_counts['hand_coalesced'] += 1
+                        self._trace_input('input_coalesced', component=side,
+                            previous_sequence=previous[2], candidate_sequence=sample[2])
                         if sample[1] <= previous[1] or sample[2] <= previous[2]:
                             continue
                     hands[side] = sample
@@ -295,6 +309,7 @@ class FreshBodyDevice(BodyDevice):
 
     def _decode_input(self, payload, *, transform=True):
         self.receive_counts['packets'] += 1
+        message = {}
         try:
             message = json.loads(payload)
             meta = message["laptop_input"]
@@ -338,11 +353,15 @@ class FreshBodyDevice(BodyDevice):
             needed = {'waist'} | {f'{s}_{part}' for s in source_sides
                                   for part in ('shoulder', 'elbow', 'wrist')}
             body_message = {"frames": {k:v for k,v in message["frames"].items() if k in needed}}
+            body_message['_trace_source'] = dict(sequence=message.get('body_sample_sequence'),
+                received_monotonic=message.get('body_sample_monotonic'), decoded_monotonic_ns=time.monotonic_ns())
             parsed_frames = self._decode_frames(body_message) if transform else None
             return kind, (body_message, parsed_frames, updates, message.get('pico_hand_status'))
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             self.receive_counts['rejected'] += 1
             self.last_rejection = str(exc)
+            self._trace_input('input_rejected', reason=str(exc), stage='decode',
+                source_sequence=message.get('body_sample_sequence') if isinstance(message, dict) else None)
             return None
 
     def _commit_input(self, prepared):
@@ -364,6 +383,7 @@ class FreshBodyDevice(BodyDevice):
                     self.pico_hand_status_at = now
                 if any(t <= self.stamps.get(key, -1) for key, t in updates.items()):
                     # Repeated publishes of an old ROS sample cannot renew freshness.
+                    self._trace_input('input_rejected', component='body', reason='duplicate', source=body_message.get('_trace_source'))
                     return
                 # Body traffic owns only body frames, never fingers/IMU fields.
                 self.incoming_body_stamps = updates
@@ -371,12 +391,15 @@ class FreshBodyDevice(BodyDevice):
                     super()._handle_message(body_message, parsed_frames=parsed_frames)
                 finally:
                     self.incoming_body_stamps = {}
+                self.trace_body_source = body_message.get('_trace_source', {})
+                self._trace_input('input_committed', component='body', source=self.trace_body_source)
                 self.stamps.update(updates)
                 self._record_source_updates(updates)
                 self.last_rejection = ""
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             self.receive_counts['rejected'] += 1
             self.last_rejection = str(exc)
+            self._trace_input('input_rejected', reason=str(exc), stage='commit', component=kind)
 
     def _prepare_pico_hands(self, message, meta, now):
         if not self.with_hand:
@@ -408,14 +431,17 @@ class FreshBodyDevice(BodyDevice):
                 if not 0 <= now-stamp <= .1:
                     self.receive_counts['rejected'] += 1
                     self.last_rejection = f'{side} expired PICO Hand before commit'
+                    self._trace_input('input_rejected', component=side, reason='expired_before_commit', source_sequence=seq)
                     continue
                 if seq <= self.hand_sequences.get(side, 0) or stamp <= self.stamps.get(f"{side}_hand", -1):
+                    self._trace_input('input_rejected', component=side, reason='duplicate', source_sequence=seq)
                     continue
                 self.pico_hand_targets[side] = angles
                 self.hand_history[side].append((float(stamp), angles.copy()))
                 if palm is not None:
                     self.palm_history[side].append((float(stamp), palm, seq))
                 self.hand_sequences[side] = seq
+                self._trace_input('input_committed', component=side, source_sequence=seq, sample_monotonic=stamp)
                 self.stamps[f"{side}_hand"] = stamp
                 self._record_source_updates({f"{side}_hand": stamp})
                 changed = True
@@ -488,10 +514,13 @@ class FreshBodyDevice(BodyDevice):
             if ticket is None:
                 return None
             if self.hand_only:
+                self.trace_sources = dict(hands=dict(self.hand_sequences), ticket=dict(ticket))
                 hand = self.hand_joints()
                 if hand is None:
                     raise InputUnavailable('PICO finger tracking missing')
                 return ticket, None, hand.copy()
+            self.trace_sources = dict(body=dict(getattr(self, 'trace_body_source', {})),
+                                      hands=dict(self.hand_sequences), ticket=dict(ticket))
             view = copy.copy(self)
             view._frames = {k:v.copy() for k,v in self._frames.items()}
             view.stamps = dict(self.stamps)
@@ -523,6 +552,11 @@ class FreshBodyDevice(BodyDevice):
             poses['hand_source_orientations'] = {
                 s:r.source_local.copy() for s,r in view.wrist_references.items()}
             poses['_wrist_filter_candidates'] = view.wrist_references
+            if self.__dict__.get('motion_trace_enabled', False):
+                # Capture emits immediately on this same control thread;
+                # MotionTrace owns the numeric copy before the next calculation.
+                self.trace_stages = dict(arm=view._arm_retarget_diagnostics,
+                                         wrist=view.wrist_input_diagnostics)
             self.wrist_input_diagnostics = view.wrist_input_diagnostics
             # The nearest paired palm can be older than the latest finger
             # sample. Include its actual clock in the post-IK age check too.

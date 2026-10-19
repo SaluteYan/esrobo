@@ -799,7 +799,7 @@ function render() {
       const j5Target = mapped.target_joint_deg?.[0];
       const j5Feedback = members[side]?.arm_urdf_rad?.[4];
       const roll = Number.isFinite(input.requested_roll_deg)
-        ? ` · ${absolute ? '绝对翻掌' : '翻掌输入'} ${input.requested_roll_deg.toFixed(1)}°／${absolute ? '限步后' : '限幅限步后'} ${Number(input.filtered_roll_deg).toFixed(1)}°`
+        ? ` · ${absolute ? '绝对翻掌' : '翻掌输入'} ${input.requested_roll_deg.toFixed(1)}°／${absolute ? (input.filter_mode === 'adaptive_so3_deadband' ? '滤波后' : '限步后') : '限幅限步后'} ${Number(input.filtered_roll_deg).toFixed(1)}°`
           + (Number.isFinite(j5Target) ? ` · J5 目标 ${j5Target.toFixed(1)}°` : '')
           + (Number.isFinite(j5Feedback) ? `／实测 ${(j5Feedback * 180 / Math.PI).toFixed(1)}°` : '')
           + (input.palm_comparison_status === 'paired' && Number.isFinite(input.hand_palm_roll_deg)
@@ -929,6 +929,14 @@ function render() {
     const row = element('div', undefined, 'source');
     row.append(element('span', '本机接收合并 / 拒绝'), element('span',
       `Body ${receiveCounts.body_coalesced || 0} · Hand ${receiveCounts.hand_coalesced || 0} · 拒绝 ${receiveCounts.rejected || 0}`));
+    $('source-state').append(row);
+  }
+  for (const [label, health] of [['本机详细记录', telemetry.motion_trace], ['网关详细记录', robot.motion_trace]]) {
+    if (!health) continue;
+    const row = element('div', undefined, 'source');
+    const status = !health.enabled ? '已关闭' : health.error ? `写入异常：${health.error}`
+      : `队列 ${health.pending} · 丢弃 ${health.dropped} · ${(health.bytes_written / 1e6).toFixed(1)} MB`;
+    row.append(element('span', label), element('span', status));
     $('source-state').append(row);
   }
   $('can-state').textContent = state.remote.can || '等待 SSH 连接';

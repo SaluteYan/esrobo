@@ -1410,6 +1410,8 @@ class NeroSingleArmDriver(NeroDualArmDriver):
         self.trajectory_diagnostics = None
         self.last_command_skipped = False
         if self.command_trajectory_enabled:
+            # Validate both phase limits before constructing a hardware owner.
+            self._trajectory_lead_limit(tracking=True)
             self._trajectory = CommandTrajectory(
                 self._joint_rate_limit_vector(side, "max_joint_velocity"),
                 self._joint_rate_limit_vector(side, "max_joint_acceleration"),
@@ -1442,6 +1444,14 @@ class NeroSingleArmDriver(NeroDualArmDriver):
     @property
     def command_trajectory_enabled(self):
         return bool(getattr(self._cfg, f"{self._side}_command_trajectory_enabled", False))
+
+    def _trajectory_lead_limit(self, *, tracking=False):
+        name = ("tracking_command_trajectory_lead_deg" if tracking
+                else "command_trajectory_lead_deg")
+        lead = CommandTrajectory._vector(np.deg2rad(getattr(self._cfg, name)))
+        if np.any(lead <= 0):
+            raise ValueError(f"{name} requires positive seven-axis limits")
+        return lead
 
     def configure_command_trajectory(self, fk, endpoint_speed):
         if not callable(fk) or not np.isfinite(endpoint_speed) or endpoint_speed <= 0:
@@ -1897,6 +1907,9 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                         "handover initialization feedback/state check rejected" if after_handover
                         else "startup stationary collision/feedback check rejected")
                 joints, stamp = verified
+                # This is a newly verified stationary entry, not runtime
+                # recovery or braking. Restore the strict takeover limit.
+                self._trajectory.lead = self._trajectory_lead_limit()
                 self._trajectory.reset(joints, stamp)
             except Exception as exc:
                 return self._trajectory_fault(f"tracking control preparation failed: {exc}")
@@ -1993,7 +2006,7 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             if verified is None:
                 return False
             actual, stamp = verified
-            if np.any(np.abs(state.position-actual) > self._trajectory.lead):
+            if np.any(np.abs(state.position-actual) > self._trajectory_lead_limit()):
                 return False
             # Preserve the exact last committed position; do not snap to the
             # human target or discard any moving trajectory velocity.
@@ -2029,13 +2042,20 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                         or not self._torque_is_safe(self._arm, self._side)
                         or not self._within_hard_limits(actual)
                         or np.any(actual < lower) or np.any(actual > upper)
-                        or np.any(np.abs(actual-state.position) > self._trajectory.lead)
+                        or np.any(np.abs(actual-state.position) > self._trajectory_lead_limit())
                         or np.max(np.abs(actual-anchor)) > np.deg2rad(.2)):
                     return False
                 if self._cfg.torso_collision_enabled and not self._check_physical_path(
                         actual, candidate, cached_coverage_only=True):
                     return False
-                return 0 <= time.monotonic()-sample.received_monotonic <= self._cfg.command_trajectory_max_dt_s
+                if not 0 <= time.monotonic()-sample.received_monotonic <= self._cfg.command_trajectory_max_dt_s:
+                    return False
+                # Widen only after the complete entry proof. Keep the same
+                # committed position, velocity, timestamps and lead watchdog.
+                # HOLD and pre-return braking retain this limit; the separate
+                # return trajectory still uses command_trajectory_lead_deg.
+                self._trajectory.lead = self._trajectory_lead_limit(tracking=True)
+                return True
             finally:
                 if guard is not None and hasattr(guard, 'end_entry_certificates'):
                     guard.end_entry_certificates()
@@ -2540,6 +2560,10 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             if targets.shape != (14,) or not np.all(np.isfinite(targets)):
                 raise TrajectoryFault("invalid IK target")
             snapshot = getattr(self, "_cycle_feedback", None)
+            if getattr(self, "_motion_trace_enabled", False):
+                # Immutable snapshot retained only until the passive gateway
+                # trace completes; duplicate/failed sends also need this input.
+                self._motion_trace_feedback = snapshot
             self._cycle_feedback = None
             if snapshot is not None:
                 if time.monotonic() - snapshot.received_monotonic > .1:

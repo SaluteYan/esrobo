@@ -17,6 +17,8 @@ class RobotClient:
         self.seq = 0
         self.expected_contract_id = expected_contract_id
         self.recovery_metadata = None
+        self.motion_trace = None
+        self.trace_context = None
 
     def connect(self, timeout=3.0):
         deadline = time.monotonic() + timeout
@@ -68,8 +70,25 @@ class RobotClient:
         self.seq += 1
         if kind == 'target' and self.recovery_metadata is not None:
             payload['recovery'] = self.recovery_metadata
-        self.socket.send(pack(dict(type=kind, session=self.latest["session"], seq=self.seq,
-                                   lease=self.latest["lease"], **payload), self.key))
+        started = time.monotonic_ns()
+        error = None
+        try:
+            self.socket.send(pack(dict(type=kind, session=self.latest["session"], seq=self.seq,
+                                       lease=self.latest["lease"], **payload), self.key))
+        except Exception as exc:
+            error = str(exc)
+            raise
+        finally:
+            trace = getattr(self, 'motion_trace', None)
+            if trace is not None and trace.enabled:
+                try:
+                    from esrobo_teleop.debug.motion_trace import session_tag
+                    trace.emit('network_send', kind=kind, command_seq=self.seq,
+                        session_tag=session_tag(self.latest['session']), started_ns=started,
+                        sent=error is None, error=error, payload=payload,
+                        context=self.trace_context() if self.trace_context else None)
+                except Exception:
+                    trace.dropped += 1
 
     def send_target(self, arm_urdf_rad, hand_unit=None, *, entry=None):
         """Call once per NEW solved input frame, never on stale PICO/glove data."""

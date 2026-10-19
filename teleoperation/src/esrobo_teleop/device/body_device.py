@@ -21,7 +21,7 @@ from typing import Any, Optional
 import numpy as np
 
 from .. import math_utils as mu
-from ..config import RetargetConfig
+from ..config import ANGULAR_DEADBAND_MODE, RetargetConfig
 
 BODY_FRAME_ALIASES = {
     "pelvis": "waist",
@@ -752,10 +752,18 @@ class BodyDevice:
         if direction is None:
             return vector
         previous = self._held_segment_directions[target_side].get(segment_name)
-        if previous is not None and deadband_deg > 0.0:
-            cosine = float(np.clip(np.dot(previous, direction), -1.0, 1.0))
-            if abs(float(np.degrees(np.arccos(cosine)))) < deadband_deg:
-                return previous
+        gap, step = None, None
+        if previous is not None:
+            direction, gap, step = mu.continuous_direction_deadband(
+                previous, direction, np.deg2rad(max(0., deadband_deg)))
+        if self.__dict__.get('motion_trace_enabled', False):
+            info = self.__dict__.setdefault('_trace_filter_details', {}).setdefault(target_side, {}).setdefault(segment_name, {})
+            info.update(deadband_deg=deadband_deg, deadband_held=step == 0.,
+                        deadband_mode=ANGULAR_DEADBAND_MODE,
+                        deadband_gap_deg=None if gap is None else float(np.degrees(gap)),
+                        deadband_update_deg=None if step is None else float(np.degrees(step)))
+        if step == 0.:
+            return previous
         self._held_segment_directions[target_side][segment_name] = direction.copy()
         return direction
 
@@ -769,11 +777,21 @@ class BodyDevice:
         frame_time = self._last_body_frame_packet_time_monotonic
         previous = self._filtered_segment_directions[target_side].get(segment_name)
         previous_time = self._filtered_segment_timestamps[target_side].get(segment_name)
+        tracing = self.__dict__.get('motion_trace_enabled', False)
+        if tracing:
+            info = self.__dict__.setdefault('_trace_filter_details', {}).setdefault(target_side, {}).setdefault(segment_name, {})
+            info.update(source_time=frame_time, dt_s=None, alpha=None, cutoff_hz=None, initialized=False, clock_reused=False)
         if previous is None or previous_time is None or frame_time is None:
             filtered = direction
+            if tracing:
+                info['initialized'] = True
         else:
             dt = float(frame_time - previous_time)
+            if tracing:
+                info['dt_s'] = dt
             if dt <= 1.0e-6:
+                if tracing:
+                    info['clock_reused'] = True
                 return previous
             cosine = float(np.clip(np.dot(previous, direction), -1.0, 1.0))
             angular_speed = float(np.arccos(cosine)) / dt
@@ -785,6 +803,8 @@ class BodyDevice:
                 + max(0.0, self._cfg.arm_vector_filter_speed_coefficient) * angular_speed,
             )
             alpha = 1.0 - np.exp(-2.0 * np.pi * cutoff * dt)
+            if tracing:
+                info.update(alpha=float(alpha), cutoff_hz=float(cutoff), angular_speed_rad_s=angular_speed)
             filtered = mu.normalize_vector((1.0 - alpha) * previous + alpha * direction)
             if filtered is None:
                 filtered = previous
@@ -888,6 +908,11 @@ class BodyDevice:
                 "mapped_before_filter_deg": mapped_before_filter_deg,
                 "mapped_before_filter_upper_direction": mapped_before_filter_upper.tolist(),
                 "mapped_before_filter_forearm_direction": mapped_before_filter_forearm.tolist(),
+                "lowpass_upper_direction": self._filtered_segment_directions[target_side]['upper_arm'].tolist(),
+                "lowpass_forearm_direction": self._filtered_segment_directions[target_side]['forearm'].tolist(),
+                "filter_details": self.__dict__.get("_trace_filter_details", {}).get(target_side, {}),
+                "upper_deadband_deg": self._cfg.upper_arm_angular_deadband_deg,
+                "forearm_deadband_deg": self._cfg.forearm_angular_deadband_deg,
                 "filtered_before_plane_gate_deg": filtered_before_plane_gate_deg,
                 "filtered_before_plane_upper_direction": filtered_before_plane_upper.tolist(),
                 "filtered_before_plane_forearm_direction": filtered_before_plane_forearm.tolist(),

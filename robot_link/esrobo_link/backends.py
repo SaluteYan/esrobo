@@ -173,7 +173,7 @@ class HardwareBackend:
 
     def __init__(self, config, side, with_hand, *, hand_driver=None, hand_only=False):
         import numpy as np
-        from esrobo_teleop.config import load_config
+        from esrobo_teleop.config import load_config, retarget_filter_fingerprint
         from esrobo_teleop.robot.nero_driver import NeroSingleArmDriver
         from esrobo_teleop.robot.linker_hand_driver import LinkerHandDriver, L10_PHYSICAL_JOINT_NAMES
         from esrobo_teleop.robot.torso_collision import TorsoCollisionGuard
@@ -220,6 +220,7 @@ class HardwareBackend:
             fingerprint = dict(robot=dataclasses.asdict(cfg.robot), hand=dataclasses.asdict(cfg.hand),
                                ik={k:v for k,v in dataclasses.asdict(cfg.ik).items() if k != "urdf_path"},
                                endpoint_speed=cfg.retarget.max_endpoint_translation_velocity_m_s,
+                               retarget_filter=retarget_filter_fingerprint(cfg.retarget),
                                model_sha256=hashlib.sha256(model_path.read_bytes()).hexdigest(),
                                side=side, with_hand=with_hand, hand_only=self.hand_only)
             self.contract = dict(id=hashlib.sha256(canonical(fingerprint)).hexdigest(),

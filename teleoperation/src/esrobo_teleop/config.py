@@ -7,8 +7,21 @@ replaced by direct ``pyAgxArm`` / ``LinkerHand`` calls.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Optional
+
+ANGULAR_DEADBAND_MODE = "continuous_excess_angle_v1"
+
+
+def retarget_filter_fingerprint(config):
+    """Shared laptop/gateway identity for input filtering, not a wire version."""
+    return dict(
+        deadband_mode=ANGULAR_DEADBAND_MODE,
+        wrist_joint_filter_mode="joint_continuous_deadband_v1",
+        parameters={k: v for k, v in asdict(config).items()
+                    if k.startswith(("arm_vector_filter_", "wrist_orientation_", "wrist_joint_filter_"))
+                    or k in ("upper_arm_angular_deadband_deg", "forearm_angular_deadband_deg")},
+    )
 
 
 @dataclass
@@ -152,6 +165,8 @@ class RobotConfig:
     left_command_trajectory_enabled: bool = True
     right_command_trajectory_enabled: bool = True
     command_trajectory_lead_deg: tuple = (10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0)
+    # Applied only after the checked ACTIVE handshake; entry/return keep 10 deg.
+    tracking_command_trajectory_lead_deg: tuple = (15.0, 15.0, 15.0, 15.0, 15.0, 15.0, 15.0)
     command_trajectory_max_dt_s: float = 0.1
     # The planned return performs collision checks on every command. Allow a
     # small scheduling overrun without relaxing the live-following horizon.
@@ -263,9 +278,19 @@ class RetargetConfig:
     forearm_angular_deadband_deg: float = 0.30
     # Adaptive direction smoothing suppresses PICO joint-position jitter while
     # opening its bandwidth during deliberate arm motion.
-    arm_vector_filter_min_cutoff_hz: float = 3.0
+    arm_vector_filter_min_cutoff_hz: float = 2.0
     arm_vector_filter_max_cutoff_hz: float = 8.0
     arm_vector_filter_speed_coefficient: float = 0.7
+    # PICO absolute palm: SO(3) smoothing, then continuous angular deadband.
+    wrist_orientation_filter_min_cutoff_hz: float = 2.0
+    wrist_orientation_filter_max_cutoff_hz: float = 8.0
+    wrist_orientation_filter_speed_coefficient: float = 0.7
+    wrist_orientation_deadband_deg: float = 0.25
+    # Post-mapping PICO J6/J7 only; radians/source-second adaptive speed.
+    wrist_joint_filter_min_cutoff_hz: float = 1.0
+    wrist_joint_filter_max_cutoff_hz: float = 4.0
+    wrist_joint_filter_speed_coefficient: float = 0.2
+    wrist_joint_filter_deadband_deg: float = 1.0
     use_hand_imu_orientation: bool = True
     # Full-arm PICO control uses shoulder/elbow/wrist positions only.  Require a
     # calibrated glove IMU for terminal orientation instead of falling back to

@@ -20,6 +20,7 @@ from .inputs import InputUnavailable, SourceExpired
 from .pipeline import Pipeline
 from .hand_handover import HandHandover
 from .wrist_handover import WristHandover
+from .wrist_joint_filter import WristJointFilter
 from .diagnostics import RuntimeDiagnostics
 from .input_recovery import InputRecovery, RecoveryRejected
 
@@ -179,6 +180,7 @@ class Controller:
         self.last_hand_source = None
         self.hand_handover = None
         self.wrist_handover = None
+        self.wrist_joint_filters = {}
         self.last_wrist_source = None
         self.first_wrist_source = None
         self.first_resume_source = None
@@ -238,7 +240,7 @@ class Controller:
         return True
 
     def _input_hold_timeout(self):
-        detail = (self.input_resume_diagnostics or {}).get("reason", "no fresh matching input")
+        detail = (self.input_resume_diagnostics or {}).get("reason", "no fresh valid input")
         return RecoveryRejected(f"PICO input hold exceeded {self.settings.input_hold_max_s*1000:.0f} ms; "
                             f"last recovery check: {detail} "
                             f"({self.input_resume_count}/{self.settings.input_resume_frames}); explicit recovery required")
@@ -258,17 +260,19 @@ class Controller:
         suffix = ""
         if recovery:
             suffix = (f"; last recovery check: {recovery['reason']} "
-                      f"({self.input_resume_count}/{self.settings.input_resume_frames} matching frames)")
+                      f"({self.input_resume_count}/{self.settings.input_resume_frames} fresh valid frames)")
         phase = 'WAITING_FOR_FIRST_ACTIVE_INPUT' if self.entry_active_pending else 'PAUSED_INPUT'
         return self._send_input_hold(state, f"{phase}: {reason}; waiting for fresh PICO frames{suffix}")
 
-    def _resume_continuous(self, targets):
+    def _resume_valid(self, targets):
         diagnostic = dict(evaluated_monotonic_s=time.monotonic(), allowed=False,
                           phase=('first_active_input' if self.entry_active_pending else 'input_recovery'),
                           reason="target is a position hold")
         self.input_resume_diagnostics = diagnostic
         first_wide = self.recovery_enabled and self.entry_active_pending
         diagnostic['candidate'] = InputRecovery.sources(targets)
+        # Recovery has one validity gate; displacement is diagnostic only.
+        InputRecovery(self.settings).inspect(diagnostic['candidate'], diagnostic['candidate'])
         diagnostic['baseline'] = InputRecovery.sources(self.last_active_target)
         for side, source in self.last_arm_source.items():
             diagnostic['baseline'][side]['arm'] = list(source)
@@ -282,7 +286,9 @@ class Controller:
                 if self.settings.side in ("left", "right") and self.settings.with_hand and not self.settings.hand_only:
                     continue
                 return False
-            if not self.settings.hand_only:
+            # First ACTIVE entry has its own commissioned pose bounds.
+            # Ordinary recovery never compares angles against this baseline.
+            if self.entry_active_pending and not self.settings.hand_only:
                 source = current.get('source_arm_urdf_rad', current['arm_urdf_rad'])
                 baseline = np.asarray(self.last_arm_source.get(side, previous["arm_urdf_rad"]), dtype=float).copy()
                 if self.wrist_handover is not None and not self.wrist_handover.done:
@@ -297,7 +303,7 @@ class Controller:
                                     else wrist_source)
                 delta = np.abs(np.asarray(source)-baseline)
                 limits = np.asarray(([10.]*4+[15.,5.,5.] if first_wide else
-                                     [self.settings.input_resume_arm_delta_deg]*7))
+                                     [5.]*7))
                 joint = int(np.argmax(delta/np.deg2rad(limits)))
                 if delta[joint] > np.deg2rad(limits[joint]):
                     diagnostic.update(joint=joint+1, arm_delta_deg=float(np.degrees(delta[joint])),
@@ -310,15 +316,17 @@ class Controller:
                 and not targets[self.settings.side].get('hold')):
             current = targets[self.settings.side]
             self.first_wrist_source = list(current.get('source_arm_urdf_rad', current['arm_urdf_rad'])[5:])
-        if first_wide:
+        if first_wide and not self.settings.hand_only:
             current_source = InputRecovery.sources(targets)
             adjacent = (self.first_resume_source is None or
-                        InputRecovery(self.settings).within(current_source, self.first_resume_source)[0])
+                        all(np.all(np.abs(np.asarray(current_source[side]['arm'])-
+                            self.first_resume_source[side]['arm']) <= np.deg2rad(5.)+1e-9)
+                            for side in self.settings.sides))
             self.first_resume_source = current_source
             if not adjacent:
                 diagnostic.update(reason='first active input adjacent source jump')
                 return False
-        diagnostic.update(allowed=True, reason="fresh target matches previous pose")
+        diagnostic.update(allowed=True, reason="fresh valid target")
         return True
 
     def _step_fixed_entry(self, state, measured):
@@ -372,6 +380,65 @@ class Controller:
     def _send_targets(self, targets, settings, **kwargs):
         return send_targets(self.client, targets, settings, **kwargs)
 
+    def _propose_wrist_joint_filters(self, frame, targets, feedback):
+        """PICO-only candidates; source targets and receiver state stay untouched."""
+        if (self.settings.hand_only or not frame[1]
+                or (self.wrist_handover is not None and not self.wrist_handover.done)):
+            return targets, {}
+        palms = frame[1].get('hand_local_orientations', {})
+        candidates = {}
+        result = dict(targets)
+        for side, target in targets.items():
+            if side not in palms or target.get('hold'):
+                continue
+            stamp = frame[0].get(side+'_palm')
+            if stamp is None:
+                raise InputUnavailable('J6/J7 filter requires paired PICO palm source time')
+            filt = self.wrist_joint_filters.get(side)
+            if filt is None:
+                # Protocol 7 has already certified and reached the entry target.
+                # Preview/legacy entry uses the existing verified feedback baseline.
+                baseline = (self.last_active_target or {}).get(side, feedback[side])
+                seed = baseline['arm_urdf_rad'][5:7]
+                robot = self.pipeline.cfg.robot
+                filt = WristJointFilter(seed, self.pipeline.cfg.retarget,
+                    getattr(robot, side+'_joint_soft_lower_limits_urdf')[5:7],
+                    getattr(robot, side+'_joint_soft_upper_limits_urdf')[5:7])
+            mapped = target['arm_urdf_rad']
+            candidate = filt.propose(mapped[5:7], stamp)
+            result[side] = dict(target, arm_urdf_rad=list(mapped))
+            # Never replace the true unfiltered source with the stabilized output.
+            result[side].setdefault('source_arm_urdf_rad', list(mapped))
+            result[side]['arm_urdf_rad'][5:7] = [float(x) for x in candidate.output]
+            candidates[side] = (filt, candidate)
+        self._trace_wrist_joint_filters('wrist_joint_filter_candidate', candidates, targets,
+                                        committed=False)
+        return result, candidates
+
+    def _trace_wrist_joint_filters(self, event, candidates, targets, *, committed):
+        trace = self.pipeline.__dict__.get('motion_trace')
+        if trace is not None and candidates:
+            # One event for both sides: copy the source context once, not once
+            # per axis/arm. Each side still retains its own source clock/state.
+            sides = {side: (
+                dict(final_target_rad=targets[side]['arm_urdf_rad'][5:7],
+                     source_sample_monotonic=candidate.stamp)
+                if committed else dict(WristJointFilter.diagnostics(candidate),
+                                       mapped_rad=targets[side]['arm_urdf_rad'][5:7]))
+                for side, (_, candidate) in candidates.items()}
+            # capture_id joins the existing retarget/network events; do not
+            # recopy their complete Body/Hand provenance in every filter event.
+            context = self.pipeline.__dict__.get('trace_context') or {}
+            trace.emit(event, context={'capture_id': context.get('capture_id')}, sides=sides,
+                       preview=self.preview, committed=committed, sent=committed and not self.preview)
+
+    def _commit_wrist_joint_filters(self, candidates, targets):
+        accepted = {side: item for side, item in candidates.items() if not targets[side].get('hold')}
+        for side, (filt, candidate) in accepted.items():
+            filt.commit(candidate)
+            self.wrist_joint_filters[side] = filt
+        self._trace_wrist_joint_filters('wrist_joint_filter_committed', accepted, targets, committed=True)
+
     def step(self, state):
         return self._step(state)
 
@@ -382,6 +449,7 @@ class Controller:
         if mode not in ("IDLE", "RETURNING", "CALIBRATING", "ARMING", "CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET", "ACTIVE"):
             raise RuntimeError(f"robot {mode}: {state.get('reason', '')}; restart after local recovery")
         if mode == "RETURNING":
+            self.wrist_joint_filters.clear()
             # Reference collection starts only after the robot has completed
             # its return and reported CALIBRATING.  This preserves the user
             # visible order: robot zero first, then operator pose capture.
@@ -390,6 +458,7 @@ class Controller:
             self.mode = mode
             return None
         if mode == "CALIBRATING" and not self.preparing:
+            self.wrist_joint_filters.clear()
             # A fast/mock return can complete between two 50 Hz state packets,
             # so CALIBRATING itself must also start a fresh reference cycle.
             self.pipeline.restart_preparation()
@@ -472,8 +541,10 @@ class Controller:
         if require_reference and (not self.pipeline.initialized
                                   or (not self.safe_entry and mode == "ACTIVE" and self.mode != "ACTIVE")):
             self.pipeline.initialize(measured)
+            self.wrist_joint_filters.clear()
             self.entry_seed = measured.copy()
         if self.safe_entry and mode == "ACTIVE" and self.mode != "ACTIVE":
+            self.wrist_joint_filters.clear()
             self.pipeline.reset_command_start(measured)
         entering = self.safe_entry and mode in (
             "CALIBRATING", "CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET")
@@ -495,6 +566,9 @@ class Controller:
             )
         else:
             targets = measured_targets(feedback, self.settings)
+        wrist_filter_candidates = {}
+        if mode == 'ACTIVE' or self.preview:
+            targets, wrist_filter_candidates = self._propose_wrist_joint_filters(frame, targets, feedback)
         # Recheck original sample/feedback ages AFTER potentially slow IK. Never
         # stamp old sensor input with the time at which computation completed.
         self.pipeline.check_ticket(frame[0])
@@ -514,7 +588,7 @@ class Controller:
                 self.recovery.diagnostic = dict(
                     at=now, anchor=copy.deepcopy(self.recovery.anchor), candidate=None,
                     source_timestamps=dict(frame[0]), allowed=False,
-                    adjacent_allowed=False, reason=reason)
+                    reason=reason)
                 self.recovery_diagnostics = self.recovery.diagnostics()
                 self.input_resume_count = 0
                 self.input_resume_diagnostics = dict(
@@ -524,24 +598,21 @@ class Controller:
                 return None
             recovery_candidate = copy.deepcopy(self.recovery)
             try:
-                recovery_ready = recovery_candidate.evaluate(targets, time.monotonic())
+                recovery_candidate.evaluate(targets, time.monotonic())
             finally:
                 if recovery_candidate.diagnostic is not None:
                     recovery_candidate.diagnostic['source_timestamps'] = dict(frame[0])
                 self.recovery_diagnostics = recovery_candidate.diagnostics()
-            if (self.recovery.started is not None
-                    and not recovery_candidate.diagnostic['adjacent_allowed']):
-                raise RecoveryRejected('input reacquisition adjacent source jump')
         if mode == "ACTIVE" and self.input_hold_started_at is not None:
             if time.monotonic()-self.input_hold_started_at > self.settings.input_hold_max_s:
                 raise self._input_hold_timeout()
-            self.input_resume_count = self.input_resume_count + 1 if self._resume_continuous(targets) else 0
-            wide_ready = recovery_candidate is not None and recovery_ready
-            if self.input_resume_count < self.settings.input_resume_frames and not wide_ready:
+            self.input_resume_count = (recovery_candidate.count if recovery_candidate is not None else
+                                       self.input_resume_count + 1 if self._resume_valid(targets) else 0)
+            if self.input_resume_count < self.settings.input_resume_frames:
                 if recovery_candidate is not None:
                     self.recovery = recovery_candidate
                 self.pipeline.body.consume(frame[0])
-                reason = (f"fresh matching frames {self.input_resume_count}/{self.settings.input_resume_frames}"
+                reason = (f"fresh valid frames {self.input_resume_count}/{self.settings.input_resume_frames}"
                           if self.input_resume_count else self.input_resume_diagnostics["reason"])
                 phase = 'WAITING_FOR_FIRST_ACTIVE_INPUT' if self.entry_active_pending else 'PAUSED_INPUT'
                 self._send_input_hold(state, phase+": " + reason)
@@ -549,13 +620,6 @@ class Controller:
             # Keep the original hold deadline until this candidate is actually
             # sent. Expiry after proposal or send failure is not a recovery.
             resume_ready = True
-            if (recovery_candidate is not None and self.recovery.started is None
-                    and self.input_resume_count >= self.settings.input_resume_frames
-                    and not self.settings.with_hand):
-                # Arm-only narrow recovery needs no new trajectory phase.
-                # Hands always retain their measured-to-latest-target ramp:
-                # their source excursion is no longer restricted by a gate.
-                recovery_candidate = None
         if recovery_candidate is not None:
             raw_recovery_targets = copy.deepcopy(targets)
             recovery_complete = recovery_candidate.confirm_tracking(
@@ -647,6 +711,7 @@ class Controller:
             self.client.recovery_metadata = (recovery_candidate.metadata(recovery_complete)
                                              if recovery_candidate is not None else self.recovery_completion)
             self._send_targets(targets, self.settings, entry=entry)
+            self._commit_wrist_joint_filters(wrist_filter_candidates, targets)
             # Keep the live rate limiter across recovery completion.
             # A blocked finger must not jump to the full human target on the
             # first ordinary ACTIVE packet, or stop the arm just for contact.
@@ -689,6 +754,8 @@ class Controller:
                 self.entry_active_pending = False
                 if hand_source is not None:
                     self.last_hand_source = hand_source
+        if self.preview:
+            self._commit_wrist_joint_filters(wrist_filter_candidates, targets)
         self.pipeline.commit_frame(frame, targets)
         if resume_ready:
             self.input_hold_started_at = None
@@ -770,6 +837,7 @@ def main(argv=None):
     client = RobotClient(settings.robot_host, settings.robot_port, Path(settings.key_file).expanduser())
     pipeline = None
     journal = None
+    motion_trace = None
     controlling = False
     service_terminated = False
     old_sigterm = signal.getsignal(signal.SIGTERM)
@@ -796,6 +864,14 @@ def main(argv=None):
         status_path = Path(args.status_file) if args.status_file else None
         journal = RuntimeDiagnostics(log_path, status_path)
         pipeline.set_diagnostics(journal)
+        from esrobo_teleop.debug.motion_trace import MotionTrace, metadata
+        motion_trace = MotionTrace(log_path.with_name('motion_' + log_path.name.removeprefix('session_')),
+            info=metadata(ROOT.parent, role='laptop', settings=settings, config=cfg, contract=state['contract']))
+        pipeline.motion_trace = client.motion_trace = motion_trace
+        if hasattr(pipeline, "body"):
+            pipeline.body.motion_trace_enabled = motion_trace.enabled
+            pipeline.body.motion_trace = motion_trace
+        client.trace_context = lambda: pipeline.__dict__.get('trace_context')
         journal.message(f"Listening for laptop adapters on 127.0.0.1:{settings.input_port}; log={log_path}")
         if settings.hand_only:
             pose_instruction = f"naturally open the selected {settings.side} hand in the headset view"
@@ -828,6 +904,7 @@ def main(argv=None):
                 if sys.stdin.readline().strip().lower() in ("s", "x", "q"):
                     client.stop()  # Explicit operator STOP always overrides latched hold.
                     break
+            cycle_started_ns = time.monotonic_ns()
             targets = None
             held = False
             status = "waiting"
@@ -881,6 +958,12 @@ def main(argv=None):
                         ("ACTIVE", "ARMING", "CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET")):
                     raise RuntimeError(f"following stopped: {status}") from exc
             now = time.monotonic()
+            if motion_trace is not None:
+                motion_trace.emit('cycle', started_ns=cycle_started_ns, mode=state['mode'],
+                    context=pipeline.__dict__.get('trace_context'), status=status, held=held,
+                    input_hold=controller.input_hold_started_at is not None,
+                    recovery_phase=(controller.recovery_diagnostics or {}).get('phase'),
+                    feedback_age_s=(state.get('feedback') or {}).get('arm_feedback_age_s'))
             loop_times.append(now)
             if not args.preview:
                 control_monitor.observe(now, state["mode"], targets is not None or held or
@@ -956,6 +1039,7 @@ def main(argv=None):
                     record["body_reference_ready"] = body_reference_ready
                     record["hand_reference_ready"] = hand_reference_ready
                     record["reference_ready"] = body_reference_ready and hand_reference_ready
+                record['motion_trace'] = motion_trace.stats() if motion_trace is not None else None
                 record["initialized"] = pipeline.initialized
                 record["computed"] = controller.computed
                 visualization = getattr(pipeline, '_visualization', None)
@@ -1042,8 +1126,11 @@ def main(argv=None):
             client.socket.close()
         if pipeline:
             pipeline.close()
+        if motion_trace is not None:
+            motion_trace.close(timeout=1.)
         if journal:
             journal.submit(dict(unix_ns=time.time_ns(), monotonic_s=time.monotonic(),
+                                motion_trace=motion_trace.stats() if motion_trace is not None else None,
                                 record_type='exit', status='control resources closed',
                                 sent=getattr(locals().get('controller'), 'sent', 0),
                                 mode=locals().get('state', {}).get('mode', 'unknown')), event=True)
