@@ -76,6 +76,9 @@ robot:
   left_command_trajectory_enabled: true
   right_command_trajectory_enabled: true
   command_trajectory_lead_deg: [10, 10, 10, 10, 10, 10, 10]
+  # Live following after checked activation, including input recovery and its
+  # controlled stop. Preparation, initial takeover and return retain 10 deg.
+  tracking_command_trajectory_lead_deg: [15, 15, 15, 15, 15, 15, 15]
   command_trajectory_max_dt_s: 0.1
   return_command_trajectory_max_dt_s: 0.12  # planned return only; live following remains 0.1 s
   # Hold the last controller target during a brief assembled-feedback gap.
@@ -180,9 +183,22 @@ retarget:
   # Generate arm targets from the latest measured shoulder/elbow/wrist points.
   max_endpoint_translation_velocity_m_s: 0.22
   # PICO segment direction filter: low cutoff at rest, higher cutoff in motion.
-  arm_vector_filter_min_cutoff_hz: 3.0
+  arm_vector_filter_min_cutoff_hz: 2.0
   arm_vector_filter_max_cutoff_hz: 8.0
   arm_vector_filter_speed_coefficient: 0.7
+  # PICO palm attitude only; replaces the fixed per-frame 2-degree step.
+  # Continuous angular deadband; 2 Hz selected by recorded seven-axis replay.
+  # This reduces jitter but does not identify slow drift as stationary intent.
+  wrist_orientation_filter_min_cutoff_hz: 2.0
+  wrist_orientation_filter_max_cutoff_hz: 8.0
+  wrist_orientation_filter_speed_coefficient: 0.7
+  wrist_orientation_deadband_deg: 0.25
+  # Additional ACTIVE J6/J7 filter on both arms, after anatomical wrist mapping.
+  # Stability priority: approximately 0.64 s extra lag at steady 2 deg/s.
+  wrist_joint_filter_min_cutoff_hz: 1.0
+  wrist_joint_filter_max_cutoff_hz: 4.0
+  wrist_joint_filter_speed_coefficient: 0.2
+  wrist_joint_filter_deadband_deg: 1.0
   use_hand_imu_orientation: true
   # Pure PICO left-arm tests may run without a glove. In that case J5-J7 hold
   # their current feedback values and only J1-J4 follow shoulder/elbow/wrist.
@@ -208,7 +224,7 @@ retarget:
   # Compatibility path for older world-frame IMU UDP packets.
   hand_imu_source_to_robot_rotation: [0, -1, 0, 0, 0, -1, 1, 0, 0]
   hand_imu_max_angle_deg: 45.0
-  hand_imu_max_step_deg: 2.0
+  hand_imu_max_step_deg: 2.0  # legacy IMU path only; not PICO absolute palm
 
 ik:
   urdf_path: urdf/esrobo_waist_with_head.urdf
@@ -289,6 +305,7 @@ hand:
   out_max: 255
   max_step: 18
   max_velocity: 400
+  live_feedback_lead: null  # ACTIVE: no command/feedback position-error limit; retain speed/step limits
   home: [255, 128, 255, 255, 255, 255, 128, 128, 128, 128]
   return_open_on_quit: true
   return_open_duration_s: 1.5

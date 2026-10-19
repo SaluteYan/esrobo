@@ -3,8 +3,11 @@
 The carrier follows elbow/wrist geometry. Rotation about its longitudinal axis
 is deliberately left to the hand, so pronation is not lost in arm tracking.
 """
+import time
 import numpy as np
 from scipy.spatial.transform import Rotation
+
+from esrobo_teleop.config import ANGULAR_DEADBAND_MODE
 
 
 def checked_rotation(matrix):
@@ -176,14 +179,29 @@ class AbsoluteHandOrientation(RelativeHandOrientation):
         self.source_local = self.initial_local.copy()
         self.body_to_palm = checked_rotation(hand_rotation).T @ self.palm_reference
         self.filtered = self.initial_local.copy()
+        self.smoothed = self.initial_local.copy()
+        self.filter_stamp = None
         self.raw_delta = np.eye(3)
         self.diagnostics = {}
 
     def reset_filter(self, local=None):
         self.filtered = checked_rotation(self.initial_local if local is None else local)
+        self.smoothed = self.filtered.copy()
+        self.filter_stamp = None
 
     def update(self, points, hand_rotation, max_angle_deg=None, max_step_deg=2., *,
-               palm_rotation, full_target=False):
+               palm_rotation, full_target=False, sample_time=None,
+               min_cutoff_hz=2., max_cutoff_hz=8., speed_coefficient=.7,
+               deadband_deg=.25, max_interval_s=.1):
+        # max_step_deg/max_angle_deg are compatibility arguments for the old
+        # IMU interface. Neither limits this absolute PICO orientation path.
+        stamp = time.monotonic() if sample_time is None else float(sample_time)
+        parameters = [stamp, min_cutoff_hz, max_cutoff_hz, speed_coefficient,
+                      deadband_deg, max_interval_s]
+        if (not np.all(np.isfinite(parameters)) or min_cutoff_hz <= 0
+                or max_cutoff_hz < min_cutoff_hz or speed_coefficient < 0
+                or not 0 <= deadband_deg < 180 or max_interval_s <= 0):
+            raise ValueError("invalid wrist orientation filter parameters")
         carrier = self.forearm.update(points)
         body = checked_rotation(hand_rotation)
         palm = checked_rotation(palm_rotation)
@@ -193,17 +211,36 @@ class AbsoluteHandOrientation(RelativeHandOrientation):
         body_local = carrier.T @ body @ self.body_to_palm
         step = Rotation.from_matrix(local @ self.filtered.T).as_rotvec()
         step_angle = float(np.linalg.norm(step))
-        step_limit = np.deg2rad(max_step_deg)
-        if not np.isfinite(step_limit) or step_limit <= 0:
-            raise ValueError("positive finite wrist step limit required")
         target = local
+        dt = None if self.filter_stamp is None else stamp-self.filter_stamp
+        alpha, cutoff = 0., float(min_cutoff_hz)
+        held, clock_reset = False, False
+        gap, output_step = None, 0.
         if not full_target:
-            if step_angle > step_limit:
-                step *= step_limit / step_angle
-                target = Rotation.from_rotvec(step).as_matrix() @ self.filtered
-            # When the full step fits, use the source matrix directly. Avoid
-            # an unnecessary SO(3) round trip and preserve exact equality for
-            # reusing the source/command IK result after the filter catches up.
+            target = self.filtered.copy()
+            if dt is None or dt > max_interval_s:
+                # Seed the clock without snapping to an unseen target or
+                # granting catch-up credit for a pause. Only accepted copies
+                # commit this clock, just like their orientation state.
+                self.filter_stamp = stamp
+                clock_reset = True
+            elif dt > 1.e-6:
+                delta = Rotation.from_matrix(local @ self.smoothed.T).as_rotvec()
+                speed = np.linalg.norm(delta)/dt  # rad/s, same rule as arm vectors
+                cutoff = float(min(max_cutoff_hz, min_cutoff_hz+speed_coefficient*speed))
+                alpha = float(-np.expm1(-2*np.pi*cutoff*dt))
+                self.smoothed = Rotation.from_rotvec(alpha*delta).as_matrix() @ self.smoothed
+                excess = Rotation.from_matrix(self.smoothed @ self.filtered.T).as_rotvec()
+                gap = float(np.linalg.norm(excess))
+                output_step = max(0., gap - np.deg2rad(deadband_deg))
+                held = bool(output_step <= 1.e-12)
+                if not held:
+                    target = (Rotation.from_rotvec(excess * (output_step / gap)).as_matrix()
+                              @ self.filtered)
+                else:
+                    output_step = 0.
+                self.filter_stamp = stamp
+            # Duplicate/backwards source clocks never advance filter state.
             self.filtered = target.copy()
         requested = local @ ANATOMICAL_NEUTRAL.T
         filtered = target @ ANATOMICAL_NEUTRAL.T
@@ -212,8 +249,18 @@ class AbsoluteHandOrientation(RelativeHandOrientation):
             requested_delta_deg=float(np.degrees(Rotation.from_matrix(requested).magnitude())),
             limited_delta_deg=float(np.degrees(Rotation.from_matrix(requested).magnitude())),
             source_angle_capped=False,
-            step_limited=bool(not full_target and step_angle > step_limit),
+            step_limited=False,
             requested_step_deg=float(np.degrees(step_angle)),
+            filter_mode="adaptive_so3_deadband",
+            filter_bypassed=bool(full_target), filter_dt_s=dt,
+            filter_cutoff_hz=cutoff, filter_alpha=alpha,
+            filter_clock_reset=clock_reset, deadband_active=held,
+            deadband_deg=float(deadband_deg), source_sample_monotonic=stamp,
+            deadband_mode=ANGULAR_DEADBAND_MODE,
+            deadband_gap_deg=None if gap is None else float(np.degrees(gap)),
+            deadband_update_deg=None if full_target else float(np.degrees(output_step)),
+            source_local_orientation=local.tolist(),
+            filter_error_deg=float(np.degrees(Rotation.from_matrix(local @ target.T).magnitude())),
             forearm_plane_observable=bool(self.forearm.plane_observable),
             absolute_local_orientation=target.tolist(),
             requested_roll_deg=forearm_twist_deg(requested),

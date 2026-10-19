@@ -12,6 +12,8 @@ import sys
 import threading
 import time
 
+import numpy as np
+
 
 from .config import WORKSPACE
 from .diagnostics import RuntimeDiagnostics
@@ -195,10 +197,13 @@ def default_hand_mapper():
 
 
 class PicoForwarder:
-    def __init__(self, sdk, bridge, args, *, viewer=None, diagnostics=None, mapper=None, body_socket=None, hand_socket=None, recording=None):
+    def __init__(self, sdk, bridge, args, *, viewer=None, diagnostics=None, mapper=None, body_socket=None, hand_socket=None, recording=None, trace=None):
         require_notifications(sdk)
         self.sdk, self.bridge, self.args = sdk, bridge, args
         self.viewer, self.diagnostics, self.recording = viewer, diagnostics, recording
+        self.trace = trace
+        self.trace_seen = {}
+        self.trace_receipts = {}
         self.stop = threading.Event()
         self.metrics = TransportMetrics()
         self.hands = LatestHands(self.metrics)
@@ -229,6 +234,36 @@ class PicoForwarder:
         self.body_socket.close()
         self.hand_socket.close()
 
+    def _trace_samples(self, updates, observed):
+        if self.trace is None or not self.trace.enabled:
+            return
+        for component in ('body', 'left', 'right'):
+            sample = updates[component]
+            seq = int(sample.get('sequence', 0))
+            previous = self.trace_seen.get(component, 0)
+            if seq <= previous:
+                continue
+            self.trace_seen[component] = seq
+            poses = sample.get('poses', [])
+            if component == 'body':
+                selected = {name: poses[i] for i,name in self.bridge.JOINT_TO_FRAME.items()
+                            if name in ('waist', 'left_shoulder', 'left_elbow', 'left_wrist',
+                                        'right_shoulder', 'right_elbow', 'right_wrist') and i < len(poses)}
+            else:
+                # Fixed-size numeric ownership copy avoids hundreds of Python
+                # scalar visits on the SDK owner thread. Keep malformed raw
+                # observations available for diagnostics as well.
+                try:
+                    selected = np.asarray(poses, dtype=float)
+                except (ValueError, TypeError):
+                    selected = poses
+            self.trace.emit('raw_sample', component=component, source_sequence=seq,
+                sequence_gap=max(0, seq-previous-1) if previous else None,
+                observed_monotonic_ns=observed, received_monotonic_ns=sample.get('received_monotonic_ns'),
+                packet_timestamp_ns=sample.get('packet_timestamp_ns'), device_timestamp_ns=sample.get('timestamp_ns'),
+                valid=sample.get('valid'), active=sample.get('active'), flags=sample.get('flags'),
+                poses=selected, pose_format='xyz_quat_xyzw', notification_id=updates.get('notification_id'))
+
     def _send(self, sock, encoded, component):
         try:
             sock.sendto(encoded, (self.args.host, self.args.port))
@@ -249,9 +284,12 @@ class PicoForwarder:
                     if self.stop.wait(max(0., self.mapper.next_due-time.monotonic())):
                         break
                     sample = self.hands.latest(side, sample)
+                map_started = time.monotonic_ns()
                 mapped = self.mapper.map_sample(side, sample)
                 if mapped is None:
                     self.metrics.count(side+'_duplicate')
+                    if self.trace is not None:
+                        self.trace.emit('hand_rejected', side=side, source_sequence=sample.get('sequence'), reason='duplicate')
                     continue
                 if side == 'left' and self.diagnostics:
                     self.diagnostics.reference(self.hand_log_path, dict(event='hand_retarget', side=side,
@@ -271,7 +309,11 @@ class PicoForwarder:
                 if time.monotonic()-mapped['sample_monotonic'] > .1:
                     raise ValueError('PICO Hand stream stale after encoding')
                 if not self.stop.is_set() and not self.args.record_only:
-                    self._send(self.hand_socket, encoded, side)
+                    sent = self._send(self.hand_socket, encoded, side)
+                    if self.trace is not None:
+                        self.trace.emit('hand_forward', side=side, source_sequence=sample.get('sequence'),
+                            received_monotonic_ns=sample.get('received_monotonic_ns'),
+                            map_started_ns=map_started, sent=sent, joints=mapped['joints'], palm_basis=mapped['palm_basis'])
                 self.metrics.status(side, 'tracking')
             except (ValueError, TypeError, KeyError, OverflowError) as exc:
                 if side == 'left' and self.diagnostics:
@@ -279,11 +321,24 @@ class PicoForwarder:
                         source_sequence=sample.get('sequence'), sample=sample, error=str(exc)))
                 self.metrics.count(side+('_stale' if 'stale' in str(exc) else '_invalid'))
                 self.metrics.status(side, str(exc))
+                if self.trace is not None:
+                    self.trace.emit('hand_rejected', side=side, source_sequence=sample.get('sequence'), reason=str(exc))
 
     def snapshot(self):
         counts, times, status = self.metrics.raw()
         now = time.monotonic_ns()
         sdk = self.sdk.get_tracking_diagnostics()
+        if self.trace is not None:
+            for component, data in sdk.items():
+                receipts = data['receipts_ns']
+                previous = self.trace_receipts.get(component, 0)
+                fresh = [t for t in receipts if t > previous]
+                if fresh:
+                    self.trace_receipts[component] = fresh[-1]
+                    self.trace.emit('sdk_receipts', component=component, receipts_ns=fresh,
+                                    committed=data['committed'], rejected=data['rejected'], invalid=data['invalid'],
+                                    retained_receipt_count=len(receipts), previous_receipt_ns=previous)
+
         sdk = {k: dict(summary_times(v['receipts_ns'], now),
                       committed=v['committed'], rejected=v['rejected'], invalid=v['invalid'])
                for k, v in sdk.items()}
@@ -296,7 +351,8 @@ class PicoForwarder:
         return dict(generated_monotonic_ns=now, sdk=sdk, timing=timing,
                     counts=counts, hand_status=status,
                     errors=self.metrics.error_snapshot(),
-                    logging=self.diagnostics.stats() if self.diagnostics else {}, web_poll_hz=20.)
+                    logging=self.diagnostics.stats() if self.diagnostics else {}, web_poll_hz=20.,
+                    motion_trace=self.trace.stats() if self.trace is not None else None)
 
     def _summaries(self):
         last_print = 0.
@@ -348,6 +404,10 @@ class PicoForwarder:
                     self.metrics.mark('notification', notified)
                     self.metrics.count('notifications_coalesced', updates['notification_id']-after-1)
                     after = updates['notification_id']
+                    try:
+                        self._trace_samples(updates, notified)
+                    except Exception:
+                        self.metrics.count('trace_snapshot_errors')
                     sample = updates['body']
                     seq = int(sample['sequence'])
                     if seq > seen:
@@ -364,12 +424,17 @@ class PicoForwarder:
                             raise ValueError('SDK missing native CLOCK_MONOTONIC receipt')
                         if int(sample['packet_timestamp_ns']) <= last_sent_stamp:
                             self.metrics.count('body_duplicate')
+                            if self.trace is not None:
+                                self.trace.emit('body_rejected', source_sequence=sample['sequence'], reason='duplicate_device_timestamp')
                             for side in ('left', 'right'):
                                 self.hands.offer(side, updates[side])
                             continue
                         packet, _ = self.bridge._packet_from_sample(sample, self.sent_total, self.args.include_full_body_arrays)
                         if packet is None:
-                            self.metrics.count('body_stale' if now-sample['received_monotonic_ns']/1e9 > .1 else 'body_invalid')
+                            reason = 'body_stale' if now-sample['received_monotonic_ns']/1e9 > .1 else 'body_invalid'
+                            self.metrics.count(reason)
+                            if self.trace is not None:
+                                self.trace.emit('body_rejected', source_sequence=sample['sequence'], reason=reason)
                         else:
                             received = packet['body_sample_monotonic']
                             packet['laptop_input'] = dict(v=1, kind='pico', sample_monotonic=dict(left=received, right=received), physical_sides=['left', 'right'])
@@ -377,9 +442,15 @@ class PicoForwarder:
                             encoded = json.dumps(packet, separators=(',', ':'), allow_nan=False).encode()
                             if time.monotonic()-received > .1:
                                 self.metrics.count('body_stale')
+                                if self.trace is not None:
+                                    self.trace.emit('body_rejected', source_sequence=sample['sequence'], reason='stale_after_encoding')
                             elif self.args.record_only or self._send(self.body_socket, encoded, 'body'):
                                 sent = time.monotonic_ns()
                                 self.metrics.mark('body_forward', sent)
+                                if self.trace is not None:
+                                    self.trace.emit('body_forward', source_sequence=sample['sequence'],
+                                        received_monotonic_ns=sample['received_monotonic_ns'], sent_monotonic_ns=sent,
+                                        sent=not self.args.record_only)
                                 last_sent_stamp = int(sample['packet_timestamp_ns'])
                                 self.sent_total += 1
                                 # Fixed rate-limit deadlines, rather than adding
@@ -394,8 +465,12 @@ class PicoForwarder:
                                     self.viewer.update(packet)
                                 if self.recording:
                                     self.recording.submit(packet, len(encoded))
-                    except (ValueError, TypeError, KeyError, OverflowError):
+                            elif self.trace is not None:
+                                self.trace.emit('body_rejected', source_sequence=sample['sequence'], reason='send_failed')
+                    except (ValueError, TypeError, KeyError, OverflowError) as exc:
                         self.metrics.count('body_invalid')
+                        if self.trace is not None:
+                            self.trace.emit('body_rejected', source_sequence=sample.get('sequence'), reason=str(exc))
                 for side in ('left', 'right'):
                     self.hands.offer(side, updates[side])
         finally:
@@ -410,6 +485,9 @@ def run_pico(bridge, args):
         raise ValueError('--record-only requires --record-path')
     log_path = WORKSPACE/'laptop_teleop/log'/f'pico_transport_{time.time_ns()}.jsonl'
     diagnostics = RuntimeDiagnostics(log_path)
+    from esrobo_teleop.debug.motion_trace import MotionTrace, metadata
+    trace = MotionTrace(log_path.with_name(log_path.name.replace('pico_transport_', 'pico_motion_')),
+                        info=metadata(WORKSPACE, role='pico', arguments=vars(args)))
     viewer = recording = forwarder = None
     initialized = False
     cleanup_errors = []
@@ -421,7 +499,7 @@ def run_pico(bridge, args):
             rotation = load_config(str(WORKSPACE/'teleoperation/config/teleop_config.yaml')).retarget.source_to_robot_rotation
             viewer = SkeletonViewerServer(args.viewer_host, args.viewer_port, source_to_robot_rotation=rotation)
             viewer.start()
-        forwarder = PicoForwarder(sdk, bridge, args, viewer=viewer, diagnostics=diagnostics)
+        forwarder = PicoForwarder(sdk, bridge, args, viewer=viewer, diagnostics=diagnostics, trace=trace)
         if args.record_path:
             writer = bridge.BodyRecordingWriter(args.record_path, args.record_flush_interval,
                                                  args.record_neutral_start_s, args.record_warmup_discard_s)
@@ -437,6 +515,8 @@ def run_pico(bridge, args):
     finally:
         if forwarder:
             forwarder.close()
+        if not trace.close():
+            diagnostics.message('[pico] detailed trace incomplete:', trace.stats())
         # Workers that depend on native snapshots have stopped before owner deinit.
         if initialized:
             try:

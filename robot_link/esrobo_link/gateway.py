@@ -43,6 +43,8 @@ class Gateway:
         self.last_rejection = ""
         self.last_return = None
         self.journal = journal
+        self.motion_trace = None
+        self._trace_target_context = None
         self._diagnostic_events = []
         self._state_encoding_status = None
         self._last_record = None
@@ -181,6 +183,8 @@ class Gateway:
             entry.update(self.entry_liveness(now))
             entry.update(self.recovery_status())
             entry["entry_execution"] = self.entry_execution_diagnostics()
+            if self.motion_trace is not None:
+                entry["motion_trace"] = self.motion_trace.stats()
         for event in events:
             self.journal.write(json.dumps(event, allow_nan=False) + "\n")
         if fault_event is not None:
@@ -415,7 +419,14 @@ class Gateway:
             raise ProtocolError("hold requires an active arm session")
         token = (self.entry_plan_token if self.mode in
                  ("CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET") else None)
-        return self.gate.accept(message, peer, now, entry_plan_token=token)
+        kind = self.gate.accept(message, peer, now, entry_plan_token=token)
+        if self.motion_trace is not None:
+            from .motion_trace import command_context
+            context = command_context(message, now)
+            if kind in ('target', 'hold'):
+                self._trace_target_context = context
+            self.motion_trace.emit('network_accept', context=context)
+        return kind
 
     def entry_liveness(self, now):
         last = self.gate.last_entry_keepalive_at
@@ -531,6 +542,31 @@ class Gateway:
                 # boolean cancellation here would become a hardware E-stop.
                 raise HoldReturnTransition('latched hold transferred to checked return')
             return self.mode != 'HOLD_LATCHED'
+
+    def _execute_traced(self, target, cancelled, context):
+        trace = self.motion_trace
+        if trace is None or not trace.enabled:
+            return self.backend.step(target, cancelled)
+        from .motion_trace import cached_feedback, clear_cycle_feedback
+        clear_cycle_feedback(self.backend)
+        self.backend._motion_trace_context = context
+        started = time.monotonic_ns()
+        error = None
+        try:
+            return self.backend.step(target, cancelled)
+        except Exception as exc:
+            error = str(exc)
+            raise
+        finally:
+            try:
+                trace.emit('execution_cycle', context=context, started_ns=started,
+                           mode=self.mode, completed=error is None, error=error,
+                           hold=bool(target and target.get('hold')), feedback=cached_feedback(self.backend))
+            except Exception:
+                # Observability must never change execution or mask its exception.
+                trace.dropped += 1
+            self.backend._motion_trace_context = None
+            clear_cycle_feedback(self.backend)
 
     def tick(self):
         """Single executor: all hardware operations are serialized here."""
@@ -693,14 +729,15 @@ class Gateway:
                         raise RuntimeError(return_failure("hand-only recovery failed/cancelled", result))
             with self.lock:
                 active, target = self.mode == "ACTIVE", self.gate.target
+                trace_context = self._trace_target_context
             if self.mode == "WAITING_FOR_ACTIVE_TARGET":
                 self.backend.monitor_hold()
             if active:
                 if self.motion_cancelled():
                     return
-                self.backend.step(target, self.motion_cancelled)
+                self._execute_traced(target, self.motion_cancelled, trace_context)
             if self.mode == 'HOLD_LATCHED':
-                self.backend.step({'hold': True}, self.hold_cancelled)
+                self._execute_traced({'hold': True}, self.hold_cancelled, None)
             feedback = self.backend.snapshot()
             with self.lock:
                 self.feedback, self.feedback_time = feedback, time.monotonic()
@@ -808,6 +845,13 @@ def main():
         gateway.socket.close()
         backend.close()
         raise
+    from esrobo_teleop.debug.motion_trace import MotionTrace, metadata
+    from .motion_trace import attach
+    motion_trace = MotionTrace(log_path.with_name('execution_' + log_path.name.removeprefix('gateway_')),
+        info=metadata(Path(__file__).resolve().parents[2], role='gateway', config=getattr(backend, 'cfg', None), contract=backend.contract))
+    gateway.motion_trace = motion_trace
+    if motion_trace.enabled:
+        attach(backend, motion_trace)
     torque_log = None
     if args.hardware and hasattr(backend, 'attach_torque_recorder'):
         from esrobo_teleop.debug.async_json_log import AsyncJsonLog
@@ -846,6 +890,9 @@ def main():
         gateway.run()
     finally:
         retention_stopped.set()
+        motion_trace.close()
+        gateway.journal.write(json.dumps(dict(record_type='motion_trace_closed', **motion_trace.stats()))+'\n')
+        gateway.journal.flush()
         gateway.journal.close()
         if torque_log is not None:
             torque_log.close()

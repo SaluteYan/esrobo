@@ -5,6 +5,7 @@ from pathlib import Path
 
 from esrobo_link.protocol import ProtocolError, canonical
 from esrobo_teleop.robot.linker_hand_driver import L10_PHYSICAL_JOINT_NAMES
+from esrobo_teleop.config import retarget_filter_fingerprint
 
 REQUIRED_ENTRY_PROTOCOL = 7
 REQUIRED_ENTRY_KEEPALIVE_PROTOCOL = 1
@@ -17,6 +18,7 @@ def local_id(cfg, side, with_hand, hand_only=False):
         robot=dataclasses.asdict(cfg.robot), hand=dataclasses.asdict(cfg.hand),
         ik={k: v for k, v in dataclasses.asdict(cfg.ik).items() if k != "urdf_path"},
         endpoint_speed=cfg.retarget.max_endpoint_translation_velocity_m_s,
+        retarget_filter=retarget_filter_fingerprint(cfg.retarget),
         model_sha256=hashlib.sha256(Path(cfg.ik.urdf_path).read_bytes()).hexdigest(),
         side=side, with_hand=with_hand, hand_only=hand_only,
     )

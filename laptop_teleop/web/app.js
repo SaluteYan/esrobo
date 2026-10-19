@@ -749,7 +749,7 @@ function render() {
   $('runtime-status').classList.toggle('input-hold', Boolean(telemetry.age_s < 1.5 && telemetry.input_hold_active));
   if (telemetry.age_s < 1.5 && robot.mode === 'ACTIVE') {
     if (robot.recovery_phase === 'REACQUIRING') {
-      $('runtime-status').textContent += ' · 输入恢复：正在限速重新接管（最长 3 秒）';
+      $('runtime-status').textContent += ' · 输入恢复：核验连续新鲜帧，机械臂与手指继续限速衔接';
     }
     if (telemetry.input_hold_active && telemetry.input_resume_diagnostics?.reason) {
       $('runtime-status').textContent += ` · 恢复检查：${telemetry.input_resume_diagnostics.reason}`;
@@ -774,6 +774,11 @@ function render() {
         + ` · 限位 ${retarget.limited_axes?.length || 0} 轴（完整诊断见本机手部日志）`;
       $('runtime-status').textContent += ` · 十轴目标 [${telemetry.targets?.left?.hand_unit?.join(', ') ?? '--'}]`
         + ` / 反馈 [${robot.feedback?.hand?.position_unit?.join(', ') ?? '--'}]`;
+    }
+    for (const [side, hand] of Object.entries(telemetry.hand_following || {})) {
+      if (hand.limited_physical?.length) {
+        $('runtime-status').textContent += ` · ${side === 'left' ? '左' : '右'}手限速中（${hand.limited_physical.length} 轴），可张手释放`;
+      }
     }
   }
   if (telemetry.age_s < 1.5 && robot.entry_keepalive_protocol === 1 &&
@@ -803,7 +808,7 @@ function render() {
       const j5Target = mapped.target_joint_deg?.[0];
       const j5Feedback = members[side]?.arm_urdf_rad?.[4];
       const roll = Number.isFinite(input.requested_roll_deg)
-        ? ` · ${absolute ? '绝对翻掌' : '翻掌输入'} ${input.requested_roll_deg.toFixed(1)}°／${absolute ? '限步后' : '限幅限步后'} ${Number(input.filtered_roll_deg).toFixed(1)}°`
+        ? ` · ${absolute ? '绝对翻掌' : '翻掌输入'} ${input.requested_roll_deg.toFixed(1)}°／${absolute ? (input.filter_mode === 'adaptive_so3_deadband' ? '滤波后' : '限步后') : '限幅限步后'} ${Number(input.filtered_roll_deg).toFixed(1)}°`
           + (Number.isFinite(j5Target) ? ` · J5 目标 ${j5Target.toFixed(1)}°` : '')
           + (Number.isFinite(j5Feedback) ? `／实测 ${(j5Feedback * 180 / Math.PI).toFixed(1)}°` : '')
           + (input.palm_comparison_status === 'paired' && Number.isFinite(input.hand_palm_roll_deg)
@@ -933,6 +938,14 @@ function render() {
     const row = element('div', undefined, 'source');
     row.append(element('span', '本机接收合并 / 拒绝'), element('span',
       `Body ${receiveCounts.body_coalesced || 0} · Hand ${receiveCounts.hand_coalesced || 0} · 拒绝 ${receiveCounts.rejected || 0}`));
+    $('source-state').append(row);
+  }
+  for (const [label, health] of [['本机详细记录', telemetry.motion_trace], ['网关详细记录', robot.motion_trace]]) {
+    if (!health) continue;
+    const row = element('div', undefined, 'source');
+    const status = !health.enabled ? '已关闭' : health.error ? `写入异常：${health.error}`
+      : `队列 ${health.pending} · 丢弃 ${health.dropped} · ${(health.bytes_written / 1e6).toFixed(1)} MB`;
+    row.append(element('span', label), element('span', status));
     $('source-state').append(row);
   }
   $('can-state').textContent = state.remote.can || '等待 SSH 连接';
