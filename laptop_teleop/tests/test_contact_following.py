@@ -80,7 +80,7 @@ def test_controller_recovery_completes_while_human_moves_and_hand_is_blocked(mon
         assert result[side]['hand_unit'][3] == 0
         p.solve.return_value[side]['hand_unit']=[255]*10
         before=h.command.copy();tick()
-        assert h.command[3]>before[3] and h.command[3]-before[3]<=8
+        assert h.command[3]>before[3] and h.command[3]-before[3]<=18
 
 
 @pytest.mark.parametrize('fault',['controller_fault','driver_fault','enable_states'])
@@ -140,11 +140,11 @@ def test_default_live_mode_has_no_position_error_limit(actual,goal):
     for i in range(1,601):
         previous=h.command.copy()
         h.commit(h.propose([goal]*10,[actual]*10,i*.02))
-        assert max(abs(h.command[h.enabled]-previous[h.enabled]))<=8
+        assert max(abs(h.command[h.enabled]-previous[h.enabled]))<=18
     assert all(h.command[i]==goal for i in h.enabled)
     # Full 255-unit mismatch and feedback rebound do not reject a live command.
     h.commit(h.propose([255-goal]*10,[255-actual]*10,12.02))
-    assert max(abs(h.command[h.enabled]-goal))<=8
+    assert max(abs(h.command[h.enabled]-goal))<=18
     assert not h.reversal_wait
 
 

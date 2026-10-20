@@ -470,7 +470,7 @@ class HandConfig:
     out_min: int = 0
     out_max: int = 255
     max_step: int = 18                      # max per-command change per joint
-    max_velocity: int = 400                 # max servo units / second
+    max_velocity: int = 900                 # max servo units / second
     live_feedback_lead: float | None = None # None: no ACTIVE position-error gate; initial handover stays at 15
     home: list = field(default_factory=list)  # safe open pose (0..255) per physical joint
     return_open_on_quit: bool = True
@@ -482,6 +482,12 @@ class HandConfig:
     left_enabled_physical_joints: Optional[list] = None
     right_enabled_physical_joints: Optional[list] = None
     left_retarget_mode: str = "legacy"
+    # Optical finger shape only: palm-local metres before URDF retargeting.
+    left_shape_filter_enabled: bool = True
+    left_shape_filter_min_cutoff_hz: float = 2.0
+    left_shape_filter_max_cutoff_hz: float = 10.0
+    left_shape_filter_beta: float = 30.0  # Hz per (m/s)
+    left_shape_filter_deadband_m: float = 0.0005
     # Explicit command calibration; kept independent of measured geometry.
     left_control_calibration: dict = field(default_factory=dict)
 

@@ -160,7 +160,8 @@ class LinkerHand(Node):
             torque = [180] * 10
             pose = [255, 200, 255, 255, 255, 255, 180, 180, 180, 41]
             # L10 firmware speed scale is 0..255; apply the requested maximum
-            # to both sides. Teleoperation motion bounds remain independent.
+            # to both sides. This is a firmware setting, not 255 position
+            # units/second; teleoperation motion bounds remain independent.
             speed = [255] * 10
         elif self.hand_joint == "L20":
             pose = [255,255,255,255,255,255,10,100,180,240,245,255,255,255,255,255,255,255,255,255]

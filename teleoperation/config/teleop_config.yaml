@@ -307,7 +307,7 @@ hand:
   out_min: 0
   out_max: 255
   max_step: 18
-  max_velocity: 400
+  max_velocity: 900  # position units/s; at 50 Hz the 18-unit step cap also applies
   live_feedback_lead: null  # ACTIVE: no command/feedback position-error limit; retain speed/step limits
   home: [255, 128, 255, 255, 255, 255, 128, 128, 128, 128]
   return_open_on_quit: true
@@ -321,6 +321,12 @@ hand:
   enabled_physical_joints: [0, 1, 2, 3, 4, 5, 9]
   left_enabled_physical_joints: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   left_retarget_mode: urdf_10
+  # Palm-local optical finger shape; does not filter arm/palm orientation.
+  left_shape_filter_enabled: true
+  left_shape_filter_min_cutoff_hz: 2.0
+  left_shape_filter_max_cutoff_hz: 10.0
+  left_shape_filter_beta: 30.0
+  left_shape_filter_deadband_m: 0.0005
   # Nominal L20Lite command model, not a new measured calibration.
   # Do not alias feedback calibration: command fitting must not redefine sensors.
   left_control_calibration:

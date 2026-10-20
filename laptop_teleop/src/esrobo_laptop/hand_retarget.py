@@ -10,10 +10,11 @@ from scipy.spatial.transform import Rotation
 
 from esrobo_teleop.robot.linker_hand_driver import ACTIVE_HAND_JOINTS
 
-VERSION = "left-urdf-10-v4"
+VERSION = "left-urdf-10-v5"
 POLICY = dict(pinch_start_width=1.1, pinch_ramp_width=.6,
               project_enter_m=.008, project_exit_m=.012, project_target_m=.002,
               project_transition_s=.080, clock_gap_s=.1,
+              release_thumb_transition=True,
               flex_correction_deg=15., side_correction_deg=5.,
               direction_weights=(5.3, 3., 3.), open_direction_weights=(4., 1., 1.), plane_weight=.02,
               temporal_weight=.001, finger_regularization=.01,
@@ -262,6 +263,8 @@ class HandModel:
 
 class HandRetargeter:
     def __init__(self, cfg, *, use_native=True):
+        from .hand_shape_filter import HandShapeFilter
+        self.shape_filter = HandShapeFilter(cfg.hand, POLICY['clock_gap_s'])
         self.model = HandModel(cfg)
         self.previous = self.model.neutral.copy()
         self.contact = np.zeros(4, dtype=bool)
@@ -357,7 +360,9 @@ class HandRetargeter:
         """Publish acknowledgement; stale acknowledgements cannot commit state."""
         if self._pending is None or self._pending[0] != candidate_id:
             return False
-        _, self.previous, self.contact, self.projection, self.source_time = self._pending
+        _, self.previous, self.contact, self.projection, self.source_time, shape = self._pending
+        if shape is not None:
+            self.shape_filter.commit(shape)
         self._pending = None
         return True
 
@@ -407,6 +412,15 @@ class HandRetargeter:
         # Also validate bones used by the direct geometric mapper.
         for a in (7, 12, 17, 22):
             self._directions(target[a:a+4])
+        raw_target = target
+        shape = None
+        shape_diagnostic = dict(enabled=False, bypass='explicit_model_fixture')
+        if not synthetic:
+            shape, shape_diagnostic = self.shape_filter.propose(target, stamp)
+            target = shape.output
+            desired = self._directions(target[2:6])
+            for a in (7, 12, 17, 22):
+                self._directions(target[a:a+4])
         pair = target[TIPS[1:]]-target[5]
         distance = np.linalg.norm(pair, axis=1)
         raw = target if synthetic else np.asarray(poses)[:, :3]
@@ -415,9 +429,12 @@ class HandRetargeter:
         if synthetic:
             # Explicit model fixtures retain their exact attainable vectors.
             projection = np.zeros(4)
-        projected = pair.copy()
-        nonzero = distance > 1e-8
-        projected[nonzero] *= (POLICY['project_target_m']/distance[nonzero])[:, None]
+        # Preserve the observed contact direction. Smoothing shapes must not
+        # change a fully projected 2 mm contact into a different pinch target.
+        projected = raw_target[TIPS[1:]]-raw_target[5]
+        projection_distance = np.linalg.norm(projected, axis=1)
+        nonzero = projection_distance > 1e-8
+        projected[nonzero] *= (POLICY['project_target_m']/projection_distance[nonzero])[:, None]
         if not nonzero.all():
             # Coincident human tips have no measured direction. Continue the
             # accepted model direction, rather than divide by zero or invent
@@ -648,12 +665,24 @@ class HandRetargeter:
                 points[start:start+4] = current[10][f]
             points[0] = points[[7, 12, 17, 22]].mean(axis=0)
             solved_directions = current[5]
+        release_blend = float(max(projection)) if not contact.any() else 0.
+        if release_blend > 0. and POLICY['release_thumb_transition']:
+            # No contact remains constrained. Fade in the unconstrained thumb
+            # solution across the existing 80 ms release, rather than jumping
+            # to it when the final contact bit clears. Blend all three thumb
+            # axes together; four-finger coordination bounds remain unchanged.
+            q = q.copy()
+            q[:3] = self.previous[:3]+(0. if reset else 1.-release_blend)*(q[:3]-self.previous[:3])
+            points, _ = m.forward(q)
+            solved_directions = self._directions(points[2:6])
         rebuilt = self.reconstruct_target(target, q, points)
         original_pair = target[TIPS[1:]]-target[5]
         contact_error = (points[TIPS[1:]]-points[5])-pair
         direction_error = np.degrees(np.arccos(np.clip(np.sum(solved_directions*desired, axis=1), -1., 1.)))
         errors = np.linalg.norm(contact_error, axis=1)*1000
         diagnostic = dict(solve_ms=(time.monotonic()-started)*1000,
+            input_filter=shape_diagnostic,
+            release_orientation_blend=release_blend,
             solver_method='bounded_vector_contact_v4', compute_backend=self.backend, nonlinear_dof=n, direction_weights=weights.tolist(),
             evaluations=evals, updates=updates, step_attempts=attempts,
             contact_active=contact.tolist(), projection_fraction=projection.tolist(),
@@ -672,7 +701,7 @@ class HandRetargeter:
             limited_axes=[m.names[i] for i in range(10) if min(q[i]-m.lower[i],m.upper[i]-q[i])<1e-3])
         check()
         self._serial += 1
-        self._pending = (self._serial, q.copy(), contact.copy(), projection.copy(), stamp)
+        self._pending = (self._serial, q.copy(), contact.copy(), projection.copy(), stamp, shape)
         result = dict(joints=q.tolist(), mapping_version=VERSION, mapping_fingerprint=m.digest,
                       diagnostics=diagnostic, target_points=target.tolist(), reconstructed_points=rebuilt.tolist(),
                       solved_points=points.tolist(), candidate_id=self._serial)

@@ -388,7 +388,11 @@ def test_slow_contact_transition_does_not_introduce_thumb_jump(solver, finger, t
     assert blends[-1] == (1. if entering else 0.)
     assert np.max(abs(np.degrees(np.diff(outputs,axis=0))[20:,:3])) < 1.
     if not entering:
-        np.testing.assert_allclose(outputs[-1][3:], solver.direct_fingers(m.human_target(poses))[3:], atol=1e-12)
+        # Contact corrections must disappear. The geometric baseline now uses
+        # the filtered optical shape, with a bounded residual deadband offset.
+        filtered = np.asarray(r['target_points'])
+        np.testing.assert_allclose(outputs[-1][3:], solver.direct_fingers(filtered)[3:], atol=1e-12)
+        assert np.max(np.linalg.norm(filtered-m.human_target(poses), axis=1)) < .0006
 
 
 def test_native_chain_and_jacobian_match_python_reference():

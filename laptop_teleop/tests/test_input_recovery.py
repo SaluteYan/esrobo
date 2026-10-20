@@ -211,7 +211,10 @@ def test_controller_qualifies_then_reacquires_and_preserves_anchor(monkeypatch, 
     assert client.recovery_metadata['phase'] == 'reacquiring'
     anchor = copy.deepcopy(c.recovery.anchor)
     if with_hand:
-        assert result[side]['hand_unit'][1] < 144
+        # The 16-unit target offset fits in the configured 18-unit cycle.
+        assert result[side]['hand_unit'][1] == 144
+        actual = np.asarray(state['feedback']['hand']['position_unit'])
+        assert np.max(np.abs(np.asarray(result[side]['hand_unit'])-actual)) <= 18
     state['feedback']['arm_urdf_rad'] = p.solve.return_value[side]['arm_urdf_rad']
     if with_hand:
         # Simulate progression, not a feedback teleport outside the lead band.
@@ -396,7 +399,7 @@ def test_large_finger_recovery_uses_latest_goal_and_bounded_commands(monkeypatch
     enabled = limiter.enabled
     actual = np.asarray(state['feedback']['hand']['position_unit'])
     assert limiter.lead is None
-    assert np.max(np.abs(np.asarray(result[side]['hand_unit'])[enabled]-actual[enabled])) <= 8
+    assert np.max(np.abs(np.asarray(result[side]['hand_unit'])[enabled]-actual[enabled])) <= 18
     assert result[side]['hand_unit'][2:6] != goal[2:6]
     for i in range(100):
         previous = np.asarray(result[side]['hand_unit'])
