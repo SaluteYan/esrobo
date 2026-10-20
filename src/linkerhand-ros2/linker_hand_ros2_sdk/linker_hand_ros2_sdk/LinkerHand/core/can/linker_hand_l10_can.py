@@ -32,6 +32,9 @@ class FrameProperty(Enum):
 
 class LinkerHandL10Can:
     def __init__(self,can_id, can_channel='can0', baudrate=1000000, yaml=""):
+        self._position_lock = threading.RLock()
+        self._position_sequences = [0, 0]
+        self.strict_errors = False
         self.can_id = can_id
         self.can_channel = can_channel
         self.baudrate = baudrate
@@ -137,8 +140,13 @@ class LinkerHandL10Can:
         data = [frame_property_value] + [int(val) for val in data_list]
         msg = can.Message(arbitration_id=self.can_id, data=data, is_extended_id=False)
         try:
-            self.bus.send(msg)
+            if getattr(self, "strict_errors", False):
+                self.bus.send(msg, timeout=.002)
+            else:
+                self.bus.send(msg)
         except can.CanError as e:
+            if getattr(self, "strict_errors", False):
+                raise RuntimeError(f"CAN frame {frame_property_value:#x} failed: {e}") from e
             print(f"Failed to send message: {e}")
             self.open_can.open_can(self.can_channel)
             time.sleep(1)
@@ -152,17 +160,33 @@ class LinkerHandL10Can:
             # 
         time.sleep(sleep)
 
-    def set_joint_positions(self, joint_angles):
-        """Set the positions of 10 joints (joint_angles: list of 10 values)."""
-        self.joint_angles = joint_angles
+    def set_joint_positions(self, joint_angles, guard=None):
+        """Only commit a complete pair; do not reconnect/replay after failure."""
         self.is_cmd = True
-        # Send angle control in frames, L10 protocol splits into first 6 and last 4
-        self.send_frame(FrameProperty.JOINT_POSITION2_RCO, self.joint_angles[6:])
-        #time.sleep(0.001)
-        self.send_frame(FrameProperty.JOINT_POSITION_RCO, self.joint_angles[:6])
-        #time.sleep(0.002)
-        self.is_cmd = False
-        
+        completed = 0
+        try:
+            for frame, values in ((FrameProperty.JOINT_POSITION2_RCO, joint_angles[6:]),
+                                  (FrameProperty.JOINT_POSITION_RCO, joint_angles[:6])):
+                if guard is not None and not guard():
+                    raise RuntimeError('command cancelled/expired')
+                self.send_frame(frame, values)
+                completed += 1
+            self.joint_angles = list(joint_angles)
+        except Exception as exc:
+            failure = RuntimeError(f'hand position pair failed after {completed}/2 frames: {exc}')
+            failure.completed_frames = completed
+            raise failure from exc
+        finally:
+            self.is_cmd = False
+
+    def position_snapshot(self):
+        with self._position_lock:
+            return dict(position=list(self.x01)+list(self.x04),
+                        stamps=[getattr(self, '_position_01_received_at', None),
+                                getattr(self, '_position_04_received_at', None)],
+                        sequences=list(self._position_sequences),
+                        speed_stamps=[getattr(self, '_speed_05_received_at', None),
+                                      getattr(self, '_speed_06_received_at', None)])
 
     def set_max_torque_limits(self, pressures,type="get"):
         """Set maximum torque limits"""
@@ -239,19 +263,29 @@ class LinkerHandL10Can:
             if len(list(response_data)) == 0:
                     return
             if frame_type == FrameProperty.JOINT_POSITION_RCO.value:   # 0x01
-                self.x01 = list(response_data)  
-                self._position_01_received_at = time.monotonic()
+                with getattr(self, '_position_lock', threading.RLock()):
+                    self.x01 = list(response_data)
+                    self._position_01_received_at = time.monotonic()
+                    if hasattr(self, '_position_sequences'): self._position_sequences[0] += 1
             elif frame_type == FrameProperty.MAX_PRESS_RCO.value:    # 0x02
                 self.x02 = list(response_data)
             elif frame_type == FrameProperty.MAX_PRESS_RCO2.value:    # 0x03
                 self.x03 = list(response_data)
             elif frame_type == FrameProperty.JOINT_POSITION2_RCO.value:    # 0x04
-                self.x04 = list(response_data)
-                self._position_04_received_at = time.monotonic()
+                with getattr(self, '_position_lock', threading.RLock()):
+                    self.x04 = list(response_data)
+                    self._position_04_received_at = time.monotonic()
+                    if hasattr(self, '_position_sequences'): self._position_sequences[1] += 1
             elif frame_type == 0x05:
-                self.x05 = list(response_data)
+                with getattr(self, '_position_lock', threading.RLock()):
+                    self.x05 = list(response_data)
+                    if len(response_data) == 5:
+                        self._speed_05_received_at = time.monotonic()
             elif frame_type == 0x06:
-                self.x06 = list(response_data)
+                with getattr(self, '_position_lock', threading.RLock()):
+                    self.x06 = list(response_data)
+                    if len(response_data) == 5:
+                        self._speed_06_received_at = time.monotonic()
             elif frame_type == 0x20:
                 # Five-finger normal force
                 d = list(response_data)

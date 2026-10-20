@@ -38,6 +38,8 @@ class LinkerHand(Node):
         self.can = self.get_parameter('can').value
         self.modbus = self.get_parameter('modbus').value
         self.move_on_start = self.get_parameter('move_on_start').value
+        self._latest_mode = self.hand_type == 'left' and self.hand_joint == 'L10' and self.modbus == 'None'
+        self._executor = None
         self.sdk_v = 2
         self.sleep_time = 0.005
         self.cmd_lock = False
@@ -91,16 +93,51 @@ class LinkerHand(Node):
         self._init_hand()
         time.sleep(1)
         self.run_count = 0 # 计数器，用于记录运行次数
-        self.timer = self.create_timer(0.01, self.run)  # 100 Hz
+        if self._latest_mode:
+            self._init_latest_executor()
+            return
+        self.timer = self.create_timer(0.01, self.run)  # legacy right/non-L10
         self.thread_pub_state = threading.Thread(target=self.pub_state)
         self.thread_pub_state.daemon = True
         self.thread_pub_state.start()
+
+    def _init_latest_executor(self):
+        # Resolve the deployed checkout, including colcon symlink installs.
+        from pathlib import Path
+        for parent in Path(__file__).resolve().parents:
+            source = parent / 'teleoperation/src'
+            if (source / 'esrobo_teleop').is_dir():
+                sys.path.insert(0, str(source))
+                break
+        from esrobo_teleop.robot.hand_transport import LatestHandExecutor, make_log
+        hand = self.api.hand
+        hand.strict_errors = True
+        self._transport_pub = self.create_publisher(String, '/esrobo_left_hand_transport', 1)
+        self._executor = LatestHandExecutor(hand.set_joint_positions, self.api.get_state,
+                                            hand.position_snapshot, self.api.get_joint_speed,
+                                            log=make_log('sdk'))
+        self._executor.start()
+        self.timer = self.create_timer(.010, self._publish_latest_status)
+
+    def _publish_latest_status(self):
+        status = self._executor.status()
+        message = String()
+        message.data = json.dumps(status, allow_nan=False)
+        self._transport_pub.publish(message)
+        # Legacy viewers still get state, never with fabricated position values.
+        stamps = status['frame_stamps']
+        if all(t is not None and 0 <= time.monotonic()-t < .15 for t in stamps):
+            self.hand_state_pub.publish(self.joint_state_msg(status['position'], status['speed'] or []))
+
+    def close_latest(self):
+        if self._executor is not None:
+            self._executor.close()
 
     def _init_hand(self):
         self.api = LinkerHandApi(hand_type=self.hand_type, hand_joint=self.hand_joint,modbus=self.modbus,can=self.can)
         time.sleep(0.1)
         self.touch_type = self.api.get_touch_type()
-        self.hand_cmd_sub = self.create_subscription(JointState, f'/cb_{self.hand_type}_hand_control_cmd', self.hand_control_cb,10)
+        self.hand_cmd_sub = self.create_subscription(JointState, f'/cb_{self.hand_type}_hand_control_cmd', self.hand_control_cb, 1 if self._latest_mode else 10)
         self.hand_state_pub = self.create_publisher(JointState, f'/cb_{self.hand_type}_hand_state',10)
         self.hand_info_pub = self.create_publisher(String, f'/cb_{self.hand_type}_hand_info', 10)
         if self.is_touch == True:
@@ -195,6 +232,16 @@ class LinkerHand(Node):
         return any(abs(self.last_hand_post_cmd - pose) >= 3 for self.last_hand_post_cmd, pose in zip(self.last_hand_post_cmd, pose))
 
     def hand_control_cb(self, msg):
+        if getattr(self, '_latest_mode', False):
+            from esrobo_teleop.robot.hand_transport import PREFIX, emit
+            try:
+                if not msg.header.frame_id.startswith(PREFIX):
+                    raise ValueError('timestamped esrobo hand command required')
+                meta = json.loads(msg.header.frame_id[len(PREFIX):])
+                self._executor.accept(list(msg.position), meta)
+            except (ValueError, AttributeError, TypeError) as exc:
+                emit(self._executor.log, 'ros_command_rejected', reason=str(exc))
+            return
         if self.last_hand_post_cmd == None or self.list_check(msg.position) == True:
             self.last_hand_post_cmd = msg.position
         if self.last_hand_vel_cmd == None or self.list_check(msg.velocity) == True:
@@ -375,7 +422,20 @@ class LinkerHand(Node):
 
     
 
-    def hand_setting_cb(self,msg):
+    def hand_setting_cb(self, msg):
+        if getattr(self, '_latest_mode', False):
+            from esrobo_teleop.robot.hand_transport import emit
+            try:
+                data = json.loads(msg.data)
+                if data['params']['hand_type'] != 'left': return
+                if not self._executor.setting(lambda: self._legacy_hand_setting_cb(msg)):
+                    emit(self._executor.log, 'setting_rejected', reason='queue full or fault')
+            except (ValueError, KeyError, TypeError) as exc:
+                emit(self._executor.log, 'setting_rejected', reason=str(exc))
+            return
+        self._legacy_hand_setting_cb(msg)
+
+    def _legacy_hand_setting_cb(self,msg):
         '''控制命令回调'''
         try:
             data = json.loads(msg.data)
@@ -430,7 +490,9 @@ class LinkerHand(Node):
                     hand.set_current(data["params"]["current"])
             if data["setting_cmd"] == "show_fun_table": # Get faults
                 f = hand.show_fun_table()
-        except:
+        except Exception:
+            if getattr(self, "_latest_mode", False):
+                raise
             print("命令参数错误")
             self.cmd_lock = False
         finally:
@@ -443,6 +505,7 @@ class LinkerHand(Node):
 
         
 def main(args=None):
+    node = None
     try:
         rclpy.init(args=args)
         node = LinkerHand("linker_hand_sdk")
@@ -466,6 +529,8 @@ def main(args=None):
         ColorMsg(msg=f"LinkerHand startup failed: {exc}", color="red")
         return 1
     finally:
+        if node is not None:
+            node.close_latest()
         # node.close_can()         # 关闭 CAN 或其他硬件资源
         # node.destroy_node()      # 销毁 ROS 节点
         # rclpy.shutdown()         # 关闭 ROS

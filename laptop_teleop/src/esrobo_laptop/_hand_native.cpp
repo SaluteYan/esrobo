@@ -254,21 +254,23 @@ static py::object participate(py::object gate, py::handle qb, py::handle qr,
     for(int j=0;j<3;j++){lo[j]=low[j];hi[j]=high[j];}
     for(int f=0;f<4;f++){
         int cols[2]={flex[f],side[f]}, count=f==1?1:2;
+        bool exited=!contact[f] && elapsed[f]>0.;
+        if(exited){after[f]=stamp;for(int c=0;c<count;c++){evidence[cols[c]]=0.;authorized[cols[c]]=false;}}
         elapsed[f]=contact[f]?elapsed[f]+dt:0.;
         for(int c=0;c<count;c++){
             int j=cols[c];
             double sign=(proof_net[j]>0)-(proof_net[j]<0);
             if((base[j]-proof_origin[j])*sign<val(c==0?"flex_motion_deg":"side_motion_deg")*rad*.5)evidence[j]=0.;
-            if(axis_own[j] && approach[f]>=val("approach_width") && !reset){
+            if(axis_own[j] && approach[f]>=val("approach_width") && !reset && !exited){
                 evidence[j]=stamp+val("evidence_lifetime_s");proof_net[j]=net_deg[2*f+c]*rad;proof_origin[j]=base[j]-proof_net[j];
             }
             if(!contact[f])authorized[j]=false;
             else release[j]=false;
         }
-        bool blocked=reset || stamp<cooldown[f];
+        bool blocked=reset || (contact[f] && stamp<cooldown[f]);
         bool confirmed=contact[f] && elapsed[f]>=val("contact_confirm_s")-1e-9;
         if(confirmed && !blocked)for(int c=0;c<count;c++)authorized[cols[c]]=authorized[cols[c]] || evidence[cols[c]]>=stamp;
-        if(!contact[f] && !blocked)for(int c=0;c<count;c++)release[cols[c]]=release[cols[c]] || axis_own[cols[c]];
+        if(!contact[f] && !blocked)for(int c=0;c<count;c++)release[cols[c]]=release[cols[c]] || std::abs(fixed[cols[c]]-base[cols[c]])>1e-12;
         if(blocked){reasons[f]=reset?"clock_reset":"shape_jump_cooldown";continue;}
         bool released=false;
         for(int c=0;c<count;c++){
@@ -279,14 +281,14 @@ static py::object participate(py::object gate, py::handle qb, py::handle qr,
                 hi[j]=std::min({high[j],base[j]+radius[j],fixed[j]+budget[j]});
                 eligible[f]=true;
             }else if(!contact[f] && release[j]){
-                budget[j]=radius[j]*std::min(dt/val("transition_s"),1.);
+                budget[j]=radius[j]*std::min(dt/val("release_s"),1.);
                 fixed[j]-=std::clamp(fixed[j]-base[j],-budget[j],budget[j]);lo[j]=hi[j]=fixed[j];
                 if(std::abs(fixed[j]-base[j])<1e-12)release[j]=false;
                 released=released || budget[j]>0;
             }
         }
         if(eligible[f])reasons[f]="confirmed_contact";
-        else if(!contact[f] && released)reasons[f]="own_motion_release";
+        else if(!contact[f] && released)reasons[f]="contact_exit_release";
         else if(contact[f] && !confirmed)reasons[f]="contact_confirmation";
     }
     py::tuple hist(recent.size());for(size_t i=0;i<recent.size();i++)hist[i]=recent[i].record;

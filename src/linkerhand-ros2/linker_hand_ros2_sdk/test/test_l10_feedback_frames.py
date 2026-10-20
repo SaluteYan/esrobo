@@ -12,7 +12,7 @@ def load_receiver():
     method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'process_response')
     from enum import Enum
     enum = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'FrameProperty')
-    ns = {'Enum': Enum, 'time': time}
+    ns = {'Enum': Enum, 'time': time, 'threading': __import__('threading')}
     exec(compile(ast.Module(body=[enum, method], type_ignores=[]), str(SOURCE), 'exec'), ns)
     return ns['process_response']
 

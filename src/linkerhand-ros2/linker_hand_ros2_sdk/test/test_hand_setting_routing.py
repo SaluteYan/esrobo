@@ -29,10 +29,10 @@ def test_l10_initial_speed_maximum_without_startup_motion(side):
 def callback():
     tree = ast.parse(SOURCE.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'LinkerHand')
-    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'hand_setting_cb')
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_legacy_hand_setting_cb')
     namespace = {'json': json, 'ColorMsg': lambda **kw: None}
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(SOURCE), 'exec'), namespace)
-    return namespace['hand_setting_cb']
+    return namespace['_legacy_hand_setting_cb']
 
 
 def test_right_setting_never_changes_left():

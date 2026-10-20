@@ -273,24 +273,6 @@ def test_plane_jacobian_and_straight_degeneracy(solver):
     assert np.isfinite(j).all()
 
 
-def test_contact_hysteresis_transition_and_gap(solver):
-    solver.source_time = 1.
-    contact, blend, reset = solver._contact_candidate(np.array([.007, .009, .02, .007]), 1.02)
-    assert contact.tolist() == [True, False, False, True]
-    np.testing.assert_allclose(blend, [.25, 0, 0, .25])
-    assert not solver.contact.any()  # Candidate is pure.
-    solver.contact, solver.projection, solver.source_time = contact, blend, 1.02
-    contact, blend, reset = solver._contact_candidate(np.array([.010, .007, .02, .013]), 1.04)
-    assert contact.tolist() == [True, True, False, False]
-    np.testing.assert_allclose(blend, [.5, .25, 0, 0], atol=1e-12)
-    _, frozen, reset = solver._contact_candidate(np.ones(4)*.001, 2.)
-    assert reset
-    np.testing.assert_array_equal(frozen, solver.projection)
-    for stamp in (1., 1.02):
-        with pytest.raises(ValueError, match='non-advancing'):
-            solver._contact_candidate(np.zeros(4), stamp)
-
-
 def test_publish_ack_only_commits_current_candidate(solver):
     target, _ = solver.model.forward(solver.model.upper*.35)
     before = solver.previous.copy()
@@ -341,7 +323,8 @@ def test_all_contact_goals_are_checked_but_only_authorized_fingers_move(solver, 
     # An intentionally impossible multi-finger contact must remain bounded.
     for tip in TIPS[1:]:
         target[tip] = target[5]+[.001, .001, 0.]
-    r = solver.solve(None, target=target, source_time=1., budget_s=1.)
+    for i in range(6):
+        r = solver.solve(None, target=target, source_time=1.+i*.02, budget_s=1.)
     d = r['diagnostics'];correction = np.array(d['correction_deg'])
     assert d['contact_goal_fingers'] == [0, 1, 2, 3]
     assert d['coordination_fingers'] == ([0, 1, 2, 3] if authorized else [])
@@ -364,6 +347,10 @@ def test_coupled_contact_step_improves_posture_without_breaking_contact(solver):
     solver.contact = np.array(sample['contact'])
     solver.projection = np.array(sample['projection'])
     solver.source_time = sample['previous_time']
+    from esrobo_laptop.hand_contact import State
+    raw = np.array(sample['poses'])[:, :3]
+    distances = np.linalg.norm(raw[TIPS[1:]]-raw[5], axis=1)
+    solver.contact_detector.state = State(solver.source_time, solver.contact.copy(), solver.projection.copy(), np.zeros(4), np.zeros(4), distances, ())
     target = solver.model.human_target(sample['poses'])
     before, _ = solver.model.forward(solver.previous)
     desired = solver._directions(target[2:6])

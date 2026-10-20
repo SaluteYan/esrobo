@@ -10,10 +10,11 @@ from scipy.spatial.transform import Rotation
 
 from esrobo_teleop.robot.linker_hand_driver import ACTIVE_HAND_JOINTS
 from .hand_participation import FingerParticipation, POLICY as PARTICIPATION_POLICY
+from .hand_contact import HandContact, POLICY as CONTACT_POLICY
 
-VERSION = "left-urdf-10-v7"
+VERSION = "left-urdf-10-v8"
 POLICY = dict(pinch_start_width=1.1, pinch_ramp_width=.6,
-              project_enter_m=.008, project_exit_m=.012, project_target_m=.002,
+              project_target_m=.002,
               project_transition_s=.080, clock_gap_s=.1,
               release_thumb_transition=True, participation_thumb_transition_s=.080, fixed_finger_contact="posture_soft_vector_v1",
               flex_correction_deg=15., side_correction_deg=5.,
@@ -36,6 +37,7 @@ def fingerprint(cfg):
     from dataclasses import asdict
     model = Path(cfg.ik.urdf_path)
     value = dict(version=VERSION, policy=POLICY, participation_policy=PARTICIPATION_POLICY,
+                 contact_policy=CONTACT_POLICY, contact_source=hashlib.sha256(Path(__file__).with_name("hand_contact.py").read_bytes()).hexdigest(),
                  participation_source=hashlib.sha256(Path(__file__).with_name("hand_participation.py").read_bytes()).hexdigest(), hand=asdict(cfg.hand), manual=MANUAL_DEG,
                  urdf=hashlib.sha256(model.read_bytes()).hexdigest(),
                  solver_kernel=hashlib.sha256(Path(__file__).with_name("_hand_native.cpp").read_bytes()).hexdigest())
@@ -272,6 +274,7 @@ class HandRetargeter:
         self.participation = FingerParticipation(self.model.lower, self.model.upper, self.model.width,
             flex_deg=POLICY["flex_correction_deg"], side_deg=POLICY["side_correction_deg"],
             max_gap_s=POLICY["clock_gap_s"])
+        self.contact_detector = HandContact()
         self.contact = np.zeros(4, dtype=bool)
         self.permission_mask = np.zeros(4, dtype=bool)
         self.permission_anchor = self.previous[:3].copy()
@@ -373,7 +376,8 @@ class HandRetargeter:
         """Publish acknowledgement; stale acknowledgements cannot commit state."""
         if self._pending is None or self._pending[0] != candidate_id:
             return False
-        _, self.previous, self.contact, self.projection, self.source_time, shape, participation, self.permission_mask, self.permission_anchor, self.permission_progress = self._pending
+        _, self.previous, self.contact, self.projection, self.source_time, shape, participation, self.permission_mask, self.permission_anchor, self.permission_progress, contact_state = self._pending
+        self.contact_detector.commit(contact_state)
         self.participation.commit(participation)
         if shape is not None:
             self.shape_filter.commit(shape)
@@ -382,20 +386,6 @@ class HandRetargeter:
 
     def discard(self):
         self._pending = None
-
-    def _contact_candidate(self, distances, stamp):
-        if self.source_time is not None and stamp <= self.source_time:
-            raise ValueError('non-advancing hand source time')
-        dt = 0. if self.source_time is None else stamp-self.source_time
-        reset = dt > POLICY['clock_gap_s']
-        if reset:
-            dt = 0.
-        contact = self.contact.copy()
-        contact[distances < POLICY['project_enter_m']] = True
-        contact[distances > POLICY['project_exit_m']] = False
-        blend = self.projection+np.clip(contact.astype(float)-self.projection,
-                                      -dt/POLICY['project_transition_s'], dt/POLICY['project_transition_s'])
-        return contact, blend, reset
 
     @staticmethod
     def _plane(directions, jac):
@@ -439,7 +429,11 @@ class HandRetargeter:
         distance = np.linalg.norm(pair, axis=1)
         raw = target if synthetic else np.asarray(poses)[:, :3]
         human_distance = np.linalg.norm(raw[TIPS[1:]]-raw[5], axis=1)
-        contact, projection, reset = self._contact_candidate(human_distance, stamp)
+        contact_started = time.monotonic()
+        contact_state, contact_diagnostic = self.contact_detector.propose(human_distance, target, m.width, stamp)
+        contact, projection = contact_state.active, contact_state.projection
+        reset = contact_diagnostic["clock_reset"]
+        contact_ms = (time.monotonic()-contact_started)*1000
         if synthetic:
             # Explicit model fixtures retain their exact attainable vectors.
             projection = np.zeros(4)
@@ -728,6 +722,7 @@ class HandRetargeter:
             bend_plane_confidence=plane_confidence,
             coordination_fingers=moving.tolist(), contact_goal_fingers=active.tolist(), clock_reset=reset,
             participation=permission.diagnostic, participation_ms=participation_ms,
+            contact_detection=contact_diagnostic, contact_detection_ms=contact_ms,
             human_gap_mm=(human_distance*1000).tolist(), projected_gap_mm=(np.linalg.norm(pair, axis=1)*1000).tolist(),
             model_gap_mm=(np.linalg.norm(points[TIPS[1:]]-points[5], axis=1)*1000).tolist(),
             projected_error_mm=errors.tolist(), contact_satisfied=bool(np.all(errors[contact]<=2.001)),
@@ -745,7 +740,7 @@ class HandRetargeter:
         permission.diagnostic['actual_correction_change_deg'][:3] = [0., 0., 0.]
         check()
         self._serial += 1
-        self._pending = (self._serial, q.copy(), contact.copy(), projection.copy(), stamp, shape, permission.solved(q, geometric_base), constrained_contact.copy(), permission_anchor.copy(), permission_progress)
+        self._pending = (self._serial, q.copy(), contact.copy(), projection.copy(), stamp, shape, permission.solved(q, geometric_base), constrained_contact.copy(), permission_anchor.copy(), permission_progress, contact_state)
         result = dict(joints=q.tolist(), mapping_version=VERSION, mapping_fingerprint=m.digest,
                       diagnostics=diagnostic, target_points=target.tolist(), reconstructed_points=rebuilt.tolist(),
                       solved_points=points.tolist(), candidate_id=self._serial)

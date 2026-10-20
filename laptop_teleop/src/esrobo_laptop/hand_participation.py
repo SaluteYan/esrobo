@@ -11,7 +11,7 @@ POLICY = dict(window_s=.600, minimum_span_s=.100, minimum_samples=3,
               approach_width=.01, jump_window_s=.100, jump_flex_deg=20.,
               jump_side_deg=6., cooldown_s=.300, transition_s=.080,
               history_capacity=64, evidence_lifetime_s=.600,
-              contact_confirm_s=.100)
+              contact_confirm_s=.100, release_s=.160)
 FLEX = np.array([4, 5, 7, 9])
 SIDE = np.array([3, 5, 6, 8])  # Middle's placeholder is masked below.
 HAS_SIDE = np.array([True, False, True, True])
@@ -139,12 +139,17 @@ class FingerParticipation:
         participating = np.zeros(4, dtype=bool)
         for f in range(4):
             cols = [FLEX[f], SIDE[f]] if HAS_SIDE[f] else [FLEX[f]]
+            exited = not contact[f] and elapsed[f] > 0.
+            if exited:
+                after[f] = stamp
+                evidence[cols] = 0.
+                authorized[cols] = False
             elapsed[f] = elapsed[f]+dt if contact[f] else 0.
             for c, k in enumerate(cols):
                 threshold = np.deg2rad(POLICY['flex_motion_deg' if c == 0 else 'side_motion_deg'])
                 if (base[k]-origin[k])*np.sign(proof_net[k]) < threshold*.5:
                     evidence[k] = 0.
-                if axis_own[k] and approach[f] >= POLICY['approach_width'] and not reset:
+                if axis_own[k] and approach[f] >= POLICY['approach_width'] and not reset and not exited:
                     evidence[k] = stamp+POLICY['evidence_lifetime_s']
                     proof_net[k] = np.deg2rad(net_deg[f,c])
                     origin[k] = base[k]-proof_net[k]
@@ -152,12 +157,12 @@ class FingerParticipation:
                 authorized[cols] = False
             if contact[f]:
                 release[cols] = False
-            blocked = reset or stamp < cooldown[f]
+            blocked = reset or (contact[f] and stamp < cooldown[f])
             confirmed = contact[f] and elapsed[f] >= POLICY['contact_confirm_s']-1e-9
             if confirmed and not blocked:
                 authorized[cols] |= evidence[cols] >= stamp
             if not contact[f] and not blocked:
-                release[cols] |= axis_own[cols]
+                release[cols] |= abs(fixed[cols]-base[cols]) > 1e-12
             if blocked:
                 reasons[f] = 'clock_reset' if reset else 'shape_jump_cooldown'
                 continue
@@ -170,7 +175,7 @@ class FingerParticipation:
                     hi[k] = min(self.upper[k], base[k]+self.radius[k], fixed[k]+budget[k])
                     participating[f] = True
                 elif not contact[f] and release[k]:
-                    budget[k] = self.radius[k]*min(dt/POLICY['transition_s'], 1.)
+                    budget[k] = self.radius[k]*min(dt/POLICY['release_s'], 1.)
                     offset = fixed[k]-base[k]
                     fixed[k] -= np.clip(offset, -budget[k], budget[k])
                     lo[k] = hi[k] = fixed[k]
@@ -179,7 +184,7 @@ class FingerParticipation:
             if participating[f]:
                 reasons[f] = 'confirmed_contact'
             elif not contact[f] and any(budget[cols]):
-                reasons[f] = 'own_motion_release'
+                reasons[f] = 'contact_exit_release'
             elif contact[f] and not confirmed:
                 reasons[f] = 'contact_confirmation'
         state = State(recent, correction, cooldown, after, evidence, origin, proof_net, authorized, release, elapsed)

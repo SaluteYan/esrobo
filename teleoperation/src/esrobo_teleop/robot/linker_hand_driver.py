@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import socket
 import time
+import math
 import threading
 from typing import Optional
 
@@ -110,6 +111,12 @@ class LinkerHandDriver:
     def __init__(self, cfg: HandConfig, udp_host: str = "127.0.0.1", udp_port: int = 15051,
                  active_sides: tuple[str, ...] = ("left", "right")):
         self._feedback_lock = threading.RLock()
+        import uuid
+        self._transport_session = uuid.uuid4().hex
+        self._transport_seq = 0
+        self._transport_fault = None
+        self._transport_context = None
+        self._transport_log = None
         self._geometry_feedback_time = {"left": None, "right": None}
         self._cfg = cfg
         self._mode = cfg.mode
@@ -213,6 +220,12 @@ class LinkerHandDriver:
             if not isinstance(message, dict):
                 continue
             side = message.get("side")
+            if side == 'left' and side in self._active_sides and message.get('transport_version') == 1:
+                if message.get('fault'):
+                    self._transport_fault = str(message['fault'])
+                source = message.get('sample_monotonic_s')
+                if not isinstance(source, (int, float)) or not math.isfinite(source) or source > time.monotonic():
+                    continue
             try:
                 values = np.asarray(message.get("position", []), dtype=np.float64).reshape(-1)
             except (TypeError, ValueError):
@@ -230,7 +243,8 @@ class LinkerHandDriver:
                 self._geometry_feedback_time[side] = (float(source_stamp)
                     if isinstance(source_stamp, (int, float)) else None)
                 self._feedback[side] = values
-                self._feedback_time[side] = time.monotonic()
+                self._feedback_time[side] = (float(source_stamp)
+                    if message.get('transport_version') == 1 else time.monotonic())
 
     def geometry_state(self, side: str, horizon: float, *, cover_valid_age=False):
         """Receive only; this never enables or commands the hand."""
@@ -314,6 +328,8 @@ class LinkerHandDriver:
     def _feedback_is_fresh(self) -> bool:
         self._poll_feedback()
         now = time.monotonic()
+        if self._transport_fault:
+            return False
         return all(
             self._feedback[side] is not None
             and self._feedback_time[side] is not None
@@ -330,6 +346,8 @@ class LinkerHandDriver:
     def _set_enabled_locked(self, enabled: bool) -> bool:
         if not enabled:
             self._enabled = False
+            if self._mode == 'udp' and 'left' in self._active_sides and self._model == 'L10':
+                self._send_transport_stop()
             return False
         if self._cfg.require_feedback_on_enable and not self._feedback_is_fresh():
             self._enabled = False
@@ -590,6 +608,25 @@ class LinkerHandDriver:
         return np.rint(out).astype(np.int64)
 
     # ------------------------------------------------------------- output
+    def _transport_meta(self, action):
+        from .hand_transport import make_log
+        now = time.monotonic()
+        self._transport_seq += 1
+        if self._transport_log is None:
+            self._transport_log = make_log('gateway')
+        context = self._transport_context or {}
+        return dict(version=1, action=action, session=self._transport_session,
+                    seq=self._transport_seq, issued_s=now,
+                    expires_s=min(now+.1, context.get('deadline_s', now+.1)) if action == 'target' else now+.1,
+                    velocity=float(self._cfg.max_velocity), step=int(self._cfg.max_step),
+                    command_seq=context.get('command_seq'), session_tag=context.get('session_tag'))
+
+    def _send_transport_stop(self):
+        meta = self._transport_meta('stop')
+        self._sock.sendto(json.dumps({'_hand_transport': meta}).encode(), self._udp_addr)
+        from .hand_transport import emit
+        emit(self._transport_log, 'gateway_stop', meta=meta)
+
     def _send_physical(self, left: np.ndarray, right: np.ndarray) -> None:
         left = np.clip(left, self._cfg.out_min, self._cfg.out_max).astype(np.int64).tolist()
         right_values = np.clip(right, self._cfg.out_min, self._cfg.out_max).astype(np.float64)
@@ -612,10 +649,17 @@ class LinkerHandDriver:
         right = np.rint(right_values).astype(np.int64).tolist()
         if self._mode == "udp":
             commands = {"left": left, "right": right}
-            payload = json.dumps(
-                {side: commands[side] for side in self._active_sides}
-            ).encode("utf-8")
+            message = {side: commands[side] for side in self._active_sides}
+            if 'left' in self._active_sides and self._model == 'L10':
+                meta = self._transport_meta('target')
+                if meta['expires_s'] <= time.monotonic():
+                    raise RuntimeError('hand target expired before gateway publication')
+                message['_hand_transport'] = meta
+            payload = json.dumps(message).encode('utf-8')
             self._sock.sendto(payload, self._udp_addr)
+            if '_hand_transport' in message:
+                from .hand_transport import emit
+                emit(self._transport_log, 'gateway_publish', meta=meta, position=left)
         elif self._mode == "ros2":
             commands = {"left": left, "right": right}
             for side in self._active_sides:
@@ -641,6 +685,8 @@ class LinkerHandDriver:
             raise ValueError("inactive hand side")
         with self._feedback_lock:
             self._poll_feedback_locked()
+            if self._transport_fault:
+                raise RuntimeError('left hand SDK fault: '+self._transport_fault)
             value, stamp = self._feedback[side], self._feedback_time[side]
             return {
                 "position_unit": None if value is None else value.tolist(),
@@ -728,6 +774,14 @@ class LinkerHandDriver:
             rclpy.spin_once(self._node, timeout_sec=0.001)
 
     def close(self) -> None:
+        if self._sock is not None and self._model == 'L10' and 'left' in self._active_sides:
+            try:
+                self._send_transport_stop()
+            except OSError as exc:
+                from .hand_transport import emit
+                emit(self._transport_log, 'stop_send_failed', reason=str(exc))
+        if self._transport_log is not None:
+            self._transport_log.close(timeout=1.)
         if self._sock is not None:
             self._sock.close()
         if getattr(self, "_feedback_sock", None) is not None:

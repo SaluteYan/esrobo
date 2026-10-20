@@ -544,6 +544,18 @@ class Gateway:
             return self.mode != 'HOLD_LATCHED'
 
     def _execute_traced(self, target, cancelled, context):
+        hand = getattr(self.backend, 'hand', None)
+        if not hasattr(hand, '_transport_context'):
+            hand = None
+        if hand is not None:
+            hand._transport_context = context if not target.get('hold') else None
+        try:
+            return self._execute_traced_inner(target, cancelled, context)
+        finally:
+            if hand is not None:
+                hand._transport_context = None
+
+    def _execute_traced_inner(self, target, cancelled, context):
         trace = self.motion_trace
         if trace is None or not trace.enabled:
             return self.backend.step(target, cancelled)
@@ -730,7 +742,8 @@ class Gateway:
                         raise RuntimeError(return_failure("hand-only recovery failed/cancelled", result))
             with self.lock:
                 active, target = self.mode == "ACTIVE", self.gate.target
-                trace_context = self._trace_target_context
+                trace_context = dict(self._trace_target_context or {})
+                trace_context['deadline_s'] = self.gate.target_deadline
             if self.mode == "WAITING_FOR_ACTIVE_TARGET":
                 self.backend.monitor_hold()
             if active:

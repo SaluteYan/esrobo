@@ -18,8 +18,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import socket
 import time
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+from esrobo_teleop.robot.hand_transport import PREFIX, validate, emit, make_log
+from std_msgs.msg import String
 
 import rclpy
 from rclpy.node import Node
@@ -32,8 +38,9 @@ class HandBridge(Node):
                  right_state_topic: str, side: str, feedback_only: bool = False):
         super().__init__("esrobo_hand_ros_bridge")
         self._feedback_only = feedback_only
+        self._transport_log = make_log("bridge")
         if not feedback_only:
-            self._pub_left = self.create_publisher(JointState, left_topic, 10)
+            self._pub_left = self.create_publisher(JointState, left_topic, 1)
             self._pub_right = self.create_publisher(JointState, right_topic, 10)
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -50,7 +57,7 @@ class HandBridge(Node):
         self._feedback_rate_started = time.monotonic()
         if "left" in self._active_sides:
             self.create_subscription(
-                JointState, left_state_topic, lambda msg: self._send_feedback("left", msg), 1
+                String, '/esrobo_left_hand_transport', self._send_left_feedback, 1
             )
         if "right" in self._active_sides:
             self.create_subscription(
@@ -64,24 +71,64 @@ class HandBridge(Node):
         rclpy.spin_once(self, timeout_sec=0.002)
         if self._feedback_only:
             return
-        try:
-            payload, _addr = self._sock.recvfrom(65535)
-        except socket.timeout:
-            return
-        except OSError:
-            return
-        try:
-            msg = json.loads(payload.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return
-        for side in self._active_sides:
-            values = msg.get(side)
-            if not isinstance(values, list) or len(values) == 0:
+        latest = None
+        # Bound receive work even under a flood, while servicing ROS each pass.
+        for _ in range(64):
+            try:
+                payload, _addr = self._sock.recvfrom(65535)
+            except OSError:
+                break
+            try:
+                msg = json.loads(payload.decode('utf-8'))
+                if not isinstance(msg, dict): continue
+                meta = msg.get('_hand_transport')
+                if 'left' in self._active_sides and (meta is not None or 'left' in msg):
+                    try:
+                        validate(meta, time.monotonic())
+                        values = msg.get('left', [])
+                        if meta['action'] == 'target' and (
+                                not isinstance(values, list) or len(values) != 10 or
+                                any(type(v) not in (int, float) or not math.isfinite(v)
+                                    or not 0 <= v <= 255 for v in values)):
+                            raise ValueError('invalid left hand positions')
+                        if latest is None or meta['issued_s'] >= latest[0]['issued_s']:
+                            if latest is not None:
+                                emit(self._transport_log, 'bridge_superseded', meta=latest[0],
+                                     replacement_seq=meta['seq'])
+                            latest = (meta, values if meta['action'] == 'target' else [], time.monotonic())
+                    except ValueError as exc:
+                        emit(self._transport_log, 'bridge_rejected', reason=str(exc))
+                if 'right' in self._active_sides:
+                    values = msg.get('right')
+                    if isinstance(values, list) and values:
+                        js = JointState()
+                        js.position = [float(v) for v in values]
+                        self._pub_right.publish(js)
+            except (ValueError, TypeError, UnicodeDecodeError):
                 continue
+        if latest is not None:
+            meta, values, received = latest
             js = JointState()
-            js.name = [f"{side}_joint{i}" for i in range(len(values))]
+            js.header.frame_id = PREFIX + json.dumps(meta, separators=(',', ':'))
             js.position = [float(v) for v in values]
-            (self._pub_left if side == "left" else self._pub_right).publish(js)
+            self._pub_left.publish(js)
+            emit(self._transport_log, 'bridge_publish', meta=meta, received_s=received,
+                 published_s=time.monotonic())
+
+    def _send_left_feedback(self, msg):
+        try:
+            state = json.loads(msg.data)
+            if state.get('version') != 1 or state.get('side') != 'left': return
+            stamps = state['frame_stamps']
+            valid = len(stamps) == 2 and all(isinstance(t, (float, int)) for t in stamps)
+            # Fault-only packets must still reach the gateway without feedback.
+            payload = dict(side='left', transport_version=1, position=state['position'],
+                           sample_monotonic_s=min(stamps) if valid else None,
+                           frame_stamps=stamps, frame_sequences=state['frame_sequences'],
+                           fault=state.get('fault'), sent=state.get('sent'))
+            self._sock.sendto(json.dumps(payload, allow_nan=False).encode(), self._feedback_addr)
+        except (KeyError, ValueError, TypeError):
+            return
 
     def _send_feedback(self, side: str, msg: JointState) -> None:
         now = time.monotonic()
@@ -100,6 +147,7 @@ class HandBridge(Node):
 
     def close(self) -> None:
         self._sock.close()
+        self._transport_log.close(timeout=1.)
 
 
 def main(argv=None) -> int:
