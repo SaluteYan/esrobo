@@ -9,16 +9,17 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from esrobo_teleop.robot.linker_hand_driver import ACTIVE_HAND_JOINTS
+from .hand_participation import FingerParticipation, POLICY as PARTICIPATION_POLICY
 
-VERSION = "left-urdf-10-v5"
+VERSION = "left-urdf-10-v7"
 POLICY = dict(pinch_start_width=1.1, pinch_ramp_width=.6,
               project_enter_m=.008, project_exit_m=.012, project_target_m=.002,
               project_transition_s=.080, clock_gap_s=.1,
-              release_thumb_transition=True,
+              release_thumb_transition=True, participation_thumb_transition_s=.080, fixed_finger_contact="posture_soft_vector_v1",
               flex_correction_deg=15., side_correction_deg=5.,
               direction_weights=(5.3, 3., 3.), open_direction_weights=(4., 1., 1.), plane_weight=.02,
               temporal_weight=.001, finger_regularization=.01,
-              huber_delta=.2, contact_weight=100., initial_contact_weight=10., opening_vector_weight=1., contact_tolerance_m=.002,
+              huber_delta=.2, contact_weight=100., initial_contact_weight=10., opening_vector_weight=.1, contact_tolerance_m=.002,
               damping=.001, max_updates=6, seed_grid=(7, 7, 5))
 FINGERS = ("thumb", "index", "middle", "ring", "pinky")
 TIPS = np.array([5, 10, 15, 20, 25])
@@ -34,7 +35,8 @@ def fingerprint(cfg):
     # Hash the geometry and the exact control policy, not machine-specific paths.
     from dataclasses import asdict
     model = Path(cfg.ik.urdf_path)
-    value = dict(version=VERSION, policy=POLICY, hand=asdict(cfg.hand), manual=MANUAL_DEG,
+    value = dict(version=VERSION, policy=POLICY, participation_policy=PARTICIPATION_POLICY,
+                 participation_source=hashlib.sha256(Path(__file__).with_name("hand_participation.py").read_bytes()).hexdigest(), hand=asdict(cfg.hand), manual=MANUAL_DEG,
                  urdf=hashlib.sha256(model.read_bytes()).hexdigest(),
                  solver_kernel=hashlib.sha256(Path(__file__).with_name("_hand_native.cpp").read_bytes()).hexdigest())
     for finger in FINGERS:
@@ -267,7 +269,13 @@ class HandRetargeter:
         self.shape_filter = HandShapeFilter(cfg.hand, POLICY['clock_gap_s'])
         self.model = HandModel(cfg)
         self.previous = self.model.neutral.copy()
+        self.participation = FingerParticipation(self.model.lower, self.model.upper, self.model.width,
+            flex_deg=POLICY["flex_correction_deg"], side_deg=POLICY["side_correction_deg"],
+            max_gap_s=POLICY["clock_gap_s"])
         self.contact = np.zeros(4, dtype=bool)
+        self.permission_mask = np.zeros(4, dtype=bool)
+        self.permission_anchor = self.previous[:3].copy()
+        self.permission_progress = 1.
         self.projection = np.zeros(4)
         self.source_time = None
         self._pending = None
@@ -304,10 +312,15 @@ class HandRetargeter:
             self._native = load_model(m, self.rest_points, self.thumb_seed_angles, POLICY)
         if use_native and self._native is None:
             raise RuntimeError('left hand native kernel is missing; run laptop_teleop/scripts/build_hand_native.sh')
+        if self._native is not None:
+            from .hand_native import _MODULE
+            self.participation.native = _MODULE.participate
         self.backend = 'native_cpp' if self._native is not None else 'python_reference'
 
     def direct_fingers(self, target):
         """Signed four-finger geometric seed; URDF correction follows for pinch."""
+        if self._native is not None:
+            return self._native.direct_fingers(target, self.previous)
         m = self.model
         q = self.previous.copy()
         for k, base, axis, idx, neutral, coefficients in self.finger_geometry:
@@ -360,7 +373,8 @@ class HandRetargeter:
         """Publish acknowledgement; stale acknowledgements cannot commit state."""
         if self._pending is None or self._pending[0] != candidate_id:
             return False
-        _, self.previous, self.contact, self.projection, self.source_time, shape = self._pending
+        _, self.previous, self.contact, self.projection, self.source_time, shape, participation, self.permission_mask, self.permission_anchor, self.permission_progress = self._pending
+        self.participation.commit(participation)
         if shape is not None:
             self.shape_filter.commit(shape)
         self._pending = None
@@ -450,34 +464,35 @@ class HandRetargeter:
         gates = np.clip((POLICY['pinch_start_width']-distance/m.width)/POLICY['pinch_ramp_width'], 0., 1.)
         gates = np.maximum(gates*gates*(3-2*gates), projection)
         active = np.flatnonzero(contact | (projection > 0.))
-        strict = contact[active]
-        base = self.direct_fingers(target)
+        participation_started = time.monotonic()
+        geometric_base = self.direct_fingers(target)
+        raw_base = geometric_base if synthetic else self.direct_fingers(raw_target)
+        permission = self.participation.propose(geometric_base, raw_base, target, stamp, contact)
+        base = permission.fixed
+        moving_indices = np.flatnonzero(permission.upper[3:]-permission.lower[3:] > 1e-12)+3
+        moving = np.array([f for f in active if any(k in moving_indices
+            for k in ([5] if f == 1 else [[3,4],[],[6,7],[8,9]][f]))], dtype=int)
+        constrained_contact = contact & np.asarray(permission.diagnostic["eligible"])
+        strict = constrained_contact[active]
+        participation_ms = (time.monotonic()-participation_started)*1000
         target_plane, _ = self._plane(desired, np.zeros((3, 3, 3)))
         plane_confidence = float(np.linalg.norm(target_plane))
         weights = np.array(POLICY['open_direction_weights'])
         weights += max(gates)*(np.array(POLICY['direction_weights'])-weights)
         if self._native is not None:
-            packed = self._native.solve(base, self.previous, desired, pair, contact,
-                                        projection, gates, weights, deadline-time.monotonic())
+            packed = self._native.solve(base, self.previous, desired, pair, constrained_contact,
+                                        projection, gates, weights, permission.lower, permission.upper, geometric_base,
+                                        deadline-time.monotonic())
             q, points, solved_directions = packed['joints'], packed['points'], packed['directions']
             n, evals = packed['dof'], packed['evaluations']
             updates, attempts = packed['updates'], packed['attempts']
             check()
         else:
-            indices = [0, 1, 2]
-            for f in active:
-                indices += ([5] if f == 1 else [[3, 4], [], [6, 7], [8, 9]][f])
-            indices = np.asarray(indices)
-            lower, upper = m.lower[indices].copy(), m.upper[indices].copy()
-            for col, k in enumerate(indices[3:], 3):
-                radius = np.deg2rad(POLICY['flex_correction_deg'] if k in (4, 5, 7, 9) else POLICY['side_correction_deg'])
-                finger = next(f for f in active if k in ([5] if f == 1 else [[3,4],[],[6,7],[8,9]][f]))
-                if not contact[finger]: radius *= projection[finger]
-                lower[col] = max(lower[col], base[k]-radius)
-                upper[col] = min(upper[col], base[k]+radius)
+            indices = np.r_[np.arange(3), moving_indices]
+            lower, upper = permission.lower[indices], permission.upper[indices]
             n = len(indices)
             positions = {int(k): i for i, k in enumerate(indices)}
-            local_columns = [(positions.get((3, -1, 6, 8)[f]), positions[(4, 5, 7, 9)[f]]) for f in active]
+            local_columns = [(positions.get((3, -1, 6, 8)[f]), positions.get((4, 5, 7, 9)[f])) for f in active]
             # Non-participating four fingers are evaluated only once per frame.
             fixed_fingers, _ = m.forward_fingers(self._finger_angles(base))
             plane_scale = np.sqrt(POLICY['plane_weight'])*plane_confidence
@@ -485,7 +500,7 @@ class HandRetargeter:
             previous = self.previous[indices]
             regularization = np.full(n, POLICY['temporal_weight'])
             regularization[3:] = POLICY['finger_regularization']
-            reference = previous.copy(); reference[3:] = base[indices[3:]]
+            reference = previous.copy(); reference[3:] = geometric_base[indices[3:]]
             evals = 0
 
             def evaluate(x):
@@ -513,18 +528,22 @@ class HandRetargeter:
                 if len(active):
                     angles = self._finger_angles(base)
                     for f, (side_col, flex_col) in zip(active, local_columns):
-                        angles[f, 1] = x[flex_col]
+                        if flex_col is not None:
+                            angles[f, 1] = x[flex_col]
                         if side_col is not None:
                             angles[f, 0] = x[side_col]
-                    fp, fj = m.forward_fingers(angles, active)
-                    finger_points[active] = fp
+                    finger_jac = {}
+                    if len(moving):
+                        fp, fj = m.forward_fingers(angles, moving)
+                        finger_points[moving] = fp
+                        finger_jac = dict(zip(moving, fj))
                     for a, (f, cols) in enumerate(zip(active, local_columns)):
-                        delta = fp[a, 3]-thumb[3]-pair[f]
+                        delta = finger_points[f, 3]-thumb[3]-pair[f]
                         length = np.linalg.norm(delta); errors[a] = length
                         dj = -full_jt[3].copy()
                         for local, col in enumerate(cols):
                             if col is not None:
-                                dj[:, col] += fj[a, 3, :, local]
+                                dj[:, col] += finger_jac[f][3, :, local]
                         pair_jacobian[f] = dj
                         if not strict[a]:
                             continue
@@ -545,7 +564,7 @@ class HandRetargeter:
                         weight = np.sqrt(POLICY['contact_weight']*gates[f])/m.width
                         restoration.append(v*weight); restoration_jac.append(jv*weight)
                         residual.append(v*weight); jac.append(jv*weight)
-                soft = np.flatnonzero((~contact) & (gates > 1e-8))
+                soft = np.flatnonzero((~constrained_contact) & (gates > 1e-8))
                 if len(soft):
                     weight = np.sqrt(POLICY['opening_vector_weight'])*gates[soft]/m.width
                     delta = tips[soft]-thumb[3]-pair[soft]
@@ -666,7 +685,10 @@ class HandRetargeter:
             points[0] = points[[7, 12, 17, 22]].mean(axis=0)
             solved_directions = current[5]
         release_blend = float(max(projection)) if not contact.any() else 0.
-        if release_blend > 0. and POLICY['release_thumb_transition']:
+        release_applied = (release_blend > 0. and POLICY['release_thumb_transition']
+                           and self.permission_progress >= 1.
+                           and np.array_equal(constrained_contact, self.permission_mask))
+        if release_applied:
             # No contact remains constrained. Fade in the unconstrained thumb
             # solution across the existing 80 ms release, rather than jumping
             # to it when the final contact bit clears. Blend all three thumb
@@ -675,6 +697,22 @@ class HandRetargeter:
             q[:3] = self.previous[:3]+(0. if reset else 1.-release_blend)*(q[:3]-self.previous[:3])
             points, _ = m.forward(q)
             solved_directions = self._directions(points[2:6])
+        # Permission is a discrete decision; changing its contact priority must
+        # not instantly replace the accepted thumb posture. Interpolate the
+        # three bounded joints together from the accepted anchor for 80 ms.
+        # This intentionally permits a residual contact gap during transition.
+        permission_changed = not np.array_equal(constrained_contact, self.permission_mask)
+        permission_anchor = self.previous[:3].copy() if permission_changed else self.permission_anchor
+        permission_progress = 0. if permission_changed else self.permission_progress
+        if reset and permission_progress < 1.:
+            permission_anchor, permission_progress = self.previous[:3].copy(), 0.
+        permission_dt = 0. if reset or self.source_time is None else stamp-self.source_time
+        permission_progress = min(1., permission_progress+permission_dt/POLICY['participation_thumb_transition_s'])
+        if permission_progress < 1.:
+            q = q.copy()
+            q[:3] = permission_anchor+(q[:3]-permission_anchor)*permission_progress
+            points, _ = self._native.landmarks(q) if self._native is not None else m.forward(q)
+            solved_directions = self._directions(points[2:6])
         rebuilt = self.reconstruct_target(target, q, points)
         original_pair = target[TIPS[1:]]-target[5]
         contact_error = (points[TIPS[1:]]-points[5])-pair
@@ -682,26 +720,32 @@ class HandRetargeter:
         errors = np.linalg.norm(contact_error, axis=1)*1000
         diagnostic = dict(solve_ms=(time.monotonic()-started)*1000,
             input_filter=shape_diagnostic,
-            release_orientation_blend=release_blend,
-            solver_method='bounded_vector_contact_v4', compute_backend=self.backend, nonlinear_dof=n, direction_weights=weights.tolist(),
+            release_orientation_blend=release_blend, release_orientation_applied=release_applied,
+            participation_transition_progress=permission_progress, participation_transition_changed=permission_changed,
+            solver_method='bounded_vector_contact_v5', compute_backend=self.backend, nonlinear_dof=n, direction_weights=weights.tolist(),
             evaluations=evals, updates=updates, step_attempts=attempts,
             contact_active=contact.tolist(), projection_fraction=projection.tolist(),
             bend_plane_confidence=plane_confidence,
-            coordination_fingers=active.tolist(), clock_reset=reset,
+            coordination_fingers=moving.tolist(), contact_goal_fingers=active.tolist(), clock_reset=reset,
+            participation=permission.diagnostic, participation_ms=participation_ms,
             human_gap_mm=(human_distance*1000).tolist(), projected_gap_mm=(np.linalg.norm(pair, axis=1)*1000).tolist(),
             model_gap_mm=(np.linalg.norm(points[TIPS[1:]]-points[5], axis=1)*1000).tolist(),
-            projected_error_mm=errors.tolist(), contact_satisfied=bool(np.all(errors[active[strict]]<=2.001)),
+            projected_error_mm=errors.tolist(), contact_satisfied=bool(np.all(errors[contact]<=2.001)),
+            constrained_contact=constrained_contact.tolist(),
             thumb_direction_error_deg=direction_error.tolist(),
-            correction_deg=np.degrees(q-base).tolist(), geometric_seed_rad=base.tolist(),
+            correction_deg=np.degrees(q-geometric_base).tolist(), geometric_seed_rad=geometric_base.tolist(),
             pinch_blend=float(max(gates)),
             nearest_pinch_error_mm=float(np.linalg.norm((points[TIPS[1:]]-points[5])-original_pair, axis=1)[int(np.argmin(distance))]*1000),
             pinch_error_mm=(np.linalg.norm((points[TIPS[1:]]-points[5])-original_pair, axis=1)*1000).tolist(),
             tip_error_mm=(np.linalg.norm(points[TIPS]-target[TIPS], axis=1)*1000).tolist(),
             structural_tip_error_mm=(np.linalg.norm(points[TIPS]-rebuilt[TIPS], axis=1)*1000).tolist(),
             limited_axes=[m.names[i] for i in range(10) if min(q[i]-m.lower[i],m.upper[i]-q[i])<1e-3])
+        permission.diagnostic['actual_correction_change_deg'] = np.degrees(
+            (q-geometric_base)-permission.state.correction).tolist()
+        permission.diagnostic['actual_correction_change_deg'][:3] = [0., 0., 0.]
         check()
         self._serial += 1
-        self._pending = (self._serial, q.copy(), contact.copy(), projection.copy(), stamp, shape)
+        self._pending = (self._serial, q.copy(), contact.copy(), projection.copy(), stamp, shape, permission.solved(q, geometric_base), constrained_contact.copy(), permission_anchor.copy(), permission_progress)
         result = dict(joints=q.tolist(), mapping_version=VERSION, mapping_fingerprint=m.digest,
                       diagnostics=diagnostic, target_points=target.tolist(), reconstructed_points=rebuilt.tolist(),
                       solved_points=points.tolist(), candidate_id=self._serial)

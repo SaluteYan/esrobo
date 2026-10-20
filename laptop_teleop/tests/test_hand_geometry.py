@@ -11,7 +11,13 @@ from esrobo_laptop.hand_retarget import HandRetargeter, TIPS
 def solver(request):
     result = HandRetargeter(read_robot_config(read_settings(ROOT/'config/laptop.yaml')), use_native=request.param=='native_cpp')
     assert result.backend == request.param
-    return result
+    try:
+        yield result
+    finally:
+        # Explicit-permission fixtures install a closure referencing the solver.
+        # Break it during teardown, not in a later transport timing test's GC.
+        if 'propose' in vars(result.participation):
+            del result.participation.propose
 
 
 def test_exact_fk_jacobian_includes_passive_thumb_and_fingers(solver):
@@ -191,7 +197,7 @@ def test_timeout_during_fk_does_not_commit_contact_or_warm_start(solver, monkeyp
         monkeypatch.setattr(solver.model, 'forward_fingers', fail)
     else:
         from types import SimpleNamespace
-        solver._native = SimpleNamespace(solve=fail)
+        solver._native = SimpleNamespace(solve=fail, direct_fingers=solver._native.direct_fingers)
     with pytest.raises(TimeoutError):
         solver.solve(None, target=target, budget_s=1.)
     np.testing.assert_array_equal(solver.previous, previous)
@@ -302,7 +308,34 @@ def test_publish_ack_only_commits_current_candidate(solver):
     assert solver.source_time == 1.02
 
 
-def test_contact_corrections_are_limited_and_all_contacts_participate(solver):
+def authorize_solver_bounds(solver):
+    """Numerical-kernel fixture: explicit permission, not optical intent detection.
+
+    Production permission and zero-motion retention are tested independently in
+    test_hand_participation. These tests still exercise the coupled solver when
+    all involved joints are explicitly authorized.
+    """
+    from dataclasses import replace
+    propose = solver.participation.propose
+    def authorized(base, raw, points, stamp, contact):
+        candidate = propose(base, raw, points, stamp, contact)
+        lo, hi = candidate.lower.copy(), candidate.upper.copy()
+        for f in np.flatnonzero(contact):
+            cols = [5] if f == 1 else [[3,4], [], [6,7], [8,9]][f]
+            lo[cols] = np.maximum(solver.model.lower[cols], base[cols]-solver.participation.radius[cols])
+            hi[cols] = np.minimum(solver.model.upper[cols], base[cols]+solver.participation.radius[cols])
+        candidate.diagnostic['eligible'] = contact.tolist()
+        # This fixture starts after the permission transition; transition timing
+        # and failed-publication behavior have separate end-to-end tests.
+        solver.permission_mask = contact.copy()
+        solver.permission_progress = 1.
+        return replace(candidate, lower=lo, upper=hi)
+    solver.participation.propose = authorized
+
+
+@pytest.mark.parametrize('authorized', [False, True])
+def test_all_contact_goals_are_checked_but_only_authorized_fingers_move(solver, authorized):
+    if authorized: authorize_solver_bounds(solver)
     q = solver.model.upper*.6
     target, _ = solver.model.forward(q)
     # An intentionally impossible multi-finger contact must remain bounded.
@@ -310,8 +343,11 @@ def test_contact_corrections_are_limited_and_all_contacts_participate(solver):
         target[tip] = target[5]+[.001, .001, 0.]
     r = solver.solve(None, target=target, source_time=1., budget_s=1.)
     d = r['diagnostics'];correction = np.array(d['correction_deg'])
-    assert d['coordination_fingers'] == [0, 1, 2, 3]
-    assert d['nonlinear_dof'] == 10
+    assert d['contact_goal_fingers'] == [0, 1, 2, 3]
+    assert d['coordination_fingers'] == ([0, 1, 2, 3] if authorized else [])
+    assert d['nonlinear_dof'] == (10 if authorized else 3)
+    assert d['contact_satisfied'] == bool(np.all(np.array(d['projected_error_mm']) <= 2.001))
+    if not authorized: np.testing.assert_array_equal(correction[3:], np.zeros(7))
     assert max(abs(correction[[4, 5, 7, 9]])) <= 15.000001
     assert max(abs(correction[[3, 6, 8]])) <= 5.000001
     assert np.isfinite(r['joints']).all()
@@ -320,6 +356,7 @@ def test_contact_corrections_are_limited_and_all_contacts_participate(solver):
 
 
 def test_coupled_contact_step_improves_posture_without_breaking_contact(solver):
+    authorize_solver_bounds(solver)
     import json
     from pathlib import Path
     sample = json.loads((Path(__file__).parent/'fixtures/hand_contact/middle_boundary.json').read_text())
@@ -388,7 +425,8 @@ def test_slow_contact_transition_does_not_introduce_thumb_jump(solver, finger, t
     assert blends[-1] == (1. if entering else 0.)
     assert np.max(abs(np.degrees(np.diff(outputs,axis=0))[20:,:3])) < 1.
     if not entering:
-        # Contact corrections must disappear. The geometric baseline now uses
+        # This opening-only fixture never grants participation, so corrections stay zero.
+        # The geometric baseline uses
         # the filtered optical shape, with a bounded residual deadband offset.
         filtered = np.asarray(r['target_points'])
         np.testing.assert_allclose(outputs[-1][3:], solver.direct_fingers(filtered)[3:], atol=1e-12)
@@ -419,5 +457,6 @@ def test_native_solver_matches_reference_and_deadline_keeps_state():
     before=native.previous.copy()
     with pytest.raises(TimeoutError):
         native._native.solve(before,before,np.tile([0.,0.,1.],(3,1)),np.zeros((4,3)),
-                             np.zeros(4),np.zeros(4),np.zeros(4),np.ones(3),-1.)
+                             np.zeros(4),np.zeros(4),np.zeros(4),np.ones(3),
+                             native.model.lower,native.model.upper,before,-1.)
     np.testing.assert_array_equal(before,native.previous)

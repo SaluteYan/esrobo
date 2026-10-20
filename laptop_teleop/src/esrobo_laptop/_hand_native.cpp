@@ -169,11 +169,150 @@ static Vec plane(const std::array<Vec, 3> &d, const std::array<J, 3> *jd, J *jp)
         }
     return mul(c, 1 / l);
 }
+
+// Pure candidate construction. Python owns/commits every history object.
+static py::array_t<double> array(const std::vector<double> &v) {
+    py::array_t<double> out(v.size());
+    std::copy(v.begin(),v.end(),out.mutable_data()); return out;
+}
+template <size_t N> static py::array_t<double> array(const std::array<double,N> &v) {
+    return array(std::vector<double>(v.begin(),v.end()));
+}
+static py::object participate(py::object gate, py::handle qb, py::handle qr,
+                              py::handle pp, double stamp, py::handle cc, py::dict policy) {
+    Q base=as_q(qb), raw=as_q(qr), low=as_q(gate.attr("lower")), high=as_q(gate.attr("upper")),
+      radius=as_q(gate.attr("radius")), correction{};
+    auto points=doubles(pp,78),contact=doubles(cc,4);
+    const double width=py::cast<double>(gate.attr("width"));
+    auto val=[&](const char *k){return py::cast<double>(policy[k]);};
+    struct Sample { double t; Q raw,base; std::vector<double> tip,toward; py::object record; };
+    std::vector<Sample> history;
+    auto prev=gate.attr("state");
+    std::array<double,4> cooldown{},after{},elapsed{};after.fill(-INFINITY);
+    Q evidence{},proof_origin{},proof_net{};std::array<bool,10> authorized{},release{},axis_own{};
+    if (!prev.is_none()) {
+        correction=as_q(prev.attr("correction"));
+        evidence=as_q(prev.attr("evidence_until"));
+        proof_origin=as_q(prev.attr("evidence_origin"));proof_net=as_q(prev.attr("evidence_net"));
+        auto au=doubles(prev.attr("authorized_axes"),10),re=doubles(prev.attr("release_axes"),10),el=doubles(prev.attr("contact_elapsed"),4);
+        for(int j=0;j<10;j++){authorized[j]=au[j]!=0;release[j]=re[j]!=0;}
+        for(int f=0;f<4;f++)elapsed[f]=el[f];
+        auto co=py::array_t<double>::ensure(prev.attr("cooldown_until"));
+        auto af=py::array_t<double>::ensure(prev.attr("evidence_after"));
+        for(int f=0;f<4;f++){cooldown[f]=co.data()[f];after[f]=af.data()[f];}
+        for(auto item:py::cast<py::tuple>(prev.attr("history"))) {
+            py::object rec=py::reinterpret_borrow<py::object>(item);
+            history.push_back({py::cast<double>(rec.attr("stamp")),as_q(rec.attr("raw")),as_q(rec.attr("base")),
+                doubles(rec.attr("relative_tip"),12),doubles(rec.attr("toward_thumb"),12),rec});
+        }
+    }
+    double dt=history.empty()?0:stamp-history.back().t;
+    if(!history.empty() && dt<=0)throw py::value_error("non-advancing finger participation time");
+    bool reset=dt>py::cast<double>(gate.attr("max_gap"));
+    if(reset){history.clear();after.fill(stamp);evidence.fill(0.);elapsed.fill(0.);dt=0;}
+    std::vector<double> tip(12),toward(12);
+    for(int f=0;f<4;f++){
+        int start=7+5*f;Vec v{};
+        for(int k=0;k<3;k++) {tip[3*f+k]=points[3*(start+3)+k]-points[3*start+k];v[k]=points[15+k]-points[3*(start+3)+k];}
+        double n=std::max(norm(v),1e-12);for(int k=0;k<3;k++)toward[3*f+k]=v[k]/n;
+    }
+    std::vector<Sample> recent;
+    for(const auto &v:history)if(stamp-v.t<=val("window_s")+1e-9)recent.push_back(v);
+    constexpr int flex[4]={4,5,7,9},side[4]={3,5,6,8};
+    const double rad=3.14159265358979323846/180;
+    std::array<bool,4> jump{},own{},eligible{};
+    for(const auto &v:recent)if(stamp-v.t<=val("jump_window_s")+1e-9)
+        for(int f=0;f<4;f++)if(std::abs(v.raw[flex[f]]-raw[flex[f]])>val("jump_flex_deg")*rad ||
+           (f!=1 && std::abs(v.raw[side[f]]-raw[side[f]])>val("jump_side_deg")*rad))jump[f]=true;
+    for(int f=0;f<4;f++)if(jump[f])cooldown[f]=stamp+val("cooldown_s");
+    auto module=py::module_::import("esrobo_laptop.hand_participation");
+    auto tip_array=array(tip),toward_array=array(toward);tip_array.resize({4,3});toward_array.resize({4,3});
+    auto sample=module.attr("Sample")(stamp,array(raw),array(base),tip_array,toward_array);
+    recent.push_back({stamp,raw,base,tip,toward,sample});
+    if(recent.size()>size_t(val("history_capacity")))recent.erase(recent.begin(),recent.end()-int(val("history_capacity")));
+    std::array<double,4> approach{},coherence{},remaining{};std::vector<double> net_deg(8);
+    std::array<std::string,4> reasons;reasons.fill("insufficient_history");
+    for(int f=0;f<4;f++){
+        remaining[f]=std::max(cooldown[f]-stamp,0.);
+        std::vector<const Sample*> samples;
+        for(const auto &v:recent)if(v.t>=after[f])samples.push_back(&v);
+        if(samples.size()<size_t(val("minimum_samples")) || stamp-samples.front()->t<val("minimum_span_s")-1e-9)continue;
+        int cols[2]={flex[f],side[f]};
+        for(int c=0;c<(f==1?1:2);c++){
+            int j=cols[c];double net=base[j]-samples.front()->base[j],travel=0;
+            for(size_t i=1;i<samples.size();i++)travel+=std::abs(samples[i]->base[j]-samples[i-1]->base[j]);
+            double ratio=std::abs(net)/std::max(travel,1e-12);net_deg[2*f+c]=net/rad;
+            coherence[f]=std::max(coherence[f],ratio);
+            axis_own[j]=std::abs(net)>=val(c==0?"flex_motion_deg":"side_motion_deg")*rad && ratio>=val("coherence");
+            own[f]=own[f] || axis_own[j];
+        }
+        for(int k=0;k<3;k++)approach[f]+=(tip[3*f+k]-samples.front()->tip[3*f+k])*samples.front()->toward[3*f+k]/width;
+        reasons[f]=own[f]?"own_motion":"weak_or_inconsistent_motion";
+    }
+    Q fixed{},lo{},hi{},budget{};
+    for(int j=0;j<10;j++){correction[j]=std::clamp(correction[j],-radius[j],radius[j]);fixed[j]=lo[j]=hi[j]=std::clamp(base[j]+correction[j],low[j],high[j]);}
+    for(int j=0;j<3;j++){lo[j]=low[j];hi[j]=high[j];}
+    for(int f=0;f<4;f++){
+        int cols[2]={flex[f],side[f]}, count=f==1?1:2;
+        elapsed[f]=contact[f]?elapsed[f]+dt:0.;
+        for(int c=0;c<count;c++){
+            int j=cols[c];
+            double sign=(proof_net[j]>0)-(proof_net[j]<0);
+            if((base[j]-proof_origin[j])*sign<val(c==0?"flex_motion_deg":"side_motion_deg")*rad*.5)evidence[j]=0.;
+            if(axis_own[j] && approach[f]>=val("approach_width") && !reset){
+                evidence[j]=stamp+val("evidence_lifetime_s");proof_net[j]=net_deg[2*f+c]*rad;proof_origin[j]=base[j]-proof_net[j];
+            }
+            if(!contact[f])authorized[j]=false;
+            else release[j]=false;
+        }
+        bool blocked=reset || stamp<cooldown[f];
+        bool confirmed=contact[f] && elapsed[f]>=val("contact_confirm_s")-1e-9;
+        if(confirmed && !blocked)for(int c=0;c<count;c++)authorized[cols[c]]=authorized[cols[c]] || evidence[cols[c]]>=stamp;
+        if(!contact[f] && !blocked)for(int c=0;c<count;c++)release[cols[c]]=release[cols[c]] || axis_own[cols[c]];
+        if(blocked){reasons[f]=reset?"clock_reset":"shape_jump_cooldown";continue;}
+        bool released=false;
+        for(int c=0;c<count;c++){
+            int j=cols[c];
+            if(confirmed && authorized[j]){
+                budget[j]=radius[j]*std::min(dt/val("transition_s"),1.);
+                lo[j]=std::max({low[j],base[j]-radius[j],fixed[j]-budget[j]});
+                hi[j]=std::min({high[j],base[j]+radius[j],fixed[j]+budget[j]});
+                eligible[f]=true;
+            }else if(!contact[f] && release[j]){
+                budget[j]=radius[j]*std::min(dt/val("transition_s"),1.);
+                fixed[j]-=std::clamp(fixed[j]-base[j],-budget[j],budget[j]);lo[j]=hi[j]=fixed[j];
+                if(std::abs(fixed[j]-base[j])<1e-12)release[j]=false;
+                released=released || budget[j]>0;
+            }
+        }
+        if(eligible[f])reasons[f]="confirmed_contact";
+        else if(!contact[f] && released)reasons[f]="own_motion_release";
+        else if(contact[f] && !confirmed)reasons[f]="contact_confirmation";
+    }
+    py::tuple hist(recent.size());for(size_t i=0;i<recent.size();i++)hist[i]=recent[i].record;
+    py::array_t<bool> auth_array(10),release_array(10);
+    for(int j=0;j<10;j++){auth_array.mutable_data()[j]=authorized[j];release_array.mutable_data()[j]=release[j];}
+    auto state=module.attr("State")(hist,array(correction),array(cooldown),array(after),array(evidence),array(proof_origin),array(proof_net),auth_array,release_array,array(elapsed));
+    py::dict diagnostic;
+    diagnostic["eligible"]=eligible;diagnostic["reason"]=reasons;diagnostic["own_motion"]=own;
+    diagnostic["authorized_axes"]=authorized;diagnostic["axis_own_motion"]=axis_own;
+    diagnostic["contact_elapsed_s"]=elapsed;
+    Q evidence_remaining{};for(int j=0;j<10;j++)evidence_remaining[j]=std::max(evidence[j]-stamp,0.);
+    diagnostic["evidence_remaining_s"]=evidence_remaining;
+    py::list nets;for(int f=0;f<4;f++)nets.append(std::array<double,2>{net_deg[2*f],net_deg[2*f+1]});
+    diagnostic["net_motion_deg"]=nets;diagnostic["coherence"]=coherence;diagnostic["approach_width"]=approach;
+    diagnostic["shape_jump"]=jump;diagnostic["cooldown_remaining_s"]=remaining;diagnostic["clock_reset"]=reset;
+    Q correction_deg{},budget_deg{};for(int j=0;j<10;j++){correction_deg[j]=correction[j]/rad;budget_deg[j]=budget[j]/rad;}
+    diagnostic["retained_correction_deg"]=correction_deg;diagnostic["correction_budget_deg"]=budget_deg;
+    return module.attr("Candidate")(state,array(fixed),array(lo),array(hi),diagnostic);
+}
 class Model {
     std::array<Joint, 20> joints;
     std::array<Vec, 5> tips;
     std::array<std::array<int, 4>, 4> finger_ids;
     Q lower, upper, neutral;
+    std::array<std::array<Vec,3>,4> direct_neutral;
+    std::array<Vec,4> direct_coefficients;
     std::array<Vec, 26> rest;
     double width;
     Policy policy;
@@ -243,6 +382,40 @@ class Model {
                   py::cast<double>(p["plane_weight"]),
                   py::cast<double>(p["damping"]),
                   py::cast<int>(p["max_updates"])};
+        Q zero{};
+        for(int f=0;f<4;f++){
+            int root=finger_ids[f][f==1?1:0];auto z=finger(zero,f);const Mat &basis=joints[root].rot;
+            for(int b=0;b<3;b++){
+                Vec v=sub(z.p[b+1],z.p[b]);
+                for(int k=0;k<3;k++){direct_neutral[f][b][k]=0;for(int j=0;j<3;j++)direct_neutral[f][b][k]+=v[j]*basis[j*3+k];}
+            }
+            direct_coefficients[f]={1.,1.+joints[finger_ids[f][2]].ratio,1.+joints[finger_ids[f][2]].ratio+joints[finger_ids[f][3]].ratio};
+        }
+
+    }
+
+    py::array_t<double> direct_fingers(py::handle pp, py::handle previous) const {
+        auto p=doubles(pp,78);Q q=as_q(previous);
+        for(int f=0;f<4;f++){
+            int pitch=(f==0?4:f==1?5:f==2?7:9),root=finger_ids[f][f==1?1:0];
+            const Mat &basis=joints[root].rot;std::array<Vec,3> bones{};
+            const auto &neutral_bones=direct_neutral[f];
+            auto rowmul=[](Vec v,const Mat &r){Vec out{};for(int k=0;k<3;k++)for(int j=0;j<3;j++)out[k]+=v[j]*r[j*3+k];return out;};
+            for(int b=0;b<3;b++){
+                int start=7+5*f+b;Vec v{};for(int k=0;k<3;k++)v[k]=p[3*(start+1)+k]-p[3*start+k];
+                bones[b]=rowmul(v,basis);
+            }
+            if(f!=1){Vec axis=joints[root].axis;double sign=axis[0]>0?1:axis[0]<0?-1:0;
+                double roll=std::atan2(-sign*bones[0][1],bones[0][2])-std::atan2(-sign*neutral_bones[0][1],neutral_bones[0][2]);
+                q[pitch-1]=std::clamp(roll,lower[pitch-1],upper[pitch-1]);Mat r=rotation(axis,q[pitch-1]);
+                for(auto &bone:bones)bone=rowmul(bone,r);
+            }
+            const Vec &coefficients=direct_coefficients[f];
+            Vec angles{};for(int b=0;b<3;b++)angles[b]=std::atan2(bones[b][0],bones[b][2])-std::atan2(neutral_bones[b][0],neutral_bones[b][2]);
+            double pi2=2*3.14159265358979323846;for(int b=0;b<3;b++)angles[b]+=pi2*std::nearbyint((coefficients[b]*angles[0]-angles[b])/pi2);
+            q[pitch]=std::clamp(dot(coefficients,angles)/dot(coefficients,coefficients),lower[pitch],upper[pitch]);
+        }
+        return array(q);
     }
     Chain chain(const Q &q, const std::vector<int> &ids, int finger) const {
         std::array<Vec, 5> origins{}, axes{};
@@ -327,14 +500,16 @@ class Model {
         return py::make_tuple(out, jac);
     }
     py::dict solve(py::handle bq, py::handle pq, py::handle dd, py::handle pp, py::handle cc,
-                   py::handle blend, py::handle gg, py::handle ww, double seconds) const {
-        Q base = as_q(bq), previous = as_q(pq);
+                   py::handle blend, py::handle gg, py::handle ww, py::handle fl,
+                   py::handle fu, py::handle geometric, double seconds) const {
+        Q base = as_q(bq), previous = as_q(pq), bounds_lo = as_q(fl),
+          bounds_hi = as_q(fu), reference = as_q(geometric);
         auto dv = doubles(dd, 9), pv = doubles(pp, 12), cv = doubles(cc, 4), pr = doubles(blend, 4),
              gates = doubles(gg, 4), weights = doubles(ww, 3);
         std::array<Vec, 3> desired{};
         std::array<Vec, 4> pair{};
         std::array<bool, 4> contact{};
-        std::vector<int> active, indices = {0, 1, 2};
+        std::vector<int> active, moving, indices = {0, 1, 2};
         std::array<int, 4> flex = {4, 5, 7, 9}, side = {3, -1, 6, 8};
         for (int k = 0; k < 3; k++)
             for (int c = 0; c < 3; c++)
@@ -345,17 +520,22 @@ class Model {
                 pair[f][c] = pv[3 * f + c];
             if (contact[f] || pr[f] > 0) {
                 active.push_back(f);
-                if (side[f] >= 0)
-                    indices.push_back(side[f]);
-                indices.push_back(flex[f]);
+                bool varies = false;
+                for (int k : {side[f], flex[f]}) {
+                    if (k >= 0 && bounds_hi[k]-bounds_lo[k] > 1e-12) {
+                        indices.push_back(k);
+                        varies = true;
+                    }
+                }
+                if (varies) moving.push_back(f);
             }
         }
         int n = int(indices.size());
         Q lo{}, hi{}, prior{}, reg{};
         for (int i = 0; i < n; i++) {
             int k = indices[i];
-            lo[i] = lower[k];
-            hi[i] = upper[k];
+            lo[i] = std::max(lower[k], bounds_lo[k]);
+            hi[i] = std::min(upper[k], bounds_hi[k]);
             prior[i] = previous[k];
             reg[i] = policy.temporal;
         }
@@ -364,11 +544,7 @@ class Model {
                 int k = indices[i];
                 if (k != side[f] && k != flex[f])
                     continue;
-                double radius =
-                    (k == flex[f] ? policy.flex : policy.side) * (contact[f] ? 1. : pr[f]);
-                lo[i] = std::max(lo[i], base[k] - radius);
-                hi[i] = std::min(hi[i], base[k] + radius);
-                prior[i] = base[k];
+                prior[i] = reference[k];
                 reg[i] = policy.finger;
             }
         Vec target_plane = plane(desired, nullptr, nullptr);
@@ -391,7 +567,7 @@ class Model {
             for (int i = 0; i < n; i++)
                 full[indices[i]] = x[i];
             e.thumb = thumb(full);
-            for (int f : active)
+            for (int f : moving)
                 e.fingers[f] = finger(full, f);
             std::array<J, 3> jd{};
             e.directions = directions(e.thumb, &jd);
@@ -672,9 +848,11 @@ class Model {
     }
 };
 PYBIND11_MODULE(_hand_native_ext, m) {
+    m.def("participate", &participate);
     py::register_exception<Deadline>(m, "Deadline", PyExc_TimeoutError);
     py::class_<Model>(m, "Model")
         .def(py::init<py::dict, py::dict>())
         .def("solve", &Model::solve)
+        .def("direct_fingers", &Model::direct_fingers)
         .def("landmarks", &Model::landmarks);
 }
