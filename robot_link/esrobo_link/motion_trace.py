@@ -6,9 +6,8 @@ FIELDS = ('ik_urdf_rad', 'trajectory_urdf_rad', 'command_urdf_rad', 'velocity_ur
           'configured_speed_bound_active', 'acceleration_bound_active', 'velocity_bound_active',
           'step_bound_active', 'feedback_dt_s', 'feedback_velocity_rad_s',
           'directional_lead_braking_active', 'feedback_motion_braking_active',
-          'cartesian_bound_active', 'first_follow_hold', 'position_limit_hold', 'fault',
-          'search_method', 'solver_mode', 'solver_elapsed_ms', 'attempts',
-          'requires_controlled_hold', 'endpoint_command_speed_m_s',
+          'first_follow_hold', 'position_limit_hold', 'fault',
+          'collision_search_progress',
           'feasible_velocity_lower_rad_s', 'feasible_velocity_upper_rad_s',
           'collision_rejections', 'fault_context')
 

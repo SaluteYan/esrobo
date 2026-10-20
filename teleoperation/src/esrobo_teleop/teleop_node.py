@@ -92,7 +92,6 @@ class TeleopNode:
                 self._ik.configure_position_envelope(arm_side, np.minimum(a, b), np.maximum(a, b))
                 self._driver.configure_command_trajectory(
                     self._ik.make_command_fk(arm_side),
-                    cfg.retarget.max_endpoint_translation_velocity_m_s,
                 )
                 if cfg.robot.torso_collision_enabled:
                     from .robot.torso_collision import TorsoCollisionGuard

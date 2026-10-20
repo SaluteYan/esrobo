@@ -1144,8 +1144,8 @@ class BodyDevice:
             # The formal calibration pose may sit at the edge of PICO tracking
             # and can have a very different elbow bend from the stable target
             # accepted at enable time.  Do not inject that stale pose into the
-            # filter.  The first live target is still rate-limited from measured
-            # robot feedback by _limit_arm_segment_translations().
+            # filter. Robot-side joint trajectories constrain the first live
+            # command from the verified preparation state.
             for name in ("upper_arm", "forearm"):
                 self._filtered_segment_directions[side].pop(name, None)
                 self._held_segment_directions[side].pop(name, None)
@@ -1358,250 +1358,6 @@ class BodyDevice:
             return (current_arm_rotation @ reference_arm.T @ initial_rotation).astype(np.float32)
         return initial_rotation.copy().astype(np.float32)
 
-    @staticmethod
-    def _limit_pose_translation(
-        previous_pose: np.ndarray, target_pose: np.ndarray, max_velocity: float, dt: float
-    ) -> np.ndarray:
-        """Rate-limit a pose position while preserving its target orientation."""
-        previous = np.asarray(previous_pose, dtype=np.float32).reshape(7)
-        target = np.asarray(target_pose, dtype=np.float32).reshape(7).copy()
-        if max_velocity <= 0.0:
-            return target
-        if not np.isfinite(dt) or dt <= 0.0:
-            target[:3] = previous[:3]
-            return target
-        delta = target[:3] - previous[:3]
-        distance = float(np.linalg.norm(delta))
-        max_distance = float(max_velocity) * dt
-        if distance > max_distance and distance > 0.0:
-            target[:3] = previous[:3] + delta * (max_distance / distance)
-        return target
-
-    @staticmethod
-    def _slerp_direction(start: np.ndarray, end: np.ndarray, progress: float) -> np.ndarray:
-        """Interpolate two unit directions along a continuous shortest arc."""
-        first = mu.normalize_vector(start)
-        second = mu.normalize_vector(end)
-        if first is None or second is None:
-            raise ValueError("cannot interpolate a zero-length direction")
-        amount = float(np.clip(progress, 0.0, 1.0))
-        cosine = float(np.clip(np.dot(first, second), -1.0, 1.0))
-        if cosine > 1.0 - 1.0e-7:
-            result = mu.normalize_vector((1.0 - amount) * first + amount * second)
-            return first.copy() if result is None else result
-        if cosine < -1.0 + 1.0e-7:
-            basis = np.eye(3)[int(np.argmin(np.abs(first)))]
-            axis = mu.normalize_vector(np.cross(first, basis))
-            if axis is None:
-                return first.copy()
-            return (mu.rotvec_to_rotation_matrix(axis * np.pi * amount) @ first).astype(
-                np.float32
-            )
-        angle = float(np.arccos(cosine))
-        sine = float(np.sin(angle))
-        result = (
-            np.sin((1.0 - amount) * angle) / sine * first
-            + np.sin(amount * angle) / sine * second
-        )
-        normalized = mu.normalize_vector(result)
-        return first.copy() if normalized is None else normalized
-
-    @staticmethod
-    def _limit_arm_segment_translations(
-        previous_elbow_pose: np.ndarray,
-        previous_wrist_pose: np.ndarray,
-        target_elbow_pose: np.ndarray,
-        target_wrist_pose: np.ndarray,
-        shoulder_position: np.ndarray,
-        max_velocity: float,
-        dt: float,
-        *,
-        forearm_projector=None,
-        diagnostics: dict | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Advance a two-link arm through bounded geometric state increments.
-
-        The old implementation bisected a scalar interpolation progress while
-        applying the bend-plane projector inside every probe.  The projector is
-        state dependent around the 4--10 degree observability transition, so
-        endpoint displacement is not monotonic in that progress.  This version
-        computes the fully stabilized destination once, advances upper-arm
-        direction, elbow bend and bend-plane direction continuously, then only
-        backtracks toward the known-safe previous state if the reconstructed
-        endpoint step exceeds the Cartesian bound.
-        """
-        previous_elbow = np.asarray(previous_elbow_pose, dtype=np.float32).reshape(7)
-        previous_wrist = np.asarray(previous_wrist_pose, dtype=np.float32).reshape(7)
-        target_elbow = np.asarray(target_elbow_pose, dtype=np.float32).reshape(7).copy()
-        target_wrist = np.asarray(target_wrist_pose, dtype=np.float32).reshape(7).copy()
-        shoulder = np.asarray(shoulder_position, dtype=np.float32).reshape(3)
-        if diagnostics is not None:
-            diagnostics.clear()
-            diagnostics["method"] = "arm_state_arc_backtrack"
-        if not np.isfinite(dt) or dt <= 0.0:
-            target_elbow[:3] = previous_elbow[:3]
-            target_wrist[:3] = previous_wrist[:3]
-            if diagnostics is not None:
-                diagnostics.update(progress=0.0, reason="invalid_dt")
-            return target_elbow, target_wrist
-
-        upper_length = float(np.linalg.norm(target_elbow[:3] - shoulder))
-        forearm_length = float(np.linalg.norm(target_wrist[:3] - target_elbow[:3]))
-        previous_upper = mu.normalize_vector(previous_elbow[:3] - shoulder)
-        target_upper = mu.normalize_vector(target_elbow[:3] - shoulder)
-        previous_forearm = mu.normalize_vector(previous_wrist[:3] - previous_elbow[:3])
-        target_forearm = mu.normalize_vector(target_wrist[:3] - target_elbow[:3])
-        if (
-            upper_length <= 0.0
-            or forearm_length <= 0.0
-            or previous_upper is None
-            or target_upper is None
-            or previous_forearm is None
-            or target_forearm is None
-        ):
-            target_elbow[:3] = previous_elbow[:3]
-            target_wrist[:3] = previous_wrist[:3]
-            if diagnostics is not None:
-                diagnostics.update(progress=0.0, reason="invalid_segment")
-            return target_elbow, target_wrist
-
-        # Stabilize the complete destination once.  It becomes the fixed goal
-        # for this cycle instead of changing independently at each search probe.
-        if forearm_projector is not None:
-            projected = mu.normalize_vector(forearm_projector(target_upper, target_forearm))
-            if projected is None:
-                target_elbow[:3] = previous_elbow[:3]
-                target_wrist[:3] = previous_wrist[:3]
-                if diagnostics is not None:
-                    diagnostics.update(progress=0.0, reason="invalid_projected_target")
-                return target_elbow, target_wrist
-            target_forearm = projected
-            target_wrist[:3] = target_elbow[:3] + target_forearm * forearm_length
-
-        previous_bend = float(
-            np.arccos(np.clip(np.dot(previous_upper, previous_forearm), -1.0, 1.0))
-        )
-        target_bend = float(
-            np.arccos(np.clip(np.dot(target_upper, target_forearm), -1.0, 1.0))
-        )
-        previous_axis = mu.normalize_vector(np.cross(previous_upper, previous_forearm))
-        target_axis = mu.normalize_vector(np.cross(target_upper, target_forearm))
-        if previous_axis is None:
-            previous_axis = target_axis
-        if target_axis is None:
-            target_axis = previous_axis
-        if previous_axis is None:
-            basis = np.eye(3)[int(np.argmin(np.abs(previous_upper)))]
-            previous_axis = mu.normalize_vector(np.cross(previous_upper, basis))
-            target_axis = previous_axis
-
-        def candidate(progress: float) -> tuple[np.ndarray, np.ndarray]:
-            if progress <= 0.0:
-                return previous_elbow[:3].copy(), previous_wrist[:3].copy()
-            if progress >= 1.0:
-                return target_elbow[:3].copy(), target_wrist[:3].copy()
-            upper_direction = BodyDevice._slerp_direction(
-                previous_upper, target_upper, progress
-            )
-            plane_axis = BodyDevice._slerp_direction(
-                previous_axis, target_axis, progress
-            )
-            plane_axis = mu.normalize_vector(
-                plane_axis - upper_direction * np.dot(plane_axis, upper_direction)
-            )
-            if plane_axis is None:
-                provisional = BodyDevice._slerp_direction(
-                    previous_forearm, target_forearm, progress
-                )
-                plane_axis = mu.normalize_vector(np.cross(upper_direction, provisional))
-            if plane_axis is None:
-                return previous_elbow[:3].copy(), previous_wrist[:3].copy()
-            bend = (1.0 - progress) * previous_bend + progress * target_bend
-            forearm_direction = mu.normalize_vector(
-                mu.rotvec_to_rotation_matrix(plane_axis * bend) @ upper_direction
-            )
-            if forearm_direction is None:
-                return previous_elbow[:3].copy(), previous_wrist[:3].copy()
-            # Reapply the near-straight observability gate only to the selected
-            # state.  Backtracking always approaches the exact previous state;
-            # it does not binary-search a globally non-monotonic projection.
-            if forearm_projector is not None:
-                forearm_direction = mu.normalize_vector(
-                    forearm_projector(upper_direction, forearm_direction)
-                )
-                if forearm_direction is None:
-                    return previous_elbow[:3].copy(), previous_wrist[:3].copy()
-            elbow_position = shoulder + upper_direction * upper_length
-            wrist_position = elbow_position + forearm_direction * forearm_length
-            return elbow_position, wrist_position
-
-        max_distance = float(max_velocity) * dt
-        full_elbow, full_wrist = candidate(1.0)
-        full_elbow_step = float(np.linalg.norm(full_elbow - previous_elbow[:3]))
-        full_wrist_step = float(np.linalg.norm(full_wrist - previous_wrist[:3]))
-        if max_velocity <= 0.0:
-            target_elbow[:3], target_wrist[:3] = full_elbow, full_wrist
-            if diagnostics is not None:
-                diagnostics.update(
-                    progress=1.0,
-                    backtracks=0,
-                    max_distance_m=None,
-                    elbow_step_m=full_elbow_step,
-                    wrist_step_m=full_wrist_step,
-                )
-            return target_elbow, target_wrist
-
-        full_step = max(full_elbow_step, full_wrist_step)
-        progress = 1.0
-        if full_step > max_distance:
-            upper_angle = float(
-                np.arccos(np.clip(np.dot(previous_upper, target_upper), -1.0, 1.0))
-            )
-            forearm_angle = float(
-                np.arccos(np.clip(np.dot(previous_forearm, target_forearm), -1.0, 1.0))
-            )
-            arc_bound = max(
-                upper_length * upper_angle,
-                upper_length * upper_angle + forearm_length * forearm_angle,
-            )
-            progress = min(1.0, max_distance / arc_bound) if arc_bound > 0.0 else 0.0
-
-        backtracks = 0
-        elbow_position, wrist_position = candidate(progress)
-        elbow_step = float(np.linalg.norm(elbow_position - previous_elbow[:3]))
-        wrist_step = float(np.linalg.norm(wrist_position - previous_wrist[:3]))
-        while max(elbow_step, wrist_step) > max_distance + 1.0e-9 and progress > 1.0e-7:
-            progress *= 0.5
-            backtracks += 1
-            elbow_position, wrist_position = candidate(progress)
-            elbow_step = float(np.linalg.norm(elbow_position - previous_elbow[:3]))
-            wrist_step = float(np.linalg.norm(wrist_position - previous_wrist[:3]))
-        if max(elbow_step, wrist_step) > max_distance + 1.0e-9:
-            progress = 0.0
-            elbow_position, wrist_position = candidate(0.0)
-            elbow_step = wrist_step = 0.0
-
-        target_elbow[:3], target_wrist[:3] = elbow_position, wrist_position
-        if diagnostics is not None:
-            limited_upper = mu.normalize_vector(elbow_position - shoulder)
-            limited_forearm = mu.normalize_vector(wrist_position - elbow_position)
-            limited_bend = previous_bend
-            if limited_upper is not None and limited_forearm is not None:
-                limited_bend = float(np.arccos(np.clip(
-                    np.dot(limited_upper, limited_forearm), -1.0, 1.0
-                )))
-            diagnostics.update(
-                progress=float(progress),
-                backtracks=int(backtracks),
-                max_distance_m=float(max_distance),
-                elbow_step_m=elbow_step,
-                wrist_step_m=wrist_step,
-                previous_bend_deg=float(np.degrees(previous_bend)),
-                desired_bend_deg=float(np.degrees(target_bend)),
-                limited_bend_deg=float(np.degrees(limited_bend)),
-            )
-        return target_elbow, target_wrist
-
     def _retarget_arm_vector_pair(
         self, source_side: str, target_side: str, target_dt: float, *, full_target=False
     ):
@@ -1658,72 +1414,21 @@ class BodyDevice:
         )
         elbow_pose = mu.pose_matrix_to_array(target_elbow)
         wrist_pose = mu.pose_matrix_to_array(target_wrist)
-        desired_before_limit_deg = float(np.degrees(self._points_flexion({
-            "shoulder": robot_shoulder,
-            "elbow": elbow_pose[:3],
-            "wrist": wrist_pose[:3],
-        })))
-        forearm_projector = None
-        if self._cfg.arm_vector_position_mode == "segment_direction_relative":
-            _, robot_elbow, robot_wrist, _ = self._robot_arm_reference(target_side)
-            robot_upper = robot_elbow - robot_shoulder
-            robot_forearm = robot_wrist - robot_elbow
-
-            def forearm_projector(upper_direction, forearm_direction):
-                return self._stabilize_forearm_plane(
-                    upper_direction,
-                    forearm_direction,
-                    robot_upper,
-                    robot_forearm,
-                    plane_start_deg=self._cfg.bend_plane_observability_start_delta_deg,
-                    plane_full_deg=self._cfg.bend_plane_observability_full_delta_deg,
-                )
-
-        limiter_diagnostics: dict[str, float | int | str] = {}
+        # Segment filtering and bend-plane observability were applied above.
         if target_side == "left":
-            elbow_pose, wrist_pose = self._limit_arm_segment_translations(
-                self._previous_left_elbow_pose,
-                self._previous_left_pose,
-                elbow_pose,
-                wrist_pose,
-                self._robot_left_shoulder,
-                0.0 if full_target else self._cfg.max_endpoint_translation_velocity_m_s,
-                max(target_dt, 1e-6) if full_target else target_dt,
-                forearm_projector=forearm_projector,
-                diagnostics=limiter_diagnostics,
-            )
             self._previous_left_elbow_pose = elbow_pose
             self._previous_left_pose = wrist_pose
         else:
-            elbow_pose, wrist_pose = self._limit_arm_segment_translations(
-                self._previous_right_elbow_pose,
-                self._previous_right_pose,
-                elbow_pose,
-                wrist_pose,
-                self._robot_right_shoulder,
-                0.0 if full_target else self._cfg.max_endpoint_translation_velocity_m_s,
-                max(target_dt, 1e-6) if full_target else target_dt,
-                forearm_projector=forearm_projector,
-                diagnostics=limiter_diagnostics,
-            )
             self._previous_right_elbow_pose = elbow_pose
             self._previous_right_pose = wrist_pose
-        limited_deg = float(np.degrees(self._points_flexion({
-            "shoulder": robot_shoulder,
-            "elbow": elbow_pose[:3],
-            "wrist": wrist_pose[:3],
-        })))
-        limited_upper_direction = mu.normalize_vector(elbow_pose[:3] - robot_shoulder)
-        limited_forearm_direction = mu.normalize_vector(wrist_pose[:3] - elbow_pose[:3])
         stage_diagnostics = getattr(self, "_arm_retarget_diagnostics", None)
         if stage_diagnostics is not None:
             stage_diagnostics.setdefault(target_side, {}).update(
-                desired_before_limit_deg=desired_before_limit_deg,
-                limited_deg=limited_deg,
-                limited_upper_direction=limited_upper_direction.tolist(),
-                limited_forearm_direction=limited_forearm_direction.tolist(),
+                mapped_bend_deg=float(np.degrees(self._points_flexion({
+                    "shoulder": robot_shoulder, "elbow": elbow_pose[:3], "wrist": wrist_pose[:3]}))),
+                output_upper_direction=mu.normalize_vector(elbow_pose[:3]-robot_shoulder).tolist(),
+                output_forearm_direction=mu.normalize_vector(wrist_pose[:3]-elbow_pose[:3]).tolist(),
                 target_dt_s=float(target_dt),
-                limiter=limiter_diagnostics,
             )
         return elbow_pose, wrist_pose
 

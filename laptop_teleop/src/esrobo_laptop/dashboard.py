@@ -898,17 +898,27 @@ class Console:
                     age = arm.get('arm_feedback_age_s')
                     q = arm.get('arm_urdf_rad')
                     states = arm.get('enable_states')
-                    if (not isinstance(age, (int, float)) or not 0 <= age <= .1
+                    # A freshly verified disabled arm can have moved after an
+                    # E-stop. Its runtime reader intentionally rejects the old
+                    # pose anchor. Let explicit recovery revalidate the pinned
+                    # source before reset or motion, rather than requiring that
+                    # rejected runtime pose to admit recovery in the first place.
+                    disabled = (isinstance(states, list) and len(states) == 7
+                                and all(value is False for value in states))
+                    if not disabled and (not isinstance(age, (int, float)) or not 0 <= age <= .1
                             or not isinstance(q, list) or len(q) != 7
-                            or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in q)):
+                            or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in q)
+                            or arm.get('feedback_diagnostic')):
                         raise RuntimeError('受检恢复需要新鲜七轴位置反馈；不会自动失能')
-                    if states != [False]*7 and not (
+                    if not disabled and not (
                             states == [True]*7 and state.get('mode') == 'HOLD_LATCHED'
                             and state.get('hold_return_protocol') == 1
                             and not arm.get('controller_fault') and not arm.get('driver_fault')):
                         raise RuntimeError('当前状态不支持保持使能回零；不会自动失能，请可靠托稳后单独处理失能')
                 self.key('r')
-                return dict(message='已请求网关恢复；请等待状态变为 IDLE，再重新开始计算和使能')
+                if '--hand-only' in args:
+                    return dict(message='已请求失能与手部反馈核验，不执行回零运动；请等待状态变为 IDLE')
+                return dict(message='已请求网关恢复；机器人端将重新核验新鲜位置、失能和控制器状态，通过后才执行受检回零。请等待 IDLE，再重新开始计算和使能')
             elif action == 'local_start':
                 if self.running('teleop') and data.get('name') != 'teleop':
                     raise RuntimeError('先停止计算再修改采集进程')

@@ -9,7 +9,7 @@ import threading
 import time
 
 from .backends import MockBackend, MockDualBackend
-from .protocol import MAX_PACKET, ProtocolError, PacketTooLarge, InputHoldTransition, HoldReturnTransition, TrajectoryHoldTransition, key_from_file, pack, unpack
+from .protocol import MAX_PACKET, ProtocolError, PacketTooLarge, InputHoldTransition, HoldReturnTransition, key_from_file, pack, unpack
 from .session import SessionGate
 from .state_summary import compact_state, return_failure, short_text
 
@@ -742,14 +742,6 @@ class Gateway:
             feedback = self.backend.snapshot()
             with self.lock:
                 self.feedback, self.feedback_time = feedback, time.monotonic()
-        except TrajectoryHoldTransition as exc:
-            # Only the post-send/commit transition reaches this branch. Do not
-            # downgrade a concurrent emergency stop or bypass commissioning.
-            with self.lock:
-                if self.mode == 'ACTIVE' and not self.cancelled.is_set() and not self.stop_pending:
-                    self.input_fault(str(exc))
-            self.diagnostic_event('trajectory_hold', reason=str(exc), mode=self.mode,
-                                  command_context=trace_context, accepted_seq=self.gate.sequence)
         except InputHoldTransition:
             return  # Next executor cycle brakes; do not convert an input stop to E-stop.
         except HoldReturnTransition:

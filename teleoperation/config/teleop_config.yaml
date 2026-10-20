@@ -180,8 +180,6 @@ retarget:
   arm_reference_enable_max_upper_delta_deg: 30.0
   arm_reference_enable_max_forearm_delta_deg: 30.0
   arm_vector_max_reach: 0.72
-  # Generate arm targets from the latest measured shoulder/elbow/wrist points.
-  max_endpoint_translation_velocity_m_s: 0.22
   # PICO segment direction filter: low cutoff at rest, higher cutoff in motion.
   arm_vector_filter_min_cutoff_hz: 2.0
   arm_vector_filter_max_cutoff_hz: 8.0

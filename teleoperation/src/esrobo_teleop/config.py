@@ -273,7 +273,6 @@ class RetargetConfig:
     calibration_delay_s: float = 10.0
     calibration_sample_start_s: float = 6.0
     arm_vector_max_reach: float = 0.72
-    max_endpoint_translation_velocity_m_s: float = 0.22
     upper_arm_angular_deadband_deg: float = 0.25
     forearm_angular_deadband_deg: float = 0.30
     # Adaptive direction smoothing suppresses PICO joint-position jitter while

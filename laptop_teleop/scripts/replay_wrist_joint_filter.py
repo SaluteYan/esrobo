@@ -43,8 +43,6 @@ def trajectory(targets, *, recorded=False, tau=None):
     c.state = TrajectoryStep(np.array(prev['command_rad']), np.array(prev['velocity_rad_s']),
         stamp-dt, np.full(7,np.nan), dict(feedback_physical_rad=first['feedback_urdf_rad'],
         feedback_motion_stamp_s=stamp-dt, feedback_velocity_rad_s=[0.]*7))
-    fk14 = replay.s0.make_command_fk('left')
-    fk = lambda q: fk14(np.r_[q,np.zeros(7)])
     fb = np.array(first['feedback_urdf_rad']); commands=[]; times=[]; faults=[]
     for j,row in enumerate(replay.D):
         stamp = row['feedback_snapshot']['stamp_s']; dt = stamp-c.state.stamp
@@ -56,8 +54,7 @@ def trajectory(targets, *, recorded=False, tau=None):
             c.state.position if held else targets[replay.source_id[seq]])
         try:
             step = c.propose(target, fb, stamp, np.array(cfg.left_joint_soft_lower_limits_urdf),
-                np.array(cfg.left_joint_soft_upper_limits_urdf), fk,
-                replay.cfg.retarget.max_endpoint_translation_velocity_m_s,
+                np.array(cfg.left_joint_soft_upper_limits_urdf),
                 coordinate_elbow=True, brake_only=held)
         except Exception as exc:
             faults.append((j,str(exc))); break
@@ -93,8 +90,8 @@ def main():
     # Replay original URDF IK and wrist mapping from the already recorded arm
     # translation limiter output; no new endpoint assumptions or hardware reads.
     reconstructed = replay.solve_series(
-        [s['arm']['left']['limited_upper_direction'] for s in replay.stages],
-        [s['arm']['left']['limited_forearm_direction'] for s in replay.stages],
+        [s['arm']['left']['output_upper_direction'] for s in replay.stages],
+        [s['arm']['left']['output_forearm_direction'] for s in replay.stages],
         [s['wrist']['left']['absolute_local_orientation'] for s in replay.stages], limited=True)
     ik_error = float(np.degrees(abs(reconstructed-replay.observed)).max())
     print('Mapping baseline max error deg:', ik_error, flush=True)

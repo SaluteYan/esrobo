@@ -420,7 +420,9 @@ async function recoverGateway() {
   const arm = recoveryArm(state, side);
   const enabled = !handOnly && arm.enable_states?.some(Boolean);
   const heldReturn = enabled && canReturnWhileHolding(state, side);
-  if (enabled && !heldReturn) {
+  const disabled = arm.enable_states?.length === 7
+    && arm.enable_states.every(value => value === false);
+  if (!handOnly && !disabled && !heldReturn) {
     notice(enabledRecoveryRefusal(state, side), true);
     return;
   }
@@ -684,7 +686,7 @@ function render() {
 
   $('connection').textContent = state.connected ? 'SSH 已连接' : '机器人未连接';
   $('connection-dot').classList.toggle('online', state.connected);
-  $('robot-mode').textContent = fresh ? (robot.mode === 'HOLD_LATCHED' ? '受控减速／保持（已锁存）'
+  $('robot-mode').textContent = fresh ? (robot.mode === 'HOLD_LATCHED' ? '已停止并保持'
     : robot.mode === 'FAULT' ? '故障停止' : (robot.recovery_phase || robot.mode)) : '反馈离线';
   $('robot-mode').className = 'tag ' + (fresh && robot.mode === 'ACTIVE' ? 'active' : fresh && robot.mode === 'FAULT' ? 'fault' : '');
   const returnFailure = fresh && robot.mode === 'FAULT' && robot.last_return?.returned === false
@@ -855,16 +857,27 @@ function render() {
     || robot.controlled_stop_enabled !== true || !['ACTIVE', 'HOLD_LATCHED'].includes(robot.mode);
   $('motion-stop').title = '正常跟随时受控减速并保持使能；准备、回零或硬件故障时请使用顶部紧急停止';
   if (fresh && robot.mode === 'HOLD_LATCHED') {
-    $('runtime-status').textContent = '机器人端已锁存受控保持；需要人工受检恢复。保持状态须以持续新鲜反馈为准。';
+    $('runtime-status').textContent = '已停止并保持；继续操作前需受检恢复。保持状态须以持续新鲜反馈为准。';
   }
   const returnProtocolReady = mode.hand_only || robot.return_protocol === 3;
   const feedbackMissing = Object.values(members).some(value =>
     ['controller_feedback_stale', 'driver_feedback_stale'].includes(value.controller_fault?.category));
+  const disabledPoseRevalidation = recoveryNeeded && !mode.hand_only && sides.every(side => {
+    const arm = recoveryArm(state, side);
+    return arm.enable_states?.length === 7 && arm.enable_states.every(value => value === false);
+  }) && sides.some(side => {
+    const arm = recoveryArm(state, side);
+    return !Array.isArray(arm.arm_urdf_rad) || arm.arm_urdf_rad.length !== 7
+      || !Number.isFinite(arm.arm_feedback_age_s) || arm.arm_feedback_age_s > .1
+      || Boolean(arm.feedback_diagnostic);
+  });
   const canRecover = state.capabilities?.fault_recovery && robot.recovery_supported === true
     && returnProtocolReady && fresh && liveGateway && recoveryNeeded && !running && mode.side !== 'both' && !recoveryBusy;
   $('recover').disabled = !canRecover;
   $('recover').textContent = mode.hand_only ? '核验失能并恢复 IDLE' : '受检回零并恢复 IDLE';
-  $('recovery-panel').classList.toggle('fault', fresh && recoveryNeeded);
+  const normalHold = fresh && robot.mode === 'HOLD_LATCHED' && faults.length === 0;
+  $('recovery-title').textContent = normalHold ? '已停止并保持' : '故障停止后恢复';
+  $('recovery-panel').classList.toggle('fault', fresh && recoveryNeeded && !normalHold);
   const recoveryEnabled = !mode.hand_only && sides.some(side => recoveryArm(state, side).enable_states?.some(Boolean));
   $('recovery-detail').textContent = recoveryBusy ? '正在提交受检恢复，请等待反馈；重复点击已锁定。'
     : !state.capabilities?.fault_recovery ? '本机控制台尚未加载新版本；重启本机控制台后启用。'
@@ -876,8 +889,9 @@ function render() {
         : recoveryNeeded && recoveryEnabled ? (sides.every(side => canReturnWhileHolding(state, side))
           ? '机械臂受控停稳并保持使能，先受检归零手部，再规划执行七关节回零，到位后失能；规划拒绝时保留经核验的位置保持。'
           : enabledRecoveryRefusal(state, sides.find(side => !canReturnWhileHolding(state, side))))
-        : returnFailureDetail ? returnFailureDetail
         : feedbackMissing ? '机械臂 CAN 反馈缺失，不是已确认的急停。恢复先请求遥测并核验七轴；若仍无数据，检查供电、CAN 接线和接口映射，不能强制清除故障。'
+        : disabledPoseRevalidation ? '七轴已失能，当前位置尚未重新核验。点击受检恢复后，机器人端先重新核验当前位置、静止反馈和控制器，核验通过后才执行受检回零；失能不等于恢复 IDLE。'
+        : returnFailureDetail ? returnFailureDetail
         : recoveryNeeded && mode.hand_only ? '停止后核验机械臂失能和手部反馈；恢复不发送位置目标。'
           : recoveryNeeded ? '控制器故障尚未解除；单臂受检恢复会先核验失能急停，再规划回零运动。'
             : robot.mode === 'RECOVERING' || robot.mode === 'RETURNING' ? '恢复正在执行，等待网关显示 IDLE。'
@@ -962,7 +976,10 @@ function render() {
       const arm = members[side];
       const enabled = arm?.enable_states?.filter(Boolean).length;
       const faultName = arm?.controller_fault?.status_name || arm?.controller_fault?.category || arm?.driver_fault;
-      output.textContent = !fresh || !arm ? '等待网关反馈' : faultName ? `故障 · ${faultName}` : enabled ? `已使能 ${enabled}/7` : '已失能 0/7';
+      const enableLabel = arm?.enable_states?.length === 7
+        && arm.enable_states.every(value => typeof value === 'boolean')
+        ? (enabled ? `已使能 ${enabled}/7` : '已失能 0/7') : '使能状态未确认';
+      output.textContent = !fresh || !arm ? '等待网关反馈' : enableLabel + (faultName ? ` · 故障：${faultName}` : '');
       output.classList.toggle('on', fresh && Boolean(arm));
       output.classList.toggle('fault', Boolean(arm?.controller_fault));
     } else {

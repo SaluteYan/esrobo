@@ -48,7 +48,7 @@ def gateway_worker(contract,key,pipe,stop,enabled,folder):
                 feedback_urdf_rad=q.tolist(),feedback_snapshot=snap.diagnostics(),position_frame_sent=True,
                 configured_speed_bound_active=[False]*7,acceleration_bound_active=[False]*7,
                 directional_lead_braking_active=[False]*7,feedback_motion_braking_active=[False]*7,
-                cartesian_bound_active=False,sent_monotonic_s=now))
+                sent_monotonic_s=now))
     b.step=step
     g=Gateway(b,key,port=0);g.motion_trace=MotionTrace(Path(folder)/'execution.jsonl',enabled=enabled)
     emissions=measure_trace(g.motion_trace);cpu=time.process_time()

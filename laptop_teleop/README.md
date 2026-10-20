@@ -133,6 +133,7 @@ Body 和 Hand 由一个 SDK 订阅独立提交/转发，控制端按真实时间
 | 网页按钮、模式、骨架层、恢复 | [05 网页控制台](docs/05_WEB_CONSOLE.md) |
 | SDK、组件时间、Body/Hand 转发与同步 | [06 PICO 输入](docs/06_PICO_HAND_INPUT.md) |
 | 源码职责、映射/IK、接近和回零实现 | [07 代码与计算](docs/07_CODE_AND_COMPUTATION.md) |
+| 灵巧手运动学、对捏机制与单指运动问题 | [09 遥操作与灵巧手技术方案](docs/09_TECHNICAL_SCHEME.md) |
 
 旧 SenseGlove 脚本保留用于设备维护，当前网页和 PICO 计算无需启动。认证密钥、现场运行记录、构建产物和历史测量汇总不上传远程仓库。
 

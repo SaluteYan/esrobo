@@ -48,7 +48,7 @@ def simulate(cfg, side, baseline, tau, scenario, recording=None):
     tr.reset(q, 0.)
     duration = 8. if recording is None else float(recording[0][-1])
     now = 0.; samples = []; counts = {}; settled = None; fault = None
-    stop_anchor = None; stop_travel = None; endpoint_count = 0
+    stop_anchor = None; stop_travel = None
     for i in range(int(duration / .02)):
         dt = (.015, .020, .025)[i % 3]; now += dt
         if scenario != 'stalled' or now < .5:
@@ -67,8 +67,7 @@ def simulate(cfg, side, baseline, tau, scenario, recording=None):
             stop_anchor = tr.state.position.copy()
         before = tr.state
         try:
-            proposal = tr.propose(target, q, now, np.full(7, -3.), np.full(7, 3.),
-                                  lambda _: np.zeros((2, 3)), .22, brake_only=brake)
+            proposal = tr.propose(target, q, now, np.full(7, -3.), np.full(7, 3.), brake_only=brake)
         except TrajectoryFault as exc:
             assert tr.state is before  # A rejected proposal never advances output.
             fault = dict(time_s=now, reason=str(exc))
@@ -81,7 +80,6 @@ def simulate(cfg, side, baseline, tau, scenario, recording=None):
         for key in ('configured_speed_bound_active', 'acceleration_bound_active',
                     'directional_lead_braking_active', 'feedback_motion_braking_active'):
             counts[key] = counts.get(key, np.zeros(7)) + np.array(proposal.diagnostics[key])
-        endpoint_count += int(proposal.diagnostics['cartesian_bound_active'])
         samples.append(np.degrees(np.array([np.abs(target-proposal.position),
                       np.abs(proposal.position-q), np.abs(proposal.velocity)]))[:, 4:])
         if scenario == 'step' and settled is None and np.max(abs(target[4:]-q[4:])) <= np.deg2rad(1.5):
@@ -96,8 +94,7 @@ def simulate(cfg, side, baseline, tau, scenario, recording=None):
                 command_feedback_error_p95_deg=np.percentile(samples[:, 1], 95, axis=0).tolist(),
                 max_command_feedback_error_deg=samples[:, 1].max(axis=0).tolist(),
                 command_speed_p95_deg_s=np.percentile(samples[:, 2], 95, axis=0).tolist(),
-                limiter_ratios={k:(v[4:]/len(samples)).tolist() for k,v in counts.items()},
-                endpoint_ratio=endpoint_count/len(samples))
+                limiter_ratios={k:(v[4:]/len(samples)).tolist() for k,v in counts.items()})
 
 
 if __name__ == '__main__':

@@ -1,10 +1,6 @@
 """Feedback-bounded command-space trajectory; proposals have no side effects."""
 
 from dataclasses import dataclass
-import time
-
-from .joint_velocity_solver import solve_velocity
-
 import numpy as np
 
 
@@ -59,9 +55,8 @@ class CommandTrajectory:
     def invalidate(self):
         self.state = None
 
-    def propose(self, target, feedback, stamp, lower, upper, fk, endpoint_speed,
-                *, path_check=None, coordinate_elbow=False, brake_only=False,
-                endpoint_jacobian=None):
+    def propose(self, target, feedback, stamp, lower, upper,
+                *, path_check=None, coordinate_elbow=False, brake_only=False):
         state = self.state
         if state is None:
             raise TrajectoryFault("trajectory needs explicit session initialization")
@@ -78,8 +73,6 @@ class CommandTrajectory:
                      feedback_stamp_s=float(stamp), previous_command_stamp_s=state.stamp,
                      command_state_interval_s=dt))
         target, feedback, lower, upper = [self._vector(v) for v in (target, feedback, lower, upper)]
-        if not callable(fk) or not np.isfinite(endpoint_speed) or endpoint_speed <= 0:
-            raise TrajectoryFault("valid command FK and endpoint speed limit required")
         q, velocity = state.position, state.velocity
         # A large bend-plane rotation must precede additional elbow flexion.
         # Gate from measured J3, not the IK seed or the last command. Continue
@@ -217,14 +210,6 @@ class CommandTrajectory:
         if recovery:
             goal_velocity = brake_velocity.copy()
 
-        def endpoints(position):
-            result = np.asarray(fk(position), dtype=float)
-            if result.shape != (2, 3) or not np.all(np.isfinite(result)):
-                raise TrajectoryFault("command FK must return finite elbow/wrist positions",
-                                      {"fault_code": "model_invalid"})
-            return result
-
-        before = endpoints(q)
         collision_context = dict(
             feedback_stamp_s=float(stamp), feedback_dt_s=dt,
             previous_command_stamp_s=float(state.stamp),
@@ -241,7 +226,6 @@ class CommandTrajectory:
                                        checked_upper_physical_rad=np.maximum(feedback, q).tolist()))
         selected = None
         collision_rejections = 0
-        search_info = dict(search_method="fast", requires_controlled_hold=False)
         def validate(candidate_velocity):
             nonlocal collision_rejections
             candidate = q + dt * candidate_velocity
@@ -249,9 +233,6 @@ class CommandTrajectory:
                     or np.any(candidate_velocity < vlow-1e-10)
                     or np.any(candidate_velocity > vhigh+1e-10)
                     or np.any(candidate < lo-1e-8) or np.any(candidate > hi+1e-8)):
-                return None
-            distance = np.linalg.norm(endpoints(candidate) - before, axis=1)
-            if not np.all(distance <= endpoint_speed * dt + 1e-9):
                 return None
             if path_check is not None:
                 # Include independently lagging axes and the braking corridor.
@@ -269,36 +250,24 @@ class CommandTrajectory:
                         checked_lower_physical_rad=box_lower.tolist(),
                         checked_upper_physical_rad=box_upper.tolist())
                     return None
-            return distance
+            return True
 
-        for progress in [2.0 ** -i for i in range(11)] + [0.0]:
+        # Backtracking is only needed when collision corridors are enabled.
+        progress_values = ([2.0 ** -i for i in range(11)] + [0.0]
+                           if path_check is not None else (1.0,))
+        for progress in progress_values:
             candidate_velocity = brake_velocity + progress * (goal_velocity - brake_velocity)
-            distance = validate(candidate_velocity)
-            if distance is not None:
-                selected = q + dt*candidate_velocity, candidate_velocity, distance, progress
+            if validate(candidate_velocity):
+                selected = q + dt*candidate_velocity, candidate_velocity, progress
                 break
-        if selected is None and endpoint_jacobian is not None:
-            try:
-                selected, search_info = solve_velocity(
-                    q, velocity, goal_velocity, brake_velocity, vlow, vhigh, self.vmax,
-                    dt, endpoint_speed, before, endpoints, endpoint_jacobian, validate,
-                    brake_only=recovery)
-                if selected is not None:
-                    search_info["requires_controlled_hold"] = (
-                        search_info.get("solver_mode") == "brake" and not brake_only)
-            except Exception as exc:
-                raise TrajectoryFault("joint solver model/evaluation failure", dict(
-                    collision_context, fault_code="model_invalid", detail=str(exc))) from exc
         if selected is None:
-            code = search_info.get("fault_code", "endpoint_search_exhausted")
-            if collision_rejections and code != "solver_timeout":
-                code = "collision_rejected"
-            raise TrajectoryFault("no validated elbow/wrist speed candidate", dict(
-                collision_context, **dict(search_info, fault_code=code),
+            raise TrajectoryFault("no joint candidate passes the collision/safety checks", dict(
+                collision_context,
+                fault_code=("collision_rejected" if collision_rejections else "joint_candidate_invalid"),
                 collision_rejections=collision_rejections,
                 feasible_velocity_lower_rad_s=vlow.tolist(),
                 feasible_velocity_upper_rad_s=vhigh.tolist()))
-        candidate, candidate_velocity, distance, progress = selected
+        candidate, candidate_velocity, progress = selected
         lead = candidate - feedback
         pushing = (np.abs(lead) >= .9 * self.lead) & ((target - candidate) * lead > 0)
         # ``lead_timeout`` measures a stalled controller, not total time spent
@@ -343,7 +312,6 @@ class CommandTrajectory:
                 lead_progress_threshold_rad=progress_threshold.tolist(),
                 lead_elapsed_s=np.where(pushing, stamp-since, 0).tolist()))
         diagnostics = {
-            **search_info,
             "collision_rejections": collision_rejections,
             "braking_recovery": recovery,
             "reserve_conflict": reserve_conflict,
@@ -366,8 +334,7 @@ class CommandTrajectory:
             "velocity_bound_active": (np.abs(desired) > vmax).tolist(),
             "acceleration_bound_active": (np.abs(desired - velocity) > self.amax * dt).tolist(),
             "lead_braking_active": ((braking_bound(hi - q) < vmax) | (braking_bound(q - lo) < vmax)).tolist(),
-            "cartesian_progress": progress,
-            "endpoint_command_speed_m_s": (distance / dt).tolist(),
+            "collision_search_progress": progress,
             "lead_rad": lead.tolist(),
             "velocity_rad_s": candidate_velocity.tolist(),
             "lead_watch_feedback_rad": feedback_anchor.tolist(),
@@ -385,16 +352,10 @@ class CommandTrajectory:
                 ((desired > 0) & (desired > braking_bound(upper-q) + 1e-9)) |
                 ((desired < 0) & (-desired > braking_bound(q-lower) + 1e-9))
             ).tolist(),
-            "cartesian_bound_active": progress < 1.0,
             "desired_velocity_rad_s": desired.tolist(),
             "feasible_velocity_lower_rad_s": vlow.tolist(),
             "feasible_velocity_upper_rad_s": vhigh.tolist(),
         }
-        if search_info.get("search_method") == "joint_slsqp":
-            if time.monotonic() >= search_info["solver_deadline_monotonic"]:
-                raise TrajectoryFault("joint solver final validation exceeded budget", dict(
-                    collision_context, **dict(search_info, fault_code="solver_timeout")))
-            diagnostics["solver_elapsed_ms"] = (time.monotonic()-search_info["solver_started_monotonic"])*1000
         return TrajectoryStep(candidate, candidate_velocity, float(stamp), since, diagnostics)
 
     def commit(self, step):

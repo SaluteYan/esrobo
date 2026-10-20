@@ -60,7 +60,6 @@ def run(root, fixture, repeats, execute=False, driver_source=None):
         driver._cfg,driver._side,driver._session_start=cfg.robot,'left',None
         driver._return_cancel=threading.Event()
         driver._trajectory_fk=model.fk('left')
-        driver._trajectory_endpoint_speed=cfg.retarget.max_endpoint_translation_velocity_m_s
         driver.configure_collision_guard(guard)
         direction,zero=driver._mapping('left')
         actual=direction*q[:7]+zero

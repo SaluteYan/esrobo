@@ -307,8 +307,7 @@ def test_real_robot_trajectory_brakes_then_reacquires_without_velocity_reset(sid
         previous=trajectory.state
         brake=20<=i<30
         goal=previous.position if brake else np.deg2rad([30]*4+[40]*3)
-        candidate=trajectory.propose(goal,measured,stamp,-np.ones(7),np.ones(7),
-            lambda q:np.array([q[:3]*.1,q[3:6]*.1]),.22,brake_only=brake)
+        candidate=trajectory.propose(goal,measured,stamp,-np.ones(7),np.ones(7),brake_only=brake)
         assert np.all(np.abs(candidate.velocity)<=trajectory.vmax+1e-9)
         assert np.all(np.abs(candidate.velocity-previous.velocity)<=trajectory.amax*.02+1e-9)
         assert np.all(np.abs(candidate.position-measured)<=trajectory.lead+1e-9)

@@ -27,9 +27,6 @@ def simulate(mode, profile="step"):
                                    cfg.right_max_joint_step, np.deg2rad(cfg.command_trajectory_lead_deg))
     trajectory.reset(offsets.copy(), 0.)
     lower, upper = legacy._effective_position_limits("right")
-    def fk(physical):
-        q = (physical-offsets) / directions
-        return np.array([[q[0]*.3, q[1]*.3, q[2]*.3], [q[3]*.3, q[4]*.3, q[5]*.3]])
     measured = offsets.copy()
     t = 0.
     history = []
@@ -41,7 +38,7 @@ def simulate(mode, profile="step"):
         target = offsets.copy()
         target[3] += angle * directions[3]
         if mode == "trajectory":
-            step = trajectory.propose(target, measured, t, lower, upper, fk, .22)
+            step = trajectory.propose(target, measured, t, lower, upper)
             command = step.position
             trajectory.commit(step)
         else:
@@ -58,7 +55,7 @@ def simulate(mode, profile="step"):
     last_outside = errors[outside, 0]
     return {
         "profile": profile, "mode": mode,
-        "assumption": "synthetic 7-axis linear FK, first-order feedback tau=0.12s; NOT hardware replay",
+        "assumption": "synthetic joint-space trajectory, first-order feedback tau=0.12s; NOT hardware replay",
         "mean_error_deg": float(np.degrees(np.mean(values[:, 1]))),
         "p90_error_deg": float(np.degrees(np.percentile(values[:, 1], 90))),
         "settling_s_after_last_target_change": None if profile == "ramp" else float((last_outside[-1] if len(last_outside) else after)-after),

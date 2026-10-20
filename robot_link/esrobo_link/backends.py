@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 import time
 
-from .protocol import canonical, InputHoldTransition, HoldReturnTransition, TrajectoryHoldTransition
+from .protocol import canonical, InputHoldTransition, HoldReturnTransition
 
 
 class MockBackend:
@@ -72,7 +72,7 @@ class MockBackend:
         if not self.enabled:
             raise RuntimeError("mock held arm disabled")
 
-    def hold_arm(self, *, verify_transition=False):
+    def hold_arm(self):
         if not self.enabled:
             raise RuntimeError("mock arm cannot hold while disabled")
 
@@ -142,29 +142,6 @@ class ForwardModel:
         if any(i == 0 or i >= self._model.njoints for i in ids):
             raise ValueError("URDF arm joint missing")
         self._arm_q_indices = np.array([self._model.idx_qs[i] for i in ids])
-        self._arm_v_indices = np.array([self._model.idx_vs[i] for i in ids])
-
-    def endpoint_jacobian(self, side):
-        """World-aligned translational derivatives with respect to side URDF q."""
-        import numpy as np
-        import threading
-        data, lock = self._model.createData(), threading.Lock()
-        frames = [self._model.getFrameId(getattr(self._cfg, f"{side}_{name}"))
-                  for name in ("elbow_frame", "hand_frame")]
-        if any(i >= self._model.nframes for i in frames):
-            raise ValueError("URDF task frame missing")
-        columns = self._arm_v_indices[:7] if side == "left" else self._arm_v_indices[7:]
-
-        def evaluate(full):
-            q = np.zeros(self._model.nq)
-            q[self._arm_q_indices] = full
-            with lock:
-                self._pin.computeJointJacobians(self._model, data, q)
-                self._pin.updateFramePlacements(self._model, data)
-                return np.array([self._pin.getFrameJacobian(
-                    self._model, data, frame, self._pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
-                )[:3, columns].copy() for frame in frames])
-        return evaluate
 
     def fk(self, side):
         import numpy as np
@@ -226,8 +203,7 @@ class HardwareBackend:
         self._owns_hand = hand_driver is None
         self._full_slice = slice(0, 7) if side == "left" else slice(7, 14)
         model = ForwardModel(cfg.ik)
-        self.arm.configure_command_trajectory(model.fk(side), cfg.retarget.max_endpoint_translation_velocity_m_s,
-                                              endpoint_jacobian=model.endpoint_jacobian(side))
+        self.arm.configure_command_trajectory(model.fk(side))
         guard = TorsoCollisionGuard(model, side, cfg.robot.collision_package_dirs,
                                    cfg.robot.torso_collision_margin_m,
                                    cfg.robot.shoulder_collision_margin_m, include_fingers=with_hand)
@@ -245,7 +221,6 @@ class HardwareBackend:
             fingerprint = dict(robot=dataclasses.asdict(cfg.robot), hand=dataclasses.asdict(cfg.hand),
                                ik={k:v for k,v in dataclasses.asdict(cfg.ik).items() if k != "urdf_path"},
                                trajectory_algorithm=TRAJECTORY_ALGORITHM_VERSION,
-                               endpoint_speed=cfg.retarget.max_endpoint_translation_velocity_m_s,
                                retarget_filter=retarget_filter_fingerprint(cfg.retarget),
                                model_sha256=hashlib.sha256(model_path.read_bytes()).hexdigest(),
                                side=side, with_hand=with_hand, hand_only=self.hand_only)
@@ -635,20 +610,13 @@ class HardwareBackend:
             raise RuntimeError("target expired before arm send")
         full = self.np.zeros(14)
         full[self._full_slice] = target["arm_urdf_rad"]
-        self.arm.trajectory_hold_requested = False
         ok = self.arm.command_full_urdf(full)
         if not ok and not self.arm.last_command_skipped:
             raise RuntimeError(self.arm.safety_fault_reason or "arm target rejected")
-        if ok and self.arm.trajectory_hold_requested:
-            raise TrajectoryHoldTransition(f"{self.side}: 跟踪候选不可用，已提交联合减速命令；受控减速保持")
 
-    def hold_arm(self, *, verify_transition=False):
+    def hold_arm(self):
         if not self.arm.hold_command_trajectory():
             raise RuntimeError(self.arm.safety_fault_reason or "arm hold rejected")
-        if verify_transition and self.arm.last_command_skip_reason == "duplicate_feedback":
-            state = self.arm._trajectory.state
-            if state is None or self.np.any(self.np.abs(state.velocity) > 1e-9):
-                raise RuntimeError("fresh feedback required to validate other arm braking transition")
 
     def measured_hand_hold_target(self):
         if self.hand is None:
@@ -673,13 +641,7 @@ class HardwareBackend:
             if self.hand is None or not self.hand.command_physical(self.side, target["hand_unit"]):
                 raise RuntimeError("hand command rejected/feedback expired")
             return
-        try:
-            self.send_arm(target, cancelled)
-        except TrajectoryHoldTransition:
-            position = self.measured_hand_hold_target()
-            if cancelled() or (position is not None and not self.hand.command_physical(self.side, position)):
-                raise RuntimeError("trajectory hold hand command failed/cancelled")
-            raise
+        self.send_arm(target, cancelled)
         if self.hand:
             if cancelled() or not self.hand.command_physical(self.side, target["hand_unit"]):
                 raise RuntimeError("hand command rejected/feedback expired")
@@ -911,7 +873,7 @@ class DualBackend:
         return dict(sides=states, last_operation=self.operation_results)
 
     def _abort(self, exc):
-        if isinstance(exc, (InputHoldTransition, HoldReturnTransition, TrajectoryHoldTransition)):
+        if isinstance(exc, (InputHoldTransition, HoldReturnTransition)):
             raise exc
         self.cancel()
         try:
@@ -966,25 +928,7 @@ class DualBackend:
                         raise RuntimeError("dual hand feedback missing during hold")
                 return
             for side, member in self.members.items():
-                try:
-                    member.send_arm(target["targets"][side], cancelled)
-                except TrajectoryHoldTransition as transition:
-                    if self.contract.get("input_recovery_enabled") is not True:
-                        raise RuntimeError("dual trajectory hold is not commissioned") from transition
-                    # This member already committed its validated braking step.
-                    # Do not send any more following targets. Refresh/hold the
-                    # other member, including one that sent earlier this cycle.
-                    for other_side, other in self.members.items():
-                        if other_side != side:
-                            other.prepare_step(cancelled)
-                            if cancelled():
-                                raise RuntimeError("dual trajectory hold cancelled")
-                            other.hold_arm(verify_transition=True)
-                    if self.hand is not None:
-                        positions = {s: m.measured_hand_hold_target() for s, m in self.members.items()}
-                        if cancelled() or not self.hand.command_physical_batch(positions):
-                            raise RuntimeError("dual trajectory hand hold failed")
-                    raise transition
+                member.send_arm(target["targets"][side], cancelled)
             if cancelled():
                 raise RuntimeError("dual target expired before hands")
             if self.hand is not None and not self.hand.command_physical_batch({

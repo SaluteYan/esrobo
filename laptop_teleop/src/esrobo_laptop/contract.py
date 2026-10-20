@@ -19,7 +19,6 @@ def local_id(cfg, side, with_hand, hand_only=False):
         robot=dataclasses.asdict(cfg.robot), hand=dataclasses.asdict(cfg.hand),
         ik={k: v for k, v in dataclasses.asdict(cfg.ik).items() if k != "urdf_path"},
         trajectory_algorithm=TRAJECTORY_ALGORITHM_VERSION,
-        endpoint_speed=cfg.retarget.max_endpoint_translation_velocity_m_s,
         retarget_filter=retarget_filter_fingerprint(cfg.retarget),
         model_sha256=hashlib.sha256(Path(cfg.ik.urdf_path).read_bytes()).hexdigest(),
         side=side, with_hand=with_hand, hand_only=hand_only,

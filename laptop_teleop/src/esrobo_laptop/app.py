@@ -25,6 +25,10 @@ from .diagnostics import RuntimeDiagnostics
 from .input_recovery import InputRecovery, RecoveryRejected
 
 
+class HoldLatched(Exception):
+    """Gateway-confirmed hold ends the local following session normally."""
+
+
 def recent_rate(samples, now, window_s=2.0):
     """Stream rate over a bounded recent window, excluding old entry pauses."""
     while samples and now-samples[0] > window_s:
@@ -423,6 +427,8 @@ class Controller:
         if canonical(state["contract"]) != self.contract:
             raise ProtocolError("gateway configuration changed during session")
         mode = state["mode"]
+        if mode == "HOLD_LATCHED":
+            raise HoldLatched("已停止并保持")
         if mode not in ("IDLE", "RETURNING", "CALIBRATING", "ARMING", "CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET", "ACTIVE"):
             raise RuntimeError(f"robot {mode}: {state.get('reason', '')}; restart after local recovery")
         if mode == "RETURNING":
@@ -823,6 +829,7 @@ def main(argv=None):
     motion_trace = None
     controlling = False
     service_terminated = False
+    normal_exit_status = None
     old_sigterm = signal.getsignal(signal.SIGTERM)
     def terminate(*_):
         nonlocal service_terminated
@@ -1077,6 +1084,17 @@ def main(argv=None):
                     next_cycle = finished
             time.sleep(max(0., next_cycle-time.monotonic()))
         return 0
+    except HoldLatched as exc:
+        normal_exit_status = str(exc)
+        if journal:
+            journal.submit(dict(unix_ns=time.time_ns(), monotonic_s=time.monotonic(),
+                                record_type='controlled_stop', status=normal_exit_status,
+                                reason=state.get('reason'), mode='HOLD_LATCHED',
+                                sent=getattr(locals().get('controller'), 'sent', 0)), event=True)
+            journal.message(f"[laptop] {normal_exit_status}; targets sent={controller.sent}", event=True)
+        else:
+            print(f"[laptop] {normal_exit_status}", flush=True)
+        return 0
     except KeyboardInterrupt:
         if controlling and not service_terminated:
             try:
@@ -1122,7 +1140,7 @@ def main(argv=None):
         if journal:
             journal.submit(dict(unix_ns=time.time_ns(), monotonic_s=time.monotonic(),
                                 motion_trace=motion_trace.stats() if motion_trace is not None else None,
-                                record_type='exit', status='control resources closed',
+                                record_type='exit', status=normal_exit_status or 'control resources closed',
                                 sent=getattr(locals().get('controller'), 'sent', 0),
                                 mode=locals().get('state', {}).get('mode', 'unknown')), event=True)
             journal.close(timeout=1.)

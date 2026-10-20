@@ -56,12 +56,10 @@ def load(args):
 def solver_new():
  s=IkSolver(copy.deepcopy(cfg.ik));s.configure_position_envelope('left',cfg.robot.left_joint_soft_lower_limits_urdf,cfg.robot.left_joint_soft_upper_limits_urdf)
  s.initialize_arm_session('left',qref,np.deg2rad(load.flexion),relative_elbow_reference=False);s.reset_command_seed(measured[0]);return s
-def solve_series(u,f,p,*,limited=False):
- s=solver_new();w=WristMapping(s,cfg.robot,'left',qref,absolute_pose=True);previous=s.current_task_frame_poses(w.with_reference(measured[0]));qs=[];errors=[]
+def solve_series(u,f,p):
+ s=solver_new();w=WristMapping(s,cfg.robot,'left',qref,absolute_pose=True);qs=[];errors=[]
  for i,(uv,fv,pv) in enumerate(zip(u,f,p)):
   uv,fv=np.asarray(uv),np.asarray(fv);a=stages[i]['arm']['left'];poses={k:v.copy() for k,v in poses0.items()};el=poses['left_elbow'];wr=poses['left_wrist'];el[:3]=sh+ul*uv;wr[:3]=el[:3]+fl*fv
-  if not limited:el,wr=BodyDevice._limit_arm_segment_translations(previous['left_elbow'],previous['left_wrist'],el,wr,sh,cfg.retarget.max_endpoint_translation_velocity_m_s,a['target_dt_s'])
-  previous={'left_elbow':el,'left_wrist':wr}
   q=s.solve(wr,poses['right_wrist'],measured[i],el,poses['right_elbow'],partitioned_side='left',terminal_joint_targets=w.reference_terminal)
   if not s.last_solution_valid:raise RuntimeError(s.solution_diagnostics)
   q=q.copy();q[4:7]=w.absolute_terminal(pv,q);qs.append(q[:7]);errors.append(s.solution_diagnostics.get('wrist_error_m'))
@@ -116,7 +114,6 @@ def trajectory(qs,feedback_mode='recorded',tau=.06,targets_recorded=False):
  prev=[x for x in E if x['event']=='execution_cycle' and x['monotonic_ns']<first['monotonic_ns'] and x.get('feedback',{}).get('left',{}).get('motion')][-1]['feedback']['left']['motion']
  # The cycle before the first driver event is the previous cycle, because each driver event precedes its own execution_cycle.
  c.state=TrajectoryStep(np.array(prev['command_rad']),np.array(prev['velocity_rad_s']),stamp-dt,np.full(7,np.nan),{'feedback_physical_rad':first['feedback_urdf_rad'],'feedback_motion_stamp_s':stamp-dt,'feedback_velocity_rad_s':[0.]*7})
- fk14=s0.make_command_fk('left');fk=lambda q:fk14(np.r_[q,np.zeros(7)])
  fb=np.array(first['feedback_urdf_rad']);cmd=[];feedbacks=[];ts=[];fault=[]
  for j,row in enumerate(D):
   i=source_id[row['context']['command_seq']];stamp=row['feedback_snapshot']['stamp_s'];dt=stamp-c.state.stamp
@@ -124,7 +121,7 @@ def trajectory(qs,feedback_mode='recorded',tau=.06,targets_recorded=False):
   if feedback_mode=='recorded':fb=np.array(row['feedback_urdf_rad'])
   else:fb=fb+(1-np.exp(-dt/tau))*(c.state.position-fb) if tau>0 else c.state.position.copy()
   target=np.array(row['ik_urdf_rad']) if targets_recorded else qs[i]
-  try:step=c.propose(target,fb,stamp,np.array(cfg.robot.left_joint_soft_lower_limits_urdf),np.array(cfg.robot.left_joint_soft_upper_limits_urdf),fk,cfg.retarget.max_endpoint_translation_velocity_m_s,coordinate_elbow=True)
+  try:step=c.propose(target,fb,stamp,np.array(cfg.robot.left_joint_soft_lower_limits_urdf),np.array(cfg.robot.left_joint_soft_upper_limits_urdf),coordinate_elbow=True)
   except Exception as ex:fault.append((j,str(ex)));break
   c.commit(step);cmd.append(step.position);feedbacks.append(fb.copy());ts.append(stamp-D[0]['feedback_snapshot']['stamp_s']+T[source_id[D[0]['context']['command_seq']]])
  return dict(t=np.array(ts),command=np.array(cmd),feedback=np.array(feedbacks),fault=fault)
@@ -151,9 +148,9 @@ def main():
     args=p.parse_args();windows=[tuple(map(float,w.split(':'))) for w in args.windows]
     load(args)
     actual=np.array([x['command_urdf_rad'] for x in D])
-    reconstructed=solve_series([d['arm']['left']['limited_upper_direction'] for d in stages],
-                               [d['arm']['left']['limited_forearm_direction'] for d in stages],
-                               [d['wrist']['left']['absolute_local_orientation'] for d in stages],limited=True)
+    reconstructed=solve_series([d['arm']['left']['output_upper_direction'] for d in stages],
+                               [d['arm']['left']['output_forearm_direction'] for d in stages],
+                               [d['wrist']['left']['absolute_local_orientation'] for d in stages])
     baseline=trajectory(observed,targets_recorded=True)
     if baseline['fault']:raise RuntimeError(baseline['fault'])
     ik_error=float(np.max(abs(np.degrees(reconstructed-observed))))

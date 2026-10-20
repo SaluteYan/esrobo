@@ -119,7 +119,7 @@ def test_live_stall_is_bounded_by_fifteen_degrees_and_original_timeout(side):
     with pytest.raises(TrajectoryFault, match='persistent feedback lead'):
         for _ in range(300):
             step = p.propose(target, feedback, p.state.stamp+.02,
-                np.full(7, -4.), np.full(7, 4.), lambda q: np.zeros((2, 3)), 1.)
+                np.full(7, -4.), np.full(7, 4.))
             largest = max(largest, np.max(abs(step.position-feedback)))
             assert np.all(abs(step.position-feedback) <= np.deg2rad(15)+1e-8)
             p.commit(step)

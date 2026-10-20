@@ -48,7 +48,6 @@ def run(args):
     driver._session_start = None
     direction, offset = driver._mapping('right')
     lower, upper = driver._effective_position_limits('right')
-    model_fk = model.fk('right')
     def full(q):
         result = np.zeros(14);result[7:] = (q-offset)/direction;return result
     goal = direction*np.asarray(fixture['target_urdf_rad']) + offset
@@ -71,7 +70,7 @@ def run(args):
                 guard.begin_entry_certificates()
                 # Previous certified motion normally covers the outstanding command.
                 assert guard(full(current),full(trajectory.state.position)),guard.last_diagnostics
-            calls=[];fk_calls=[];finger_calls=[]
+            calls=[];finger_calls=[]
             build_fingers=guard._build_fingers
             def measured_build(intervals):
                 started=time.perf_counter()
@@ -86,18 +85,15 @@ def run(args):
                                   lower_urdf_rad=np.minimum(full(a),full(b)).tolist(),
                                   upper_urdf_rad=np.maximum(full(a),full(b)).tolist()))
                 return ok
-            def fk(q):
-                t=time.perf_counter();out=model_fk(full(q));fk_calls.append((time.perf_counter()-t)*1000);return out
             t=time.perf_counter();error=None
             try:
-                candidate=trajectory.propose(goal,current,stamp,lower,upper,fk,
-                    cfg.retarget.max_endpoint_translation_velocity_m_s,path_check=check)
+                candidate=trajectory.propose(goal,current,stamp,lower,upper,path_check=check)
                 accepted=check(current,candidate.position)
             except ValueError as exc:
                 error=str(exc);accepted=False
             elapsed=(time.perf_counter()-t)*1000
             repeats.append(dict(total_ms=elapsed,geometry_ms=sum(c['ms'] for c in calls),
-                fk_ms=sum(fk_calls),finger_build_ms=finger_calls,
+                finger_build_ms=finger_calls,
                 feedback_age_ms=age_s*1000,checks=calls,accepted=accepted,error=error))
             guard._build_fingers=build_fingers
             if not args.reuse_entry:
