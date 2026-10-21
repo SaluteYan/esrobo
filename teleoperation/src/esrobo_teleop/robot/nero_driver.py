@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 import threading
+import copy
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -2975,21 +2976,69 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                 or not self._controller_is_safe()
                 or not self._torque_is_safe(self._arm, self._side)):
             return False
+        # The last braking command is not proof that geometry stayed valid
+        # during stationary verification. Recheck before transferring ownership.
+        if not self._check_physical_path(actual, initial.position):
+            return False
         # No target snap and no reset of a moving trajectory. Stationary
         # feedback permits a fresh clock for the exact last committed position.
-        self._trajectory.reset(initial.position, self._arm.last_feedback_timestamp,
-                               feedback=actual)
-        directions, offsets = self._mapping(self._side)
-        full = np.zeros(14)
-        start = 0 if self._side == 'left' else 7
-        full[start:start+7] = (initial.position-offsets)/directions
-        self._last_commanded_full_urdf = full
-        self._last_command_feedback_timestamp = float(self._arm.last_feedback_timestamp)
-        self._command_velocity[self._side] = np.zeros(7)
-        self._cycle_feedback = None
-        self._first_follow_hold = True
-        self._return_inhibited = False
+        with self._trajectory_lock:
+            received = getattr(self, '_return_feedback_received', None)
+            if (self._return_cancel.is_set() or self._safety_fault_reason
+                    or not self._enabled or received is None
+                    or not 0 <= time.monotonic()-received <= self._cfg.command_trajectory_max_dt_s):
+                return False
+            self._trajectory.reset(initial.position, self._arm.last_feedback_timestamp,
+                                   feedback=actual)
+            directions, offsets = self._mapping(self._side)
+            full = np.zeros(14)
+            start = 0 if self._side == 'left' else 7
+            full[start:start+7] = (initial.position-offsets)/directions
+            self._last_commanded_full_urdf = full
+            self._last_command_feedback_timestamp = float(self._arm.last_feedback_timestamp)
+            self._command_velocity[self._side] = np.zeros(7)
+            self._cycle_feedback = None
+            self._first_follow_hold = True
+            self._return_inhibited = False
         return True
+
+    def _try_return_failure_hold(self, trajectory, *, entry_cache=None):
+        """Brake a recoverable checked-motion failure using committed state.
+
+        No replan, certificate widening, fault reset or velocity reset is
+        permitted here. A failed brake remains a fault; a successful brake
+        transfers a verified stationary command to the normal hold owner.
+        """
+        if (getattr(self._cfg, self._side + '_input_recovery_verified', False) is not True
+                or trajectory.state is None or self._return_cancel.is_set()
+                or self._safety_fault_reason or not self._enabled
+                or self._arm.get_joint_enable_states() != [True]*7):
+            return False
+        original_failure = self._return_execution_failure
+        self._return_start_state = trajectory.state
+        directions, offsets = self._mapping(self._side)
+        target = np.zeros(14)
+        start = 0 if self._side == 'left' else 7
+        target[start:start+7] = (trajectory.state.position-offsets)/directions
+        held = False
+        try:
+            # Reuse every return guard, including fresh feedback, controller,
+            # torque, full stopping-box coverage, send deadline and commit.
+            # brake_only prevents recursive fallback and waypoint progression.
+            stopped = self._execute_return_group(
+                target, np.arange(7), trajectory.state.position,
+                np.deg2rad(self._cfg.full_arm_return_tolerance_deg), 2.,
+                'failure_braking', brake_only=True,
+                require_zero_command_velocity=True, entry_cache=entry_cache)
+            held = bool(stopped and self._resume_stationary_return_hold())
+            self.return_hold_preserved = held
+            return held
+        finally:
+            brake_failure = None if held else (self._safety_fault_reason or self._return_execution_failure)
+            self._return_execution_failure = original_failure
+            self._return_failure_hold_diagnostics = dict(held=held,
+                trigger=original_failure, brake_failure=brake_failure)
+            self._emit_probe(dict(event='return_failure_hold', **self._return_failure_hold_diagnostics))
 
     def _brake_held_trajectory_for_return(self, timeout):
         """Finish the existing runtime brake before starting offline geometry.
@@ -3034,6 +3083,8 @@ class NeroSingleArmDriver(NeroDualArmDriver):
         self._handover_initialization_pending = False
         self._entry_hand_stationary_check = stationary_hand_check
         self._return_execution_failure = None
+        self._return_first_rejection = None
+        self._return_failure_hold_diagnostics = None
         self.return_hold_preserved = False
         hold_was_healthy = not (getattr(self, '_return_inhibited', False) or self._safety_fault_reason)
         if request_id is None:
@@ -3062,14 +3113,16 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             result = ReturnResult(returned, disabled, stage, reason)
             self.last_return_result = result
             if not returned:
-                self._return_inhibited = True
-                if (preserve_hold and not recover and hold_was_healthy
+                self._return_inhibited = not self.return_hold_preserved
+                if (not self.return_hold_preserved and preserve_hold and not recover and hold_was_healthy
                         and stage in ('preflight', 'hand_open_before_arm', 'planning')):
                     try:
                         self.return_hold_preserved = self._resume_stationary_return_hold()
                     except Exception:
                         self.return_hold_preserved = False
             self._emit_probe(dict(event="return_result", **result.__dict__,
+                holding=self.return_hold_preserved,
+                first_rejection=self._return_first_rejection,
                 collision=getattr(getattr(self, "_collision_guard", None), "last_diagnostics", None)))
             print(f"[{self._side}-arm] RETURN {stage}: {reason or 'zero verified'}; "
                   f"returned={returned}, disabled={disabled}", flush=True)
@@ -3731,12 +3784,19 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                       lambda a, b: self._check_physical_path(a, b, entry_coverage_only=True))
         sample = None
         last_send = None
+        first_rejection = None
         def safety_path(a, b):
+            nonlocal first_rejection
             ok = check_path(a, b)
             if not ok and entry_cache is not None:
-                details = entry_cache.last_diagnostics
+                if first_rejection is None:
+                    first_rejection = copy.deepcopy(entry_cache.last_diagnostics)
+                if (first_rejection.get('category') != 'entry_certificate_miss'
+                        and getattr(self, '_return_first_rejection', None) is None):
+                    self._return_first_rejection = copy.deepcopy(first_rejection)
+                details = first_rejection
                 self._return_execution_failure = (
-                    "initial approach certificate rejected: "
+                    "checked motion certificate rejected: "
                     + details.get('category', 'unknown') + "; "
                     + details.get('reason', '') + "; replan required")
             elif ok and entry_cache is not None:
@@ -4028,6 +4088,10 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                         # cycle. Re-read hardware before forming a command.
                         pause()
                         continue
+                # Optional lookahead misses are not execution faults. Within
+                # this proposal, retain the first cause instead of subsequent
+                # generic 'certificate invalid' retries.
+                first_rejection = None
                 try:
                     proposal = return_trajectory.propose(
                         target_physical, current, stamp, lower, upper,
@@ -4086,10 +4150,12 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                         self._return_execution_failure += (
                             f"; observed feedback interval={observed_feedback_dt}; "
                             f"command state interval={float(stamp-return_trajectory.state.stamp):.4f}s")
-                    if entry_cache is not None and not entry_cache.last_diagnostics.get('certified', False):
-                        details = entry_cache.last_diagnostics
+                    if first_rejection is not None:
+                        details = first_rejection
+                        if getattr(self, '_return_first_rejection', None) is None:
+                            self._return_first_rejection = copy.deepcopy(details)
                         self._return_execution_failure = (
-                            "initial approach certificate rejected: "
+                            "checked motion certificate rejected: "
                             + details.get('category', 'unknown') + "; "
                             + details.get('reason', '') + "; replan required; " + str(exc))
                     self._emit_probe(dict(
@@ -4100,6 +4166,8 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                         f"an unsafe return trajectory: {exc}.",
                         flush=True,
                     )
+                    if not brake_only and fault_code in ('collision_rejected', 'joint_candidate_invalid'):
+                        self._try_return_failure_hold(return_trajectory, entry_cache=entry_cache)
                     return False
                 except (TypeError, ValueError) as exc:
                     self._return_inhibited = True
@@ -4112,6 +4180,10 @@ class NeroSingleArmDriver(NeroDualArmDriver):
                     return False
                 if not safety_path(current, limited):
                     self._return_inhibited = True
+                    if getattr(self, '_return_first_rejection', None) is None:
+                        self._return_first_rejection = copy.deepcopy(first_rejection)
+                    if not brake_only:
+                        self._try_return_failure_hold(return_trajectory, entry_cache=entry_cache)
                     return False
                 sent = send(limited, proposal.velocity, stamp)
                 if sent is None:
@@ -4171,6 +4243,8 @@ class NeroSingleArmDriver(NeroDualArmDriver):
             f"{self._return_execution_failure}.",
             flush=True,
         )
+        if not brake_only and not self._return_cancel.is_set():
+            self._try_return_failure_hold(return_trajectory, entry_cache=entry_cache)
         return False
 
     def disable(self) -> bool:

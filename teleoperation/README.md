@@ -218,9 +218,11 @@ python3 scripts/hand_safe_test.py --side right --joint 2 --delta 8 --confirm-mot
 L10 顺序已按硬件 SDK 固定映射。当前左手通过 `left_enabled_physical_joints` 启用全部十轴，
 使用原始 PICO 26 点的 URDF 拟合；右手保留 `[0,1,2,3,4,5,9]` 和既有端点。
 左手新增侧摆及旋转采用当前名义控制模型，不代表完成新增实机标定，见
-[左手十轴重定向](../laptop_teleop/docs/09_LEFT_HAND_RETARGET.md)。
+[左手十轴重定向](../laptop_teleop/docs/07_CODE_AND_COMPUTATION.md#左手-l20lite-十轴重定向)。
 
 ## 5. 离线测试（无需硬件）
+
+`tests/` 的回归源码与 `fixtures/` 用于模型、保护和故障复现；`log/` 是运行产物，不能混为一类清理。可删除已确认的模拟输出及字节码缓存，保留有效测试、URDF与 `assets/` 网格。历史故障和回放资料集中在本机 `laptop_teleop/log/retained/`，部分文件已无损压缩；读取方式及全仓库清理边界见[日志与测试目录维护](../laptop_teleop/docs/04_TROUBLESHOOTING.md#日志与测试目录维护)。仅整理文件不运行下面的仿真程序，也不启动任何硬件。
 
 ```bash
 cd /home/esrobo/Projects/esrobo/teleoperation

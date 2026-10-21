@@ -352,6 +352,11 @@ class HardwareBackend:
         if result.returned and not hand_stationary():
             raise RuntimeError("held hand moved or feedback expired during handover")
         if not result.returned or cancelled():
+            if (not cancelled() and getattr(self.arm, 'return_hold_preserved', False) is True
+                    and self.contract.get('input_recovery_enabled') is True):
+                holding = self.hand is None or (self.hand.feedback_ready() and self.hand.set_enabled(True))
+                if holding:
+                    return dict(dataclasses.asdict(result), holding=True)
             diagnostic = getattr(self.arm._collision_guard, "last_diagnostics", {})
             geometry = {key: diagnostic.get(key) for key in
                         ("category", "pair", "clearance_m", "required_m")}
@@ -419,7 +424,13 @@ class HardwareBackend:
         return proof['certified']
 
     def return_diagnostics(self):
-        return getattr(self, '_last_hand_return_diagnostics', None)
+        details = dict(getattr(self, '_last_hand_return_diagnostics', None) or {})
+        for key, attr in (('first_motion_rejection', '_return_first_rejection'),
+                          ('failure_hold', '_return_failure_hold_diagnostics')):
+            value = getattr(self.arm, attr, None)
+            if isinstance(value, dict):
+                details[key] = value
+        return details or None
 
     def _restore_hand_before_return(self, result, cancelled, *, holding=False):
         """Verify hand zero at a disabled or verified stationary held arm pose."""
@@ -450,6 +461,8 @@ class HardwareBackend:
             if already_open:
                 # Fresh measured arrival needs no new hand command or swept
                 # motion certificate. Do not move a hand already at its zero.
+                self.hand.finish_output(cancelled, safety_check=lambda: not
+                    self._hand_return_feedback(cancelled, anchor=anchor, holding=holding)[1])
                 return dict(result, hands_open=True, disabled=not holding, reason='')
             envelope = None
             if near_zero:
@@ -495,7 +508,15 @@ class HardwareBackend:
                 return ok
 
             if not self._certify_return_hand(full-drift, full+drift, envelope, near_zero, monitor):
-                raise RuntimeError('hand open sweep not certified safe')
+                diagnostic = self.arm._collision_guard.last_diagnostics
+                pair = diagnostic.get('pair')
+                clearance, required = diagnostic.get('clearance_m'), diagnostic.get('required_m')
+                detail = ''
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    detail = ': '+str(pair[0])+' / '+str(pair[1])
+                if isinstance(clearance, (int, float)) and isinstance(required, (int, float)):
+                    detail += f'; clearance={clearance*1000:.1f}mm required={required*1000:.1f}mm'
+                raise RuntimeError('hand open sweep not certified safe'+detail)
             # A certificate is useful only while the original feedback, pose
             # and hand envelope still match. No command precedes this check.
             if not monitor():
@@ -505,6 +526,14 @@ class HardwareBackend:
                 cancelled, safety_check=monitor, force=True)
             if not opened or not monitor():
                 raise RuntimeError(reason or ('hand open feedback not verified: '+
+                                             self.hand.describe_open_pose_errors(errors)))
+            # A verified pose can arrive while the final redundant command is
+            # between its two CAN frames. Finish that pair before normal stop;
+            # aborts still take the immediate-stop finally path below.
+            self.hand.finish_output(cancelled, safety_check=monitor)
+            opened, errors = self.hand.open_pose_status()
+            if not opened or not monitor():
+                raise RuntimeError(reason or ('hand zero lost before arm return (after completion): '+
                                              self.hand.describe_open_pose_errors(errors)))
             return dict(result, hands_open=True, disabled=not holding, reason='')
         except Exception as exc:
@@ -752,8 +781,8 @@ class HardwareBackend:
                 recognize_inherited_stop=explicit_recovery and not from_hold,
                 **hand_phase)
             result.update(dataclasses.asdict(arm_result), arm_returned=arm_result.returned)
-            if from_hold:
-                result['holding'] = bool(getattr(self.arm, 'return_hold_preserved', False))
+            if from_hold or getattr(self.arm, 'return_hold_preserved', False) is True:
+                result['holding'] = getattr(self.arm, 'return_hold_preserved', False) is True
                 if result['holding'] and self.hand is not None:
                     # Restore only the measured-position software command gate;
                     # this does not send a hand target or resume live following.

@@ -45,6 +45,42 @@ class SkeletonViewerState:
         self._diagnostics_monotonic = 0.0
         self._acquisition_diagnostics = None
         self._acquisition_diagnostics_monotonic = 0.0
+        self._hand_samples = {}
+
+    def update_hands(self, samples):
+        """Retain only new owned SDK snapshots; never read the SDK here.
+
+        The acquisition owner and hand worker treat these snapshots as immutable.
+        Conversion/validation for the browser runs in the HTTP reader instead.
+        """
+        with self._lock:
+            for side in ('left', 'right'):
+                sample = samples.get(side)
+                if (isinstance(sample, dict) and type(sample.get('sequence')) is int
+                        and sample['sequence'] > self._hand_samples.get(side, {}).get('sequence', 0)):
+                    self._hand_samples[side] = sample
+
+    @staticmethod
+    def _hand_view(sample, now, body_stamp):
+        if sample is None:
+            return dict(available=False, age_ms=None, positions=[], valid=[])
+        stamp = sample.get('received_monotonic_ns', 0)
+        stamp = stamp / 1e9 if type(stamp) in (int, float) and math.isfinite(stamp) else 0.
+        age = now-stamp
+        poses, flags = sample.get('poses', []), sample.get('flags', [])
+        positions, valid = [], []
+        for index in range(26):
+            try:
+                pos = [float(value) for value in poses[index][:3]]
+                ok = len(pos) == 3 and all(math.isfinite(v) for v in pos) and bool(int(flags[index]) & 2)
+            except (IndexError, TypeError, ValueError, OverflowError):
+                pos, ok = None, False
+            positions.append(pos if ok else None)
+            valid.append(ok)
+        return dict(available=bool(sample.get('active')) and stamp > 0 and 0 <= age <= .5,
+                    sequence=sample.get('sequence'), age_ms=round(age*1000., 1) if stamp > 0 else None,
+                    body_delta_ms=round(abs(stamp-body_stamp)*1000., 1) if body_stamp else None,
+                    positions=positions, valid=valid)
 
     @staticmethod
     def _signature(packet: dict[str, Any]) -> tuple[Any, ...]:
@@ -88,7 +124,9 @@ class SkeletonViewerState:
                 # current reception gap behind a high displayed frequency.
                 elapsed = now - self._source_updates[0]
                 update_hz = (len(self._source_updates) - 1) / max(elapsed, 1.0e-9)
-            return {
+            hands = dict(self._hand_samples)
+            body_stamp = self._received_monotonic if packet is not None else None
+            result = {
                 "connected": age_s is not None and age_s <= 0.5,
                 "age_ms": None if age_s is None else round(age_s * 1000.0, 1),
                 "source_update_hz": round(update_hz, 1),
@@ -104,6 +142,9 @@ class SkeletonViewerState:
                     else round((now - self._diagnostics_monotonic) * 1000.0, 1)
                 ),
             }
+        result['hands'] = {side: self._hand_view(hands.get(side), now, body_stamp)
+                           for side in ('left', 'right')}
+        return result
 
     def update_diagnostics(self, diagnostics: dict[str, Any]) -> None:
         now = time.monotonic()

@@ -31,6 +31,10 @@ class HandHandover:
         self.lead = None if lead is None else float(lead)
         if self.lead is not None and (not math.isfinite(self.lead) or not 0 < self.lead <= 30):
             raise ValueError('live hand feedback lead must be null or in (0, 30] units')
+        self.arrival_tolerance = (float(getattr(cfg, 'left_initial_handover_tolerance', 5.))
+                                  if side == 'left' and not live_goal else 2.)
+        if not math.isfinite(self.arrival_tolerance) or not 0 < self.arrival_tolerance <= 15:
+            raise ValueError('initial hand arrival tolerance must be in (0, 15] units')
         self.started = now
         self.command = self.checked(measured)
         self.last_at = now
@@ -70,11 +74,12 @@ class HandHandover:
             pending = [
                 f"physical[{i}] goal={goal[i]} command={self.command[i]} feedback={actual[i]}"
                 for i in self.enabled
-                if self.command[i] != goal[i] or abs(actual[i]-goal[i]) > 2
+                if self.command[i] != goal[i] or abs(actual[i]-goal[i]) > self.arrival_tolerance
             ]
             detail = "; ".join(pending) or f"matched_frames={self.matched}/3"
             raise RuntimeError(
-                "initial hand handover exceeded 10 s; explicit recovery required; " + detail)
+                "initial hand handover exceeded 10 s; explicit recovery required; " + detail
+                + f"; arrival_tolerance={self.arrival_tolerance:g} units")
         dt = max(0., min(now-self.last_at, self.period))
         budget = min(self.step, int(math.floor(self.velocity*dt+1.e-7)))
         lower, upper = self.command-budget, self.command+budget
@@ -98,7 +103,7 @@ class HandHandover:
         # commands. Do not send a reversal while it is chasing the last target:
         # otherwise the delayed original movement and the reversed command can
         # separate beyond both limits on the next feedback update. Use the
-        # existing two-unit arrival tolerance, not an enlarged feedback band.
+        # existing two-unit reversal threshold, independent of arrival tolerance.
         reversing = (np.sign(goal-self.command)*self.direction < 0)
         waiting = reversing & (np.abs(actual-self.command) > 2) & (not self.live_goal)
         bounded_goal = np.where(waiting, self.command, goal)
@@ -110,7 +115,7 @@ class HandHandover:
             if delta[i]:
                 direction[i] = delta[i]
         matched = (np.all(candidate[self.enabled] == goal[self.enabled])
-                   and np.all(np.abs(actual[self.enabled]-goal[self.enabled]) <= 2))
+                   and np.all(np.abs(actual[self.enabled]-goal[self.enabled]) <= self.arrival_tolerance))
         return HandStep(tuple(int(v) for v in candidate), now,
                         self.matched+1 if matched else 0,
                         tuple(int(v) for v in direction),

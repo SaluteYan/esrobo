@@ -46,6 +46,8 @@ class Gateway:
         self.motion_trace = None
         self._trace_target_context = None
         self._diagnostic_events = []
+        self.journal_error = None
+        self.diagnostic_events_dropped = 0
         self._state_encoding_status = None
         self._last_record = None
         self._record_time = 0.0
@@ -65,6 +67,10 @@ class Gateway:
             details['state'] = {k:v for k,v in details['state'].items()
                                 if k not in ('lease', 'session', 'client_nonce')}
         with self.lock:
+            # Diagnostic failure must not turn into unbounded memory growth.
+            if len(self._diagnostic_events) >= 256:
+                del self._diagnostic_events[0]
+                self.diagnostic_events_dropped += 1
             self._diagnostic_events.append(dict(record_type=kind, unix_ns=time.time_ns(),
                                                 monotonic_s=time.monotonic(), **copy.deepcopy(details)))
         print(f"[gateway] {kind}: {short_text(details.get('reason', details.get('stage', 'recorded')))}", flush=True)
@@ -89,7 +95,7 @@ class Gateway:
                     self.diagnostic_event('network_state_error', reason=str(exc),
                                           action='core_state_rejected', state=message)
                     self._state_encoding_status = 'core_oversize'
-                    self.trip('required state exceeds packet bound; telemetry unavailable')
+                    self.input_fault('required state exceeds packet bound; telemetry unavailable')
                 return None
             if self._state_encoding_status != 'compacted':
                 self.diagnostic_event('network_state_error', reason='optional diagnostics exceeded packet bound',
@@ -192,7 +198,9 @@ class Gateway:
         self.journal.write(json.dumps(entry, allow_nan=False) + "\n")
         self.journal.flush()
         with self.lock:
-            del self._diagnostic_events[:len(events)]
+            written = {id(event) for event in events}
+            self._diagnostic_events[:] = [event for event in self._diagnostic_events
+                                          if id(event) not in written]
             if self._fault_event_pending is fault_event:
                 self._fault_event_pending = None
             self._last_record, self._record_time = identity, now
@@ -238,13 +246,26 @@ class Gateway:
         with self.lock:
             if self.mode == 'HOLD_LATCHED':
                 return
-            if (self.mode != 'ACTIVE'
+            if (self.mode not in ('ACTIVE', 'WAITING_FOR_ACTIVE_TARGET')
                     or self.backend.contract.get('input_recovery_enabled') is not True):
                 self.trip(reason)
                 return
             self.mode, self.reason = 'HOLD_LATCHED', reason
-            self.first_fault_reason = self.first_fault_reason or reason
+            self.entry_plan_token = ''
+            self.entry_ready_deadline = None
             self.pending = None
+
+    def accept_checked_hold(self, result):
+        """Only accept an explicit backend proof, never infer hold from text."""
+        if (result.get('holding') is not True or self.cancelled.is_set()
+                or self.backend.contract.get('input_recovery_enabled') is not True):
+            return False
+        self.mode = 'HOLD_LATCHED'
+        self.reason = return_failure('已停止并保持；受检运动未完成，需显式恢复', result)
+        self.entry_plan_token = ''
+        self.entry_ready_deadline = None
+        self.pending = None
+        return True
 
     def recovery_status(self):
         started = self.gate.recovery_started_at
@@ -252,6 +273,8 @@ class Gateway:
                  'REACQUIRING' if started is not None else
                  'INPUT_WAIT' if self.gate.hold_started_at is not None else self.mode)
         return dict(input_recovery_protocol=self.backend.contract.get('input_recovery_protocol'),
+                    journal_error=self.journal_error,
+                    diagnostic_events_dropped=self.diagnostic_events_dropped,
                     input_recovery_enabled=self.backend.contract.get('input_recovery_enabled', False),
                     controlled_stop_protocol=1,
                     controlled_stop_enabled=self.backend.contract.get('input_recovery_enabled') is True,
@@ -273,16 +296,13 @@ class Gateway:
                     self.entry_target = None
                 self.entry_candidate_since = None
             if self.mode in ("ACTIVE", "ARMING", "CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET") and not self.gate.fresh(time.monotonic()):
-                if self.mode == 'ACTIVE':
-                    self.input_fault("joint target lease expired; explicit local recovery required")
-                else:
-                    self.trip("joint target lease expired; explicit local recovery required")
+                self.input_fault("joint target lease expired; explicit local recovery required")
             if self.mode in ("CHECKING_ENTRY", "APPROACHING", "WAITING_FOR_ACTIVE_TARGET"):
                 if not self.entry_matches(self.gate.target):
-                    self.trip("handover target/reference changed or input expired")
+                    self.input_fault("handover target/reference changed or input expired")
                 elif (self.entry_ready_deadline is not None
                       and time.monotonic() > self.entry_ready_deadline):
-                    self.trip("fresh ACTIVE target acknowledgment timed out")
+                    self.input_fault("fresh ACTIVE target acknowledgment timed out")
 
     def entry_matches(self, target, *, distance=.02, joint_limit_deg=2.):
         reference = self.entry_target
@@ -454,7 +474,7 @@ class Gateway:
                                     and self.mode == "ACTIVE"):
                                 entry = self.gate.target.get("entry", {})
                                 if entry.get("phase") not in ("ready", "active") or entry.get("token") != self.entry_token:
-                                    self.trip("invalid ACTIVE handover token/phase")
+                                    self.input_fault("invalid ACTIVE handover token/phase")
                             if kind == "stop":
                                 self.trip("laptop requested stop")
                                 self.stop_pending = True
@@ -519,7 +539,11 @@ class Gateway:
                                 self.state_send_gaps_over_80ms += gap > .08
                             self._last_state_send_at = sent_at
                     except OSError:
-                        self.trip("feedback send failed")
+                        self.input_fault("feedback send failed; explicit local recovery required")
+        except OSError as exc:
+            # The local executor owns braking even if its UDP worker exits.
+            # Do not tear it down merely because remote telemetry is lost.
+            self.input_fault(f"network I/O failed: {exc}; explicit local recovery required")
         except Exception as exc:
             self.diagnostic_event("network_state_error", reason=f"network worker failed: {exc}")
             self.trip(f"network worker failed: {exc}")
@@ -659,6 +683,8 @@ class Gateway:
                         self.reason = ("robot_zero_verified=True; hand_open_verified=True; "
                                        "waiting for complete PICO calibration pose")
                         self.gate.target, self.gate.deadline = None, 0.0
+                    elif self.accept_checked_hold(result):
+                        pass
                     else:
                         raise RuntimeError(return_failure("session preparation failed/cancelled", result))
             elif operation == "h":
@@ -671,6 +697,8 @@ class Gateway:
                     self.last_return = result
                     self.record_return(result)
                     self.feedback, self.feedback_time = feedback, time.monotonic()
+                    if self.accept_checked_hold(result):
+                        return  # Next executor tick maintains the verified hold.
                     self.entry_ready_deadline = time.monotonic() + 2.
                     self.entry_token = secrets.token_hex(16)
                     self.mode = "WAITING_FOR_ACTIVE_TARGET"
@@ -704,10 +732,8 @@ class Gateway:
                                        "zero/disable verified; local e required")
                         self.first_fault_reason, self.first_fault_summary = None, None
                         self.gate.target, self.gate.deadline = None, 0.0
-                    elif (operation == 'z_hold' and result.get('holding')
-                          and not self.cancelled.is_set()):
-                        self.mode = 'HOLD_LATCHED'
-                        self.reason = return_failure("return refused; verified hold retained", result)
+                    elif self.accept_checked_hold(result):
+                        pass
                     else:
                         # A failed offline preflight/plan or hand-open check
                         # must remain FAULT, but need not re-latch E-stop on an
@@ -772,16 +798,27 @@ class Gateway:
                 and time.monotonic() >= self.gate.target_deadline):
             raise RuntimeError("fresh ready acknowledgment expired during activation")
 
+    def safe_record(self):
+        try:
+            self.record()
+        except Exception as exc:
+            # Losing observability is reported separately from motion safety.
+            # Do not let a full disk disable a load-bearing arm, nor recursively
+            # attempt to write the error through the failed journal.
+            with self.lock:
+                self.journal_error = short_text(f'{type(exc).__name__}: {exc}')
+                self.journal = None
+            try:
+                print(f'[gateway] journal disabled: {self.journal_error}', flush=True)
+            except OSError:
+                pass
+
     def diagnostic_loop(self):
         # Planning can block the I/O worker for seconds. Keep dashboard phases
         # visible without putting filesystem writes on the network watchdog.
-        try:
-            while not self.network_done.wait(.05):
-                self.record()
-        except Exception as exc:
-            self.trip(f"diagnostic writer failed: {exc}")
-        finally:
-            self.record()  # Drain result/error events even when shutdown skips the next tick.
+        while not self.network_done.wait(.05):
+            self.safe_record()
+        self.safe_record()
 
     def run(self):
         logger = threading.Thread(target=self.diagnostic_loop, name="robot-link-journal", daemon=True)
@@ -803,7 +840,7 @@ class Gateway:
                 self.network_done.set()
                 thread.join(timeout=1)
                 logger.join()
-                self.record()  # Flush any event queued while the network thread was exiting.
+                self.safe_record()  # A failed final log write must not skip resource cleanup.
                 self.socket.close()
                 self.backend.close()
 
@@ -854,7 +891,8 @@ def main():
     log_path = Path(args.log_file) if args.log_file else Path(__file__).resolve().parents[1] / "log" / f"gateway_{time.time_ns()}.jsonl"
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        gateway.journal = log_path.open("x", encoding="utf-8")
+        journal = log_path.open("x", encoding="utf-8")
+        gateway.journal = journal
     except BaseException:
         gateway.socket.close()
         backend.close()
@@ -904,14 +942,25 @@ def main():
         gateway.run()
     finally:
         retention_stopped.set()
-        motion_trace.close()
-        gateway.journal.write(json.dumps(dict(record_type='motion_trace_closed', **motion_trace.stats()))+'\n')
-        gateway.journal.flush()
-        gateway.journal.close()
-        if torque_log is not None:
-            torque_log.close()
-        if lock_file:
-            lock_file.close()
+        try:
+            motion_trace.close()
+            if gateway.journal is not None:
+                try:
+                    journal.write(json.dumps(dict(record_type='motion_trace_closed', **motion_trace.stats()))+'\n')
+                    journal.flush()
+                except (OSError, ValueError):
+                    pass  # A final disk error must not skip closing resources.
+        finally:
+            try:
+                journal.close()
+            except OSError:
+                pass
+            try:
+                if torque_log is not None:
+                    torque_log.close()
+            finally:
+                if lock_file:
+                    lock_file.close()
 
 
 if __name__ == "__main__":

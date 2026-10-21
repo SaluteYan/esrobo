@@ -994,6 +994,7 @@ def main(argv=None):
                                   command=controller.hand_handover.command.tolist(),
                                   reversal_wait_physical=list(controller.hand_handover.reversal_wait),
                                   age_s=now-controller.hand_handover.started,
+                                  arrival_tolerance_unit=controller.hand_handover.arrival_tolerance,
                                   matched_frames=controller.hand_handover.matched)),
                               hand_following={side: dict(
                                   command=limiter.command.tolist(),

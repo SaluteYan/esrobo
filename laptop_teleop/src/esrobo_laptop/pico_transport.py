@@ -507,6 +507,10 @@ class PicoForwarder:
                             self.trace.emit('body_rejected', source_sequence=sample.get('sequence'), reason=str(exc))
                 for side in ('left', 'right'):
                     self.hands.offer(side, updates[side])
+                if self.viewer:
+                    # Read-only browser data stays local, outside the Body UDP
+                    # packet and after control forwarding. No extra SDK reads.
+                    self.viewer.state.update_hands(updates)
         finally:
             self.close()
         return 0

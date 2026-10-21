@@ -167,6 +167,7 @@ def test_hand_diagnostics_expire_when_receipts_or_mapping_stop(monkeypatch):
 
 
 @pytest.mark.parametrize('hz', [60, 74, 90])
+@pytest.mark.performance
 def test_uniform_input_forwards_95_percent_with_low_notification_latency(hz):
     sdk = FakeSDK(hz)
     f = forwarder(sdk, mapper=Mapper())
@@ -185,6 +186,7 @@ def test_uniform_input_forwards_95_percent_with_low_notification_latency(hz):
 
 
 @pytest.mark.parametrize('delay', [.02, .1, .5])
+@pytest.mark.performance
 def test_body_does_not_wait_for_hand_computation(delay):
     sdk = FakeSDK()
     f = forwarder(sdk, mapper=Mapper(delay))
@@ -265,6 +267,7 @@ def test_hand_expiration_invalid_flags_and_side_independence():
     assert not mapper.last.get('left')
 
 
+@pytest.mark.performance
 def test_blocked_terminal_does_not_block_body(tmp_path):
     release = threading.Event()
     class Blocked:
@@ -339,6 +342,7 @@ def test_owner_initializes_once_per_start_and_workers_never_subscribe(monkeypatc
 
 
 @pytest.mark.parametrize('delay', [.02, .1, .5])
+@pytest.mark.performance
 def test_slow_recording_does_not_hold_forwarder(tmp_path, delay):
     diagnostics = RuntimeDiagnostics(tmp_path/'diagnostic.jsonl')
     sdk = FakeSDK()

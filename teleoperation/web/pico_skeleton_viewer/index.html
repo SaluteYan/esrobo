@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PICO 双臂骨架诊断</title>
-  <link rel="stylesheet" href="./styles.css?v=20261009-entry-boundary">
+  <title>PICO 双臂与人手骨架诊断</title>
+  <link rel="stylesheet" href="./styles.css?v=20261021-human-hands">
 </head>
 <body>
   <main class="workspace">
     <header class="topbar">
       <div class="title-block">
-        <h1>PICO 双臂骨架诊断</h1>
+        <h1>PICO 双臂与人手骨架诊断</h1>
         <span id="sequence">序列 --</span>
       </div>
       <div class="status-cluster">
@@ -28,6 +28,7 @@
           <option value="feedback">实际反馈</option>
         </select>
         <span id="layer-status">原始采集层</span>
+        <label class="hand-toggle"><input id="show-hands" type="checkbox" checked>显示人手</label>
         <button id="pause" class="command" type="button">暂停</button>
         <button id="reset-camera" class="command" type="button">重置视角</button>
       </div>
@@ -36,8 +37,8 @@
     <section class="viewport" aria-label="三维骨架视图">
       <div id="scene"></div>
       <div id="data-warning" class="data-warning" role="status">尚未收到 Body 骨架数据。</div>
-      <div class="side-label left">左臂</div>
-      <div class="side-label right">右臂</div>
+      <div class="side-label left">左臂 / 左手</div>
+      <div class="side-label right">右臂 / 右手</div>
       <div class="axis-legend">
         <span><i class="axis x"></i>+X</span>
         <span><i class="axis y"></i>+Y</span>
@@ -59,6 +60,8 @@
         <h2>追踪质量</h2>
         <dl class="metrics">
           <div><dt>有效节点</dt><dd id="valid-count">0 / 0</dd></div>
+          <div><dt>左人手节点</dt><dd id="left-hand-status">等待26点数据</dd></div>
+          <div><dt>右人手节点</dt><dd id="right-hand-status">等待26点数据</dd></div>
           <div><dt>左大臂</dt><dd id="left-upper">-- m</dd></div>
           <div><dt>左前臂</dt><dd id="left-fore">-- m</dd></div>
           <div><dt>右大臂</dt><dd id="right-upper">-- m</dd></div>
@@ -95,6 +98,6 @@
       </section>
     </aside>
   </main>
-  <script type="module" src="./app.js?v=20261009-entry-boundary"></script>
+  <script type="module" src="./app.js?v=20261021-human-hands"></script>
 </body>
 </html>

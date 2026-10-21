@@ -56,6 +56,8 @@ flowchart LR
 
 `build/`、`install/`、`log/` 是本机生成的构建或运行目录；外部 SDK 与本机标定文件也可能只存在于已部署机器上。新机器部署时按[环境安装](laptop_teleop/README.md#环境安装与配置)和[两机连接](laptop_teleop/docs/02_ROBOT_CONNECTION.md)准备，不能仅凭克隆源码推断设备已就绪。
 
+清理仓库时，优先删除可再生缓存、已确认的模拟输出及重复备份；不要把 `external/`、虚拟环境、`install/` 或 URDF 网格当作普通缓存清空。历史现场记录可校验后压缩，活动日志、状态、标定和未解决故障证据保留。测试按用途保留，按修改范围运行；目录规则、归档读取及清理清单见[日志与测试目录维护](laptop_teleop/docs/04_TROUBLESHOOTING.md#日志与测试目录维护)。
+
 ## 从哪里开始
 
 1. **首次部署**：阅读[环境安装](laptop_teleop/README.md#环境安装与配置)和[网络、SSH、共享密钥及网关](laptop_teleop/docs/02_ROBOT_CONNECTION.md)。本机与机器人端需使用相匹配的协议、配置和 URDF。

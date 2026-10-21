@@ -701,6 +701,8 @@ function render() {
     ? `受检回零未完成（${returnStage}）：${
         returnFailure === 'goal pose not certified safe'
           ? '零位目标未通过几何安全检查；当前手指姿态也参与检查。请查看机器人网关日志中的碰撞部位及间隙，处理原因后再重试。'
+          : returnFailure.startsWith('hand open sweep not certified safe')
+          ? '灵巧手张开路径未通过几何安全检查（扫掠包络与机器人模型过近或重叠），没有发送张手命令。' + returnFailure.slice('hand open sweep not certified safe'.length)
           : returnFailure
       }${robot.last_return.arm_returned === false ? ' 机械臂七轴回零尚未开始或未完成。' : ''}${robot.last_return.disabled === true ? ' 已核验失能。' : ' 尚未核验失能，未恢复 IDLE。'} 详细反馈与几何诊断见机器人网关日志。`
     : '';
@@ -890,8 +892,8 @@ function render() {
           ? '机械臂受控停稳并保持使能，先受检归零手部，再规划执行七关节回零，到位后失能；规划拒绝时保留经核验的位置保持。'
           : enabledRecoveryRefusal(state, sides.find(side => !canReturnWhileHolding(state, side))))
         : feedbackMissing ? '机械臂 CAN 反馈缺失，不是已确认的急停。恢复先请求遥测并核验七轴；若仍无数据，检查供电、CAN 接线和接口映射，不能强制清除故障。'
-        : disabledPoseRevalidation ? '七轴已失能，当前位置尚未重新核验。点击受检恢复后，机器人端先重新核验当前位置、静止反馈和控制器，核验通过后才执行受检回零；失能不等于恢复 IDLE。'
         : returnFailureDetail ? returnFailureDetail
+        : disabledPoseRevalidation ? '七轴已失能，当前位置尚未重新核验。点击受检恢复后，机器人端先重新核验当前位置、静止反馈和控制器，核验通过后才执行受检回零；失能不等于恢复 IDLE。'
         : recoveryNeeded && mode.hand_only ? '停止后核验机械臂失能和手部反馈；恢复不发送位置目标。'
           : recoveryNeeded ? '控制器故障尚未解除；单臂受检恢复会先核验失能急停，再规划回零运动。'
             : robot.mode === 'RECOVERING' || robot.mode === 'RETURNING' ? '恢复正在执行，等待网关显示 IDLE。'

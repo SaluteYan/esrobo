@@ -119,9 +119,15 @@ Body 和 Hand 由一个 SDK 订阅独立提交/转发，控制端按真实时间
 
 ```bash
 ./laptop_teleop/scripts/test.sh
+# 默认42项冒烟；指定文件只跑该文件
+./laptop_teleop/scripts/test.sh laptop_teleop/tests/test_hand_handover.py
+# 跨模块变更／发布前显式运行完整功能回归
+./laptop_teleop/scripts/test.sh --full
 ```
 
-性能耗时仅由独立 `tests/tools/profile_runtime.py` 等工具测量，正式运行不加载逐周期耗时或分位数统计。测试方式见 [排障指南](docs/04_TROUBLESHOOTING.md#独立测试与耗时测量)。
+采集时序性能验收单独运行 `test.sh --performance`；完整基准使用独立 `tests/tools/profile_runtime.py` 等工具。正式运行不加载逐函数性能包装器。按改动选用 `--hand`、`--handover`、`--transport`、`--web`、`--arm` 或具体用例，避免每次小改动运行完整回归；详见 [验证范围](docs/04_TROUBLESHOOTING.md#按修改范围验证)。
+
+`log/retained/` 中部分历史 JSON／JSONL 已改为同名 `.gz` 无损归档；需要回放时按[维护说明](docs/04_TROUBLESHOOTING.md#日志与测试目录维护)解压所需文件。运行状态、活动采集、模型、安装环境及有效测试样本不属于清理对象。`__pycache__/` 和 `.pytest_cache/` 可再生；清理它们不等于删除测试，也不需要重新执行全套运动回归。
 
 ## 文档导航
 
