@@ -307,6 +307,7 @@ hand:
   max_step: 18
   max_velocity: 900  # position units/s; at 50 Hz the 18-unit step cap also applies
   live_feedback_lead: null  # ACTIVE: no command/feedback position-error limit; retain speed/step limits
+  left_initial_handover_tolerance: 5  # initial arrival only; three frames, 10s timeout and 15-unit lead unchanged
   home: [255, 128, 255, 255, 255, 255, 128, 128, 128, 128]
   return_open_on_quit: true
   return_open_duration_s: 1.5

@@ -125,7 +125,8 @@ class HandBridge(Node):
             payload = dict(side='left', transport_version=1, position=state['position'],
                            sample_monotonic_s=min(stamps) if valid else None,
                            frame_stamps=stamps, frame_sequences=state['frame_sequences'],
-                           fault=state.get('fault'), sent=state.get('sent'))
+                           fault=state.get('fault'), sent=state.get('sent'),
+                           finish_protocol=state.get('finish_protocol'), finished=state.get('finished'))
             self._sock.sendto(json.dumps(payload, allow_nan=False).encode(), self._feedback_addr)
         except (KeyError, ValueError, TypeError):
             return

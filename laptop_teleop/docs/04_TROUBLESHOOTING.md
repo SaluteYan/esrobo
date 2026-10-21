@@ -4,6 +4,12 @@
 
 ## 基本检查
 
+异常处理的本地更新见 [07代码与计算：异常停止分流](07_CODE_AND_COMPUTATION.md#异常停止分流2026-10-21本地修改待上线)。受检执行失败只有减速、静止和健康验证全部通过才显示“已停止并保持；受检运动未完成”；`returned=false` 仍不是恢复IDLE成功。核对网关 `return_result` 诊断中的 `first_motion_rejection` 与 `failure_hold`，不要仅看重试后的 `entry_certificate_invalid`。
+
+手部111→254→111异常导致旧几何证明失效时，当前修改仍不能保证不下落；无安全减速候选、反馈／控制器／力矩／发送故障及明确急停保留故障停止。电子急停不等于机械抱闸或已失能。本次修改尚未部署，不自动重启、使能、失能或回零。
+
+`journal_error` 表示网关日志不可用而非运动故障；事件缓存有界，`diagnostic_events_dropped` 表示记录丢失。网络中断后本地保持不自动恢复跟随。
+
 ```bash
 ./laptop_teleop/scripts/run_laptop.sh check --side left
 ./laptop_teleop/scripts/run_laptop.sh inspect --side left
@@ -217,10 +223,47 @@ PYTHONPATH=teleoperation/src python -m esrobo_teleop.debug.log_retention --apply
 `log/retained/` 保存需要复核的故障、现场回放输入和验收汇总。人工清理时：
 
 - 现场数据和有效故障证据保留；关闭的 PICO 原始采集／传输文件可无损压缩到 `retained/sessions/<会话>/`，压缩后校验解压 SHA256 再移除原文件。
-- 当前 J6/J7 回放所需 `motion`、标定和执行记录仍保留原 JSONL 路径。完全相同的副本只保留一份，删除前比较内容哈希。
+- J6/J7 等历史回放所需 `motion`、标定和执行内容继续保留；大型关闭记录可能以同名 `.jsonl.gz` 保存，回放前按需解压。完全相同的副本只保留一份，删除前比较内容哈希并记录保留位置。
 - `compute.jsonl`／`pico.jsonl`／`execution.jsonl` 若来自明确的模拟性能实验，可清理明细；保留对应 `result.json`、性能汇总、输入生成工具、最终验收和失败记录。不按文件扩展名批量删除现场 JSONL。
 - `retained/maintenance/` 保存整理清单，记录删除理由、归档路径与 SHA256；源码和文档整理前的备份放在项目 `.deploy-backups/`。
 
+历史手部回放的大型原始 JSONL 也可在原目录无损压缩为同名 `.jsonl.gz`，校验解压 SHA256 后移除未压缩副本。回放工具若仍要求旧路径，先解压恢复所需文件，不必解压整个资料库。`*-diagnostics.json` 只有在确认属于可重建的求解输出、保留对应输入／源码／重放脚本及汇总后才删除；真实采集诊断不按这个名称规则自动删除。最新两次采集与正式运动数据、未解决故障、正在打开及近期仍变化的文件优先保留。
+
+大型历史 `.json` 诊断同样可以无损压缩为 `.json.gz`，不等于删除其证据。2026-10-21 全仓库整理保留了这些诊断内容，未假设历史版本的求解结果一定可由当前代码重建。原始路径、压缩路径、原内容SHA256、删除理由及保留副本位置，见 `log/retained/maintenance/cleanup_workspace_20261021/` 的 `results.json.gz`；简表为 `summary.json`。历史报告中的路径和哈希描述的是当时未压缩文件，不修改历史报告来掩盖归档变化。
+
 读取压缩现场记录时先解压到临时目录供现有 JSONL 工具使用，例如 `gzip -dc <archive.jsonl.gz> > /tmp/field-session.jsonl`。归档文件名保留原始会话编号，不能把文件修改时间当作采样时间。容量目标不是硬上限；活动采集仍会持续占用空间。
 
+JSON诊断可用 `gzip -dc <diagnostics.json.gz> > /tmp/diagnostics.json`。工具若写死历史原路径，应先核对该原路径不存在、不是活动文件，再仅恢复该文件；分析完成后可移除解压副本并保留归档。不要同时保留全部归档和全部解压副本。
+
 `tests/` 只存有效回归、固定 `fixtures/` 与独立 `tools/`。完整日志和一次性输出不放进测试目录。当前结构及运行入口见 [测试索引](../tests/README.md)；可清理字节码缓存，不能依据测试年限或文件数量删除有效用例。
+
+全仓库清理边界：
+
+| 内容 | 处理方式 |
+| --- | --- |
+| `__pycache__`／`.pytest_cache` | 删除可再生内容；字节码必须仍有对应源码，保留无源码的安装模块。 |
+| 模拟测试日志 | 核对测试来源、合成反馈与非活动状态后删除；保留必要的失败汇总和固定样本。测试应优先使用临时目录，避免写入正式日志目录。 |
+| 历史备份／分析结果 | 相同内容按哈希去重；未提交源码及无法重建的证据保留，未使用的已跟踪 `.bak` 可从Git恢复。 |
+| `external/`、虚拟环境、ROS `build/`／`install/` | 属于依赖或安装现场，不随日志清理删除；含绝对路径或符号链接的安装不能只凭目录名判断可再生。 |
+| `assets/`、URDF、标定、密钥、第三方驱动和测试fixtures | 保留；不能依据体积或当前只连接左手就删除。 |
+
+`.keep` 仍用于保护需要复核的记录，不取消现有自动保留策略。人工清理可对已关闭的受保护历史文件逐项压缩／去重，必须保存校验清单；不运行 `git clean -fdx` 扫除本机环境。
+
+### 按修改范围验证
+
+不再把完整回归作为每次修改的默认步骤。先查看现有用例是否已覆盖改动，再运行受影响的最小测试范围：
+
+| 修改范围 | 建议命令（项目根目录） |
+|---|---|
+| 文档、注释、日志整理 | 链接／语法／文件清单校验，不跑运动回归 |
+| 单个函数或参数 | `bash laptop_teleop/scripts/test.sh 路径/test_x.py`，也可指定 `::test_name` |
+| 不确定影响范围时的快速检查 | `bash laptop_teleop/scripts/test.sh`，默认42项冒烟，不代表整套通过 |
+| 手部映射／对捏 | `bash laptop_teleop/scripts/test.sh --hand`，结合相关现场回放 |
+| 接管、恢复、回零 | `bash laptop_teleop/scripts/test.sh --handover` |
+| 采集与执行传输 | `bash laptop_teleop/scripts/test.sh --transport` |
+| 网页服务 | `bash laptop_teleop/scripts/test.sh --web` |
+| 机械臂映射与轨迹 | `bash laptop_teleop/scripts/test.sh --arm` |
+| 公共协议、共享状态机、跨模块改动或发布验收 | `bash laptop_teleop/scripts/test.sh --full` |
+| 采集调度、并发、日志开销或计算速度 | `bash laptop_teleop/scripts/test.sh --performance`，另按需求执行独立基准 |
+
+显式测试路径不会再追加全套目录。完整功能集与依赖机器调度的性能集分开报告；性能测试保留原门槛，在停止实机遥操作且负载可控时运行，不因偶发失败循环重跑至通过。新增用例应针对未覆盖的行为、边界或真实回归，优先扩展现有参数化用例；仅改常量默认值、文案或可逆的低影响内容，不机械地增加测试文件。旧行为废弃时同步删除旧断言；左右侧、故障／取消、时效、提交及运动保护等有独立意义的覆盖继续保留。测试数量不是质量指标，专项通过不得写成完整回归通过。

@@ -27,7 +27,7 @@ def emit(log, event, **fields):
 def validate(meta, now):
     if not isinstance(meta, dict) or meta.get('version') != VERSION:
         raise ValueError('hand transport version required')
-    if meta.get('action') not in ('target', 'stop'):
+    if meta.get('action') not in ('target', 'stop', 'finish'):
         raise ValueError('invalid hand transport action')
     if not isinstance(meta.get('session'), str) or not 1 <= len(meta['session']) <= 64:
         raise ValueError('invalid hand transport session')
@@ -68,6 +68,9 @@ class LatestHandExecutor:
         self.counts = dict(accepted=0, replaced=0, rejected=0, sent=0, expired=0)
         self.last_sent_id = None
         self.last_feedback_ids = None
+        self.sending = False
+        self.finish_requested = None
+        self.finished_id = None
         self.speed_sample = None
         self.speed_stamp = None
 
@@ -95,8 +98,18 @@ class LatestHandExecutor:
                 if meta['action'] == 'stop':
                     self.generation += 1
                     self.pending = None
+                    self.finish_requested = None
                     self.last_command = None
                     self.last_sent = None
+                elif meta['action'] == 'finish':
+                    # Normal completion clears queued goals but lets the
+                    # already-started pair finish under its ORIGINAL deadline.
+                    # Explicit stop/fault/close still cancels each frame.
+                    self.pending = None
+                    self.finish_requested = dict(session=meta['session'], seq=meta['seq'])
+                    if not self.sending:
+                        self.finished_id = self.finish_requested
+                        self.finish_requested = None
                 else:
                     self.counts['replaced'] += self.pending is not None
                     self.pending = (values, dict(meta), now, self.generation)
@@ -119,6 +132,8 @@ class LatestHandExecutor:
             if self.fault is None:
                 self.fault = str(exc)[:240]
             self.pending = None
+            self.finish_requested = None
+            self.sending = False
             self.settings.clear()
             self.generation += 1
         emit(self.log, 'executor_fault', reason=str(exc))
@@ -163,8 +178,12 @@ class LatestHandExecutor:
                     # when its position is unchanged. Completion clears this
                     # slot, so no cached goal is replayed without new input.
                     if budget:
-                        if not guard():
-                            return
+                        with self.lock:
+                            # A finish received before this claim must prevent
+                            # any output, including a locally cached candidate.
+                            if self.pending is not pending or not guard():
+                                return
+                            self.sending = True
                         same_position = candidate == self.last_command
                         started = self.clock()
                         try:
@@ -172,17 +191,25 @@ class LatestHandExecutor:
                         except Exception as exc:
                             if (getattr(exc, 'completed_frames', None) == 0 and
                                     (generation != self.generation or self.closed.is_set())):
+                                with self.lock:
+                                    self.sending = False
                                 emit(self.log, 'cancelled_before_can', meta=meta)
                                 return
                             raise
                         completed = self.clock()
-                        if generation != self.generation or self.closed.is_set():
-                            emit(self.log, 'completed_before_stop', meta=meta, position=candidate)
-                            return
-                        if not guard():
-                            raise RuntimeError('hand command cancelled/expired during CAN send')
-                        self.last_command, self.last_sent = candidate, completed
-                        self.last_sent_id = dict(session=meta['session'], seq=meta['seq'])
+                        with self.lock:
+                            if generation != self.generation or self.closed.is_set():
+                                self.sending = False
+                                emit(self.log, 'completed_before_stop', meta=meta, position=candidate)
+                                return
+                            if not guard():
+                                raise RuntimeError('hand command cancelled/expired during CAN send')
+                            self.last_command, self.last_sent = candidate, completed
+                            self.last_sent_id = dict(session=meta['session'], seq=meta['seq'])
+                            self.sending = False
+                            if self.finish_requested is not None:
+                                self.finished_id = self.finish_requested
+                                self.finish_requested = None
                         self.counts['sent'] += 1
                         emit(self.log, 'can_command_sent', meta=meta, sdk_received_s=received,
                              started_s=started, completed_s=completed, position=candidate,
@@ -217,6 +244,7 @@ class LatestHandExecutor:
             return dict(version=VERSION, side='left', position=sample['position'],
                         frame_stamps=sample['stamps'], frame_sequences=sample['sequences'],
                         fault=self.fault, sent=self.last_sent_id, counts=dict(self.counts),
+                        finish_protocol=1, finished=self.finished_id,
                         speed=self.speed_sample, speed_stamp_s=self.speed_stamp)
 
     def start(self):

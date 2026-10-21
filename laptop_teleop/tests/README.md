@@ -5,13 +5,24 @@
 - `tools/`：独立分析、回放、性能测量工具；不由生产入口导入，不在每次 pytest 中自动运行。工具之间通过包名引用，原根目录工具路径已迁移。
 - `__pycache__/`：可再生缓存，可在测试结束后清理。
 
+2026-10-21 全仓库整理删除了测试字节码、pytest缓存和已确认的模拟运行输出，保留三个项目测试目录中的有效源码、fixtures及分析工具；本次没有按文件年龄或用例数量削减保护覆盖。文档／缓存／归档整理只做清单、哈希、语法与链接核验，不触发完整运动回归。历史工具需要的压缩记录按 [归档说明](../docs/04_TROUBLESHOOTING.md#日志与测试目录维护)按需解压；`fixtures/` 中JSONL是固定回归样本，不是待删除运行日志。
+
 项目根目录执行：
 
 ```bash
 bash laptop_teleop/scripts/test.sh
 ```
 
-该入口覆盖本机、robot_link 和分区 IK 测试，仍保留已有两个 `-k` 排除项。成功不代表仓库全部硬件相关测试通过，也不代表实机已就绪。
+无参数只运行42项快速冒烟，不代表完整回归。小改动优先直接传入测试文件或 `文件::用例`，不会额外运行整套目录：
+
+```bash
+bash laptop_teleop/scripts/test.sh laptop_teleop/tests/test_hand_handover.py
+bash laptop_teleop/scripts/test.sh --hand
+bash laptop_teleop/scripts/test.sh --full
+bash laptop_teleop/scripts/test.sh --performance
+```
+
+还可选择 `--handover`、`--transport`、`--web`、`--arm`，使用 `--help` 查看入口。`--full` 覆盖本机、robot_link 和分区 IK 的现行功能用例；原来长期排除的两项旧轨迹模拟已删除，不再靠 `-k` 隐藏。10项机器负载敏感的采集时序用例标记为 `performance`，原门槛不变，单独运行并报告。它们不属于被废弃的测试；改变采集调度、并发、日志开销或计算速度时仍需验收。成功不代表仓库全部硬件相关测试通过，也不代表实机已就绪。
 
 入口会先构建左手 C++17 数值内核，依赖见安装环境脚本的 `test,build` extras。直接调用 pytest 或下方回放工具前，先执行 `bash laptop_teleop/scripts/build_hand_native.sh`。几何与接触测试同时运行原生实现和 Python 参考实现，并逐值比较 FK／雅可比与求解结果；缓存二进制不纳入仓库。
 
@@ -28,7 +39,7 @@ python laptop_teleop/tests/tools/summarize_torque.py /path/to/torque.jsonl
 
 `benchmark_*` 是离线模拟或几何计算；`audit_transfers.py` 可读取真实服务状态，`profile_runtime.py acquisition` 会使用实际采集，运行前按 [排障文档](../docs/04_TROUBLESHOOTING.md#独立测试与耗时测量)确认使用条件。不要把所有工具批量当作离线测试启动。
 
-新增测试应覆盖当前需求；若功能明确废弃，删除对应断言并在统一 [修改日志](../docs/08_CHANGELOG.md)记录依据。不得为了通过测试而删除仍有效的保护验证。
+新增测试应覆盖尚未覆盖的行为、边界或真实回归，优先扩展既有参数化用例，不为每次常量、文案或文档修改机械新增文件。若功能明确废弃，删除对应断言并在统一 [修改日志](../docs/08_CHANGELOG.md)记录依据。保留有效的保护验证，不为减少数量删除独立故障场景。按修改范围运行一次足够的验证，只有新改动或未解决失败才重复；完整回归用于公共接口、跨模块变更及发布验收。详细选择依据见 [按修改范围验证](../docs/04_TROUBLESHOOTING.md#按修改范围验证)。
 
 左手接触重定向可重复验收：
 

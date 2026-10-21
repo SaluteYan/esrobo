@@ -72,9 +72,33 @@ const bones = connections.map(([from, to, side]) => {
   return { from, to, line };
 });
 
+// OpenXR/PICO: palm=0, wrist=1; thumb=2..5, other fingers=6..25.
+const handChains = [[1, 2, 3, 4, 5], [1, 6, 7, 8, 9, 10],
+  [1, 11, 12, 13, 14, 15], [1, 16, 17, 18, 19, 20], [1, 21, 22, 23, 24, 25],
+  [6, 11, 16, 21], [1, 0]];
+const handEdges = handChains.flatMap(chain => chain.slice(1).map((to, i) => [chain[i], to]));
+const handGeometry = new THREE.SphereGeometry(0.006, 10, 8);
+const humanHands = Object.fromEntries(["left", "right"].map(side => {
+  const group = new THREE.Group();
+  skeleton.add(group);
+  const material = new THREE.MeshBasicMaterial({ color: colors[side] });
+  const points = Array.from({ length: 26 }, () => {
+    const point = new THREE.Mesh(handGeometry, material);
+    group.add(point);
+    return point;
+  });
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(handEdges.length * 6), 3));
+  const lines = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ color: colors[side] }));
+  group.add(lines);
+  group.visible = false;
+  return [side, { group, points, lines }];
+}));
+
 let mode = "raw";
 let paused = false;
 let latestState = null;
+let displayedState = null;
 let latestFrames = {};
 let latestDiagnostics = null;
 
@@ -145,6 +169,7 @@ function skeletonOrigin(state) {
 }
 
 function updateSkeleton(state) {
+  displayedState = state;
   const origin = skeletonOrigin(state);
   for (const [name, mesh] of joints) {
     const pos = framePosition(name, state);
@@ -163,6 +188,49 @@ function updateSkeleton(state) {
     values.set([a.position.x, a.position.y, a.position.z, b.position.x, b.position.y, b.position.z]);
     line.geometry.attributes.position.needsUpdate = true;
     line.geometry.computeBoundingSphere();
+  }
+  updateHumanHands(state, origin);
+}
+
+function updateHumanHands(state, origin) {
+  const acquisitionLayer = mode === "raw" || mode === "robot";
+  const enabled = document.querySelector("#show-hands").checked;
+  for (const side of ["left", "right"]) {
+    const hand = state.hands?.[side];
+    const view = humanHands[side];
+    const fresh = hand?.available === true && Number.isFinite(hand.age_ms)
+      && hand.age_ms >= 0 && hand.age_ms <= 500;
+    const paired = state.connected && Number.isFinite(hand?.body_delta_ms) && hand.body_delta_ms <= 100;
+    view.group.visible = enabled && acquisitionLayer && fresh && Boolean(paired);
+    let count = 0;
+    for (let i = 0; i < 26; i++) {
+      const pos = hand?.positions?.[i];
+      const point = view.points[i];
+      point.visible = view.group.visible && hand?.valid?.[i] === true
+        && Array.isArray(pos) && pos.length === 3 && pos.every(Number.isFinite);
+      if (point.visible) {
+        // Same world frame, fixed rotation and scene origin as the arms.
+        // Do not resize fingers or snap Hand wrist to the separate Body wrist.
+        const mapped = transformPoint(pos, state);
+        point.position.copy(displayPoint(mapped.map((v, axis) => v-origin[axis]), state));
+        count++;
+      }
+    }
+    let offset = 0;
+    const buffer = view.lines.geometry.attributes.position;
+    for (const [a, b] of handEdges) {
+      if (!view.points[a].visible || !view.points[b].visible) continue;
+      buffer.array.set([...view.points[a].position.toArray(), ...view.points[b].position.toArray()], offset);
+      offset += 6;
+    }
+    view.lines.geometry.setDrawRange(0, offset / 3);
+    buffer.needsUpdate = true;
+    // Unused slots may contain a prior frame, so avoid stale bounding culling.
+    view.lines.frustumCulled = false;
+    const label = !enabled ? "已隐藏" : !acquisitionLayer ? "仅原始／固定映射层"
+      : !fresh ? (hand?.age_ms != null ? "已过期／未追踪" : "等待26点数据")
+      : !paired ? "等待同步身体数据" : `${count} / 26 · ${hand.age_ms.toFixed(0)} ms`;
+    document.querySelector(`#${side}-hand-status`).textContent = label;
   }
 }
 
@@ -269,6 +337,9 @@ function setMode(nextMode) {
 
 document.querySelector("#view-mode").addEventListener("change", (event) => setMode(event.target.value));
 document.querySelector("#reset-camera").addEventListener("click", resetCamera);
+document.querySelector("#show-hands").addEventListener("change", () => {
+  if (displayedState) updateSkeleton(displayedState);
+});
 document.querySelector("#pause").addEventListener("click", (event) => {
   paused = !paused;
   updateWarning(latestState);
@@ -287,6 +358,12 @@ async function poll() {
       updateSkeleton(state);
     }
   } catch (_error) {
+    if (!paused) {
+      for (const side of ["left", "right"]) {
+        humanHands[side].group.visible = false;
+        document.querySelector(`#${side}-hand-status`).textContent = "连接中断";
+      }
+    }
     const warning = document.querySelector("#data-warning");
     warning.hidden = false;
     warning.textContent = "骨架服务连接失败；画面保留最后一帧。";

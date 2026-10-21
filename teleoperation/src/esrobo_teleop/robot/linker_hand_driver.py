@@ -115,6 +115,8 @@ class LinkerHandDriver:
         self._transport_session = uuid.uuid4().hex
         self._transport_seq = 0
         self._transport_fault = None
+        self._transport_finished = None
+        self._transport_finish_protocol = None
         self._transport_context = None
         self._transport_log = None
         self._geometry_feedback_time = {"left": None, "right": None}
@@ -223,6 +225,8 @@ class LinkerHandDriver:
             if side == 'left' and side in self._active_sides and message.get('transport_version') == 1:
                 if message.get('fault'):
                     self._transport_fault = str(message['fault'])
+                self._transport_finished = message.get('finished')
+                self._transport_finish_protocol = message.get('finish_protocol')
                 source = message.get('sample_monotonic_s')
                 if not isinstance(source, (int, float)) or not math.isfinite(source) or source > time.monotonic():
                     continue
@@ -506,6 +510,10 @@ class LinkerHandDriver:
 
     def describe_open_pose_errors(self, errors: dict[str, np.ndarray]) -> str:
         """Describe only physical joints outside the configured zero tolerance."""
+        if not errors:
+            fault = getattr(self, '_transport_fault', None)
+            return ('left hand SDK fault: '+fault if fault else
+                    'hand feedback missing/stale; open pose cannot be verified')
         tolerance = max(0.0, float(self._cfg.startup_open_tolerance))
         names = (
             L10_PHYSICAL_JOINT_NAMES
@@ -626,6 +634,39 @@ class LinkerHandDriver:
         self._sock.sendto(json.dumps({'_hand_transport': meta}).encode(), self._udp_addr)
         from .hand_transport import emit
         emit(self._transport_log, 'gateway_stop', meta=meta)
+
+    def finish_output(self, cancelled, *, safety_check=None):
+        """Drain only an in-flight pair after verified arrival, never on abort.
+
+        Wait for a matching SDK acknowledgement before the caller's normal
+        software disable sends stop. Explicit cancellation remains immediate.
+        This does not move the hand or extend a target's validity.
+        """
+        if self._mode != 'udp' or self._model != 'L10' or 'left' not in self._active_sides:
+            return
+        with self._feedback_lock:
+            self._poll_feedback()
+            if self._transport_finish_protocol != 1:
+                raise RuntimeError('left hand SDK/bridge lacks finish protocol 1; synchronize services')
+            if self._transport_fault:
+                raise RuntimeError('left hand SDK fault: '+self._transport_fault)
+            meta = self._transport_meta('finish')
+            self._sock.sendto(json.dumps({'_hand_transport': meta}).encode(), self._udp_addr)
+        from .hand_transport import emit
+        emit(self._transport_log, 'gateway_finish', meta=meta)
+        expected = dict(session=meta['session'], seq=meta['seq'])
+        while time.monotonic() < meta['expires_s']:
+            if cancelled() or (safety_check is not None and not safety_check()):
+                raise RuntimeError('hand completion cancelled or safety check failed')
+            with self._feedback_lock:
+                fresh = self._feedback_is_fresh()
+                if self._transport_fault:
+                    raise RuntimeError('left hand SDK fault: '+self._transport_fault)
+                if fresh and self._transport_finished == expected:
+                    emit(self._transport_log, 'gateway_finish_ack', seq=meta['seq'])
+                    return
+            time.sleep(.005)
+        raise RuntimeError('hand completion acknowledgement timed out')
 
     def _send_physical(self, left: np.ndarray, right: np.ndarray) -> None:
         left = np.clip(left, self._cfg.out_min, self._cfg.out_max).astype(np.int64).tolist()
