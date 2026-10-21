@@ -299,8 +299,8 @@ def authorize_solver_bounds(solver):
     """
     from dataclasses import replace
     propose = solver.participation.propose
-    def authorized(base, raw, points, stamp, contact):
-        candidate = propose(base, raw, points, stamp, contact)
+    def authorized(base, raw, points, stamp, contact, **context):
+        candidate = propose(base, raw, points, stamp, contact, **context)
         lo, hi = candidate.lower.copy(), candidate.upper.copy()
         for f in np.flatnonzero(contact):
             cols = [5] if f == 1 else [[3,4], [], [6,7], [8,9]][f]
@@ -315,6 +315,19 @@ def authorize_solver_bounds(solver):
     solver.participation.propose = authorized
 
 
+def seed_confirmed_contact(solver, points, stamp, fingers):
+    """Start numerical/transition tests after independently verified approach.
+
+    Static proximity is deliberately no longer a production contact trigger.
+    Detector admission, coupling and transactional history have separate tests.
+    """
+    from dataclasses import replace
+    distances = np.linalg.norm(points[TIPS[1:]]-points[5], axis=1)
+    state,_ = solver.contact_detector.propose(distances, points, solver.model.width, stamp)
+    active = np.zeros(4, bool);active[fingers] = True
+    solver.contact_detector.commit(replace(state,active=active,projection=active.astype(float)))
+
+
 @pytest.mark.parametrize('authorized', [False, True])
 def test_all_contact_goals_are_checked_but_only_authorized_fingers_move(solver, authorized):
     if authorized: authorize_solver_bounds(solver)
@@ -323,6 +336,7 @@ def test_all_contact_goals_are_checked_but_only_authorized_fingers_move(solver, 
     # An intentionally impossible multi-finger contact must remain bounded.
     for tip in TIPS[1:]:
         target[tip] = target[5]+[.001, .001, 0.]
+    seed_confirmed_contact(solver, target, .98, [0,1,2,3])
     for i in range(6):
         r = solver.solve(None, target=target, source_time=1.+i*.02, budget_s=1.)
     d = r['diagnostics'];correction = np.array(d['correction_deg'])
@@ -342,15 +356,16 @@ def test_coupled_contact_step_improves_posture_without_breaking_contact(solver):
     authorize_solver_bounds(solver)
     import json
     from pathlib import Path
-    sample = json.loads((Path(__file__).parent/'fixtures/hand_contact/middle_boundary.json').read_text())
+    sample = json.loads((ROOT/'tests/fixtures/hand_contact/middle_boundary.json').read_text())
     solver.previous = np.array(sample['previous'])
     solver.contact = np.array(sample['contact'])
     solver.projection = np.array(sample['projection'])
     solver.source_time = sample['previous_time']
-    from esrobo_laptop.hand_contact import State
+    from dataclasses import replace
     raw = np.array(sample['poses'])[:, :3]
     distances = np.linalg.norm(raw[TIPS[1:]]-raw[5], axis=1)
-    solver.contact_detector.state = State(solver.source_time, solver.contact.copy(), solver.projection.copy(), np.zeros(4), np.zeros(4), distances, ())
+    state,_ = solver.contact_detector.propose(distances, raw, solver.model.width, solver.source_time)
+    solver.contact_detector.commit(replace(state,active=solver.contact.copy(),projection=solver.projection.copy()))
     target = solver.model.human_target(sample['poses'])
     before, _ = solver.model.forward(solver.previous)
     desired = solver._directions(target[2:6])
@@ -371,10 +386,12 @@ def test_reused_chain_landmarks_match_full_fk(solver, fraction):
 
 
 def test_coincident_human_tips_keep_finite_two_mm_projection(solver):
+    authorize_solver_bounds(solver)  # Projection is only meaningful with explicit permission.
     q = solver.model.upper*.4
     points, _ = solver.model.forward(q)
     poses = np.zeros((26, 7)); poses[:, :3] = points; poses[:, 6] = 1.
     poses[10, :3] = poses[5, :3]
+    seed_confirmed_contact(solver, poses[:,:3], .98, [0])
     solver.solve(poses, source_time=1., budget_s=1.)
     result = solver.solve(poses, source_time=1.08, budget_s=1.)
     assert result['diagnostics']['projected_gap_mm'][0] == pytest.approx(2.)
@@ -400,16 +417,27 @@ def test_straight_human_thumb_disables_unobservable_bending_plane(solver):
 def test_slow_contact_transition_does_not_introduce_thumb_jump(solver, finger, thumb, flexion, entering):
     m = solver.model; q = m.upper*.4; q[:3] = thumb
     k = [4,5,7,9][finger]; q[k] = flexion
-    outputs=[]; blends=[]
+    outputs=[]; blends=[]; permissions=[]
     motion = np.r_[np.zeros(20),np.linspace(0,.25,30),np.ones(10)*.25]
     if entering: motion = .25-motion
+    if not entering:
+        points,_=m.forward(q)
+        seed_confirmed_contact(solver,points,.98,[finger])
     for i,delta in enumerate(motion):
         goal=q.copy();goal[k]-=delta
         points,_=m.forward(goal);poses=np.zeros((26,7));poses[:,:3]=points;poses[:,6]=1.
         r=solver.solve(poses,source_time=1+i*.02,budget_s=1.)
         outputs.append(r['joints']);blends.append(r['diagnostics']['projection_fraction'][finger])
-    assert blends[19] == (0. if entering else 1.)
+        permissions.append(r['diagnostics']['constrained_contact'][finger])
+    # A seeded contact bit without axis proof no longer starts projection.
+    # Entering motion still exercises actual admission; opening-only input must
+    # not inherit permission from proximity or the seeded contact bit.
+    assert blends[19] == 0.
     assert blends[-1] == (1. if entering else 0.)
+    # Projection cannot rise before a newly verified permission, even if the
+    # numerical fixture begins with a contact bit. Release may outlive permission.
+    assert all(blends[j] <= (blends[j-1] if j else 0.)+1e-12 or permissions[j]
+               for j in range(len(blends)))
     assert np.max(abs(np.degrees(np.diff(outputs,axis=0))[20:,:3])) < 1.
     if not entering:
         # This opening-only fixture never grants participation, so corrections stay zero.
@@ -428,6 +456,79 @@ def test_native_chain_and_jacobian_match_python_reference():
         p,j=native._native.landmarks(q);rp,rj=native.model.forward(q)
         np.testing.assert_allclose(p,rp,atol=1e-12)
         np.testing.assert_allclose(j,rj,atol=1e-12)
+
+
+@pytest.mark.parametrize('finger', range(4))
+@pytest.mark.parametrize('segment', range(3))
+def test_direct_flexion_combines_each_bone_with_urdf_linkage(solver, finger, segment):
+    k, basis, axis, idx, neutral, coefficients = solver.finger_geometry[finger]
+    q = solver.model.upper*.3
+    points, _ = solver.model.forward(q)
+    original = solver.direct_fingers(points)
+    roll = np.eye(3) if axis is None else Rotation.from_rotvec(axis*original[k-1]).as_matrix()
+    # Alter one absolute bone direction, translating the downstream chain so
+    # its other bone directions remain unchanged. Each segment must contribute.
+    bone = (points[idx[segment+1]]-points[idx[segment]]) @ basis @ roll
+    turned = Rotation.from_rotvec([0., .1, 0.]).apply(bone)
+    delta = (turned-bone) @ roll.T @ basis.T
+    changed = points.copy()
+    changed[idx[segment+1:]] += delta
+    actual = solver.direct_fingers(changed)
+    expected_delta = .1*coefficients[segment]/(coefficients @ coefficients)
+    assert actual[k]-original[k] == pytest.approx(expected_delta, abs=1e-7)
+    # The URDF's rounded axes leave a sub-microradian change in this finger's
+    # reconstructed side angle when its proximal bone is rotated.
+    untouched = [j for j in range(10) if j != k and (axis is None or j != k-1)]
+    np.testing.assert_array_equal(actual[untouched], original[untouched])
+    if axis is not None:
+        assert actual[k-1] == pytest.approx(original[k-1], abs=1e-6)
+
+
+@pytest.mark.parametrize('finger', range(4))
+def test_three_bone_seed_does_not_use_metacarpal_direction(solver, finger):
+    q = solver.model.upper*.3
+    points, _ = solver.model.forward(q)
+    original = solver.direct_fingers(points)
+    # The previous MCP-only seed used this extra point; three-bone synthesis
+    # depends on MCP->PIP, PIP->DIP, DIP->tip, not this metacarpal direction.
+    points[6+5*finger] += [.01, -.005, .02]
+    np.testing.assert_array_equal(solver.direct_fingers(points), original)
+
+
+@pytest.mark.parametrize('finger', range(4))
+def test_repository_coordination_range_preserves_step_and_release_budget(solver, finger):
+    from dataclasses import replace
+    g = solver.participation
+    k = [4, 5, 7, 9][finger]
+    assert np.degrees(g.radius[k]) == pytest.approx(15.)
+    assert np.degrees(g.step_radius[k]) == pytest.approx(15.)
+    # Isolate the permission gate; no FK or physical motion is needed.
+    points = np.zeros((26, 3))
+    points[5] = [.04, 0., 0.]
+    points[[10, 15, 20, 25]] = [0., 0., .08]
+    base = np.ones(10)*.4
+    contact = np.ones(4, dtype=bool)
+    for i in range(9):
+        q = base.copy()
+        q[k] += np.deg2rad(i*.65)
+        p = points.copy()
+        p[[10, 15, 20, 25][finger]] += [i*.0003, 0., -i*.0006]
+        c = g.propose(q, q, p, 1.+i*.02, contact)
+        g.commit(c.solved(c.fixed, q))
+    assert c.diagnostic['eligible'][finger]
+    assert np.degrees(c.upper[k]-c.fixed[k]) <= 3.75+1e-9
+    # A large authorized offset must still release at the original rate.
+    offset = np.zeros(10)
+    offset[k] = np.deg2rad(10.)
+    g.state = replace(g.state, correction=offset)
+    previous = g.state
+    c = g.propose(q, q, p, 1.18, np.zeros(4, dtype=bool))
+    assert g.state is previous  # rejected candidates cannot consume release
+    assert np.degrees(c.fixed[k]-q[k]) == pytest.approx(10.-1.875)
+    g.commit(c.solved(c.fixed, q))
+    c = g.propose(q, q, p, 1.4, np.zeros(4, dtype=bool))
+    assert c.diagnostic['clock_reset']
+    assert np.degrees(c.fixed[k]-q[k]) == pytest.approx(10.-1.875)
 
 
 def test_native_solver_matches_reference_and_deadline_keeps_state():

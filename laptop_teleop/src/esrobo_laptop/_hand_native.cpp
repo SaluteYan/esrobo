@@ -179,18 +179,21 @@ template <size_t N> static py::array_t<double> array(const std::array<double,N> 
     return array(std::vector<double>(v.begin(),v.end()));
 }
 static py::object participate(py::object gate, py::handle qb, py::handle qr,
-                              py::handle pp, double stamp, py::handle cc, py::dict policy) {
+                              py::handle pp, double stamp, py::handle cc, py::dict policy,
+                              py::object episode=py::none(), py::object guard=py::none()) {
     Q base=as_q(qb), raw=as_q(qr), low=as_q(gate.attr("lower")), high=as_q(gate.attr("upper")),
-      radius=as_q(gate.attr("radius")), correction{};
+      radius=as_q(gate.attr("radius")), step_radius=as_q(gate.attr("step_radius")), correction{};
     auto points=doubles(pp,78),contact=doubles(cc,4);
     const double width=py::cast<double>(gate.attr("width"));
     auto val=[&](const char *k){return py::cast<double>(policy[k]);};
     struct Sample { double t; Q raw,base; std::vector<double> tip,toward; py::object record; };
     std::vector<Sample> history;
     auto prev=gate.attr("state");
-    std::array<double,4> cooldown{},after{},elapsed{};after.fill(-INFINITY);
-    Q evidence{},proof_origin{},proof_net{};std::array<bool,10> authorized{},release{},axis_own{};
+    std::array<double,4> cooldown{},after{},elapsed{},ids{},old_ids{};after.fill(-INFINITY);
+    std::vector<double> episode_confirmed(4);
+    Q evidence{},proof_origin{},proof_net{},episode_evidence{};std::vector<double> episode_frozen(10);std::array<bool,10> authorized{},release{},axis_own{};
     if (!prev.is_none()) {
+        auto old_ep=doubles(prev.attr("episode_id"),4);for(int f=0;f<4;f++)old_ids[f]=old_ep[f];
         correction=as_q(prev.attr("correction"));
         evidence=as_q(prev.attr("evidence_until"));
         proof_origin=as_q(prev.attr("evidence_origin"));proof_net=as_q(prev.attr("evidence_net"));
@@ -221,10 +224,22 @@ static py::object participate(py::object gate, py::handle qb, py::handle qr,
     constexpr int flex[4]={4,5,7,9},side[4]={3,5,6,8};
     const double rad=3.14159265358979323846/180;
     std::array<bool,4> jump{},own{},eligible{};
-    for(const auto &v:recent)if(stamp-v.t<=val("jump_window_s")+1e-9)
-        for(int f=0;f<4;f++)if(std::abs(v.raw[flex[f]]-raw[flex[f]])>val("jump_flex_deg")*rad ||
-           (f!=1 && std::abs(v.raw[side[f]]-raw[side[f]])>val("jump_side_deg")*rad))jump[f]=true;
-    for(int f=0;f<4;f++)if(jump[f])cooldown[f]=stamp+val("cooldown_s");
+    if(!guard.is_none()) {
+        auto g=py::cast<py::tuple>(guard);auto js=doubles(g[0],4),co=doubles(g[1],4);
+        for(int f=0;f<4;f++){jump[f]=js[f]!=0;cooldown[f]=co[f];}
+    } else {
+        for(const auto &v:recent)if(stamp-v.t<=val("jump_window_s")+1e-9)
+            for(int f=0;f<4;f++)if(std::abs(v.raw[flex[f]]-raw[flex[f]])>val("jump_flex_deg")*rad ||
+                (f!=1 && std::abs(v.raw[side[f]]-raw[side[f]])>val("jump_side_deg")*rad))jump[f]=true;
+        for(int f=0;f<4;f++)if(jump[f])cooldown[f]=stamp+val("cooldown_s");
+    }
+    for(int f=0;f<4;f++)after[f]=std::max(after[f],cooldown[f]);
+    if(!episode.is_none()) {
+        auto ep=doubles(episode.attr("episode_id"),4);auto ea=py::array_t<double>::ensure(episode.attr("evidence_after"));
+        for(int f=0;f<4;f++){ids[f]=ep[f];after[f]=std::max(after[f],ea.data()[f]);}
+        episode_confirmed=doubles(episode.attr("confirmed_at"),4);
+        episode_evidence=as_q(episode.attr("axis_until"));episode_frozen=doubles(episode.attr("frozen_axes"),10);
+    }
     auto module=py::module_::import("esrobo_laptop.hand_participation");
     auto tip_array=array(tip),toward_array=array(toward);tip_array.resize({4,3});toward_array.resize({4,3});
     auto sample=module.attr("Sample")(stamp,array(raw),array(base),tip_array,toward_array);
@@ -255,13 +270,18 @@ static py::object participate(py::object gate, py::handle qb, py::handle qr,
     for(int f=0;f<4;f++){
         int cols[2]={flex[f],side[f]}, count=f==1?1:2;
         bool exited=!contact[f] && elapsed[f]>0.;
-        if(exited){after[f]=stamp;for(int c=0;c<count;c++){evidence[cols[c]]=0.;authorized[cols[c]]=false;}}
-        elapsed[f]=contact[f]?elapsed[f]+dt:0.;
+        bool changed=!episode.is_none() && ids[f]!=old_ids[f];
+        if(exited || changed || stamp<cooldown[f]){after[f]=std::max(after[f],stamp);for(int c=0;c<count;c++){evidence[cols[c]]=0.;authorized[cols[c]]=false;}}
+        elapsed[f]=contact[f]?(episode.is_none()?elapsed[f]+dt:std::max(0.,stamp-episode_confirmed[f])):0.;
         for(int c=0;c<count;c++){
             int j=cols[c];
+            if(!episode.is_none()) {
+                evidence[j]=episode_evidence[j];authorized[j]=authorized[j] && episode_frozen[j]!=0;
+                continue;
+            }
             double sign=(proof_net[j]>0)-(proof_net[j]<0);
             if((base[j]-proof_origin[j])*sign<val(c==0?"flex_motion_deg":"side_motion_deg")*rad*.5)evidence[j]=0.;
-            if(axis_own[j] && approach[f]>=val("approach_width") && !reset && !exited){
+            if(axis_own[j] && approach[f]>=val("approach_width") && !reset && !exited && stamp>=cooldown[f]){
                 evidence[j]=stamp+val("evidence_lifetime_s");proof_net[j]=net_deg[2*f+c]*rad;proof_origin[j]=base[j]-proof_net[j];
             }
             if(!contact[f])authorized[j]=false;
@@ -269,19 +289,20 @@ static py::object participate(py::object gate, py::handle qb, py::handle qr,
         }
         bool blocked=reset || (contact[f] && stamp<cooldown[f]);
         bool confirmed=contact[f] && elapsed[f]>=val("contact_confirm_s")-1e-9;
-        if(confirmed && !blocked)for(int c=0;c<count;c++)authorized[cols[c]]=authorized[cols[c]] || evidence[cols[c]]>=stamp;
-        if(!contact[f] && !blocked)for(int c=0;c<count;c++)release[cols[c]]=release[cols[c]] || std::abs(fixed[cols[c]]-base[cols[c]])>1e-12;
-        if(blocked){reasons[f]=reset?"clock_reset":"shape_jump_cooldown";continue;}
+        if(confirmed && !blocked)for(int c=0;c<count;c++)authorized[cols[c]]=authorized[cols[c]] || (episode.is_none()?evidence[cols[c]]>=stamp:episode_frozen[cols[c]]!=0);
+        if((!contact[f] || blocked) && !reset)for(int c=0;c<count;c++)release[cols[c]]=release[cols[c]] || std::abs(fixed[cols[c]]-base[cols[c]])>1e-12;
+        if(blocked)reasons[f]=reset?"clock_reset":"shape_jump_cooldown";
+        if(reset)continue;
         bool released=false;
         for(int c=0;c<count;c++){
             int j=cols[c];
-            if(confirmed && authorized[j]){
-                budget[j]=radius[j]*std::min(dt/val("transition_s"),1.);
+            if(confirmed && !blocked && authorized[j]){
+                budget[j]=step_radius[j]*std::min(dt/val("transition_s"),1.);
                 lo[j]=std::max({low[j],base[j]-radius[j],fixed[j]-budget[j]});
                 hi[j]=std::min({high[j],base[j]+radius[j],fixed[j]+budget[j]});
                 eligible[f]=true;
-            }else if(!contact[f] && release[j]){
-                budget[j]=radius[j]*std::min(dt/val("release_s"),1.);
+            }else if((!contact[f] || blocked) && release[j]){
+                budget[j]=step_radius[j]*std::min(dt/val("release_s"),1.);
                 fixed[j]-=std::clamp(fixed[j]-base[j],-budget[j],budget[j]);lo[j]=hi[j]=fixed[j];
                 if(std::abs(fixed[j]-base[j])<1e-12)release[j]=false;
                 released=released || budget[j]>0;
@@ -294,9 +315,9 @@ static py::object participate(py::object gate, py::handle qb, py::handle qr,
     py::tuple hist(recent.size());for(size_t i=0;i<recent.size();i++)hist[i]=recent[i].record;
     py::array_t<bool> auth_array(10),release_array(10);
     for(int j=0;j<10;j++){auth_array.mutable_data()[j]=authorized[j];release_array.mutable_data()[j]=release[j];}
-    auto state=module.attr("State")(hist,array(correction),array(cooldown),array(after),array(evidence),array(proof_origin),array(proof_net),auth_array,release_array,array(elapsed));
+    auto state=module.attr("State")(hist,array(correction),array(cooldown),array(after),array(evidence),array(proof_origin),array(proof_net),auth_array,release_array,array(elapsed),array(ids));
     py::dict diagnostic;
-    diagnostic["eligible"]=eligible;diagnostic["reason"]=reasons;diagnostic["own_motion"]=own;
+    diagnostic["episode_id"]=ids;diagnostic["eligible"]=eligible;diagnostic["reason"]=reasons;diagnostic["own_motion"]=own;
     diagnostic["authorized_axes"]=authorized;diagnostic["axis_own_motion"]=axis_own;
     diagnostic["contact_elapsed_s"]=elapsed;
     Q evidence_remaining{};for(int j=0;j<10;j++)evidence_remaining[j]=std::max(evidence[j]-stamp,0.);
@@ -850,7 +871,7 @@ class Model {
     }
 };
 PYBIND11_MODULE(_hand_native_ext, m) {
-    m.def("participate", &participate);
+    m.def("participate", &participate, py::arg("gate"), py::arg("base"), py::arg("raw"), py::arg("points"), py::arg("stamp"), py::arg("contact"), py::arg("policy"), py::arg("episode")=py::none(), py::arg("guard")=py::none());
     py::register_exception<Deadline>(m, "Deadline", PyExc_TimeoutError);
     py::class_<Model>(m, "Model")
         .def(py::init<py::dict, py::dict>())

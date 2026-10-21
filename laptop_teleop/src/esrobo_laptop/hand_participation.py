@@ -11,7 +11,7 @@ POLICY = dict(window_s=.600, minimum_span_s=.100, minimum_samples=3,
               approach_width=.01, jump_window_s=.100, jump_flex_deg=20.,
               jump_side_deg=6., cooldown_s=.300, transition_s=.080,
               history_capacity=64, evidence_lifetime_s=.600,
-              contact_confirm_s=.100, release_s=.160)
+              contact_confirm_s=.100, release_s=.160, step_flex_deg=15., step_side_deg=5.)
 FLEX = np.array([4, 5, 7, 9])
 SIDE = np.array([3, 5, 6, 8])  # Middle's placeholder is masked below.
 HAS_SIDE = np.array([True, False, True, True])
@@ -39,6 +39,7 @@ class State:
     authorized_axes: np.ndarray = field(default_factory=lambda: np.zeros(10, dtype=bool))
     release_axes: np.ndarray = field(default_factory=lambda: np.zeros(10, dtype=bool))
     contact_elapsed: np.ndarray = field(default_factory=lambda: np.zeros(4))
+    episode_id: np.ndarray = field(default_factory=lambda: np.zeros(4, dtype=np.int64))
 
 
 @dataclass(frozen=True)
@@ -61,12 +62,33 @@ class FingerParticipation:
         self.width, self.max_gap = float(width), max_gap_s
         self.radius = np.deg2rad([0., 0., 0., side_deg, flex_deg, flex_deg,
                                  side_deg, flex_deg, side_deg, flex_deg])
+        self.step_radius = np.minimum(self.radius, np.deg2rad([0., 0., 0.,
+            POLICY["step_side_deg"], POLICY["step_flex_deg"], POLICY["step_flex_deg"],
+            POLICY["step_side_deg"], POLICY["step_flex_deg"], POLICY["step_side_deg"], POLICY["step_flex_deg"]]))
         self.state = None
         self.native = None
 
-    def propose(self, base, raw_base, points, stamp, contact):
+    def inspect(self, raw_base, stamp):
+        """Pure preflight, before contact; reused by either participation backend."""
+        prev = self.state
+        history = () if prev is None else prev.history
+        dt = 0. if not history else stamp-history[-1].stamp
+        if history and dt <= 0:
+            raise ValueError('non-advancing finger participation time')
+        cooldown = np.zeros(4) if prev is None else prev.cooldown_until.copy()
+        jump = np.zeros(4, bool)
+        recent = [v for v in history if stamp-v.stamp <= POLICY['jump_window_s']+1e-9]
+        if recent and dt <= self.max_gap:
+            changes = abs(np.array([v.raw for v in recent])-raw_base)
+            jump = ((changes[:, FLEX] > np.deg2rad(POLICY['jump_flex_deg'])).any(axis=0)
+                    | ((changes[:, SIDE] > np.deg2rad(POLICY['jump_side_deg'])).any(axis=0) & HAS_SIDE))
+            cooldown[jump] = stamp+POLICY['cooldown_s']
+        return jump, cooldown
+
+    def propose(self, base, raw_base, points, stamp, contact, *, episode=None, guard=None):
+        guard = self.inspect(raw_base, stamp) if guard is None else guard
         if self.native is not None:
-            return self.native(self, base, raw_base, points, stamp, contact, POLICY)
+            return self.native(self, base, raw_base, points, stamp, contact, POLICY, episode, guard)
         prev = self.state
         history = () if prev is None else prev.history
         dt = 0. if not history else stamp-history[-1].stamp
@@ -87,15 +109,13 @@ class FingerParticipation:
         sample = Sample(stamp, raw_base.copy(), base.copy(),
                         (tips-points[START]).copy(), toward.copy())
         recent = tuple(v for v in history if stamp-v.stamp <= POLICY['window_s']+1e-9)
-        jump_history = tuple(v for v in recent if stamp-v.stamp <= POLICY['jump_window_s']+1e-9)
-        jump = np.zeros(4, dtype=bool)
-        if jump_history:
-            changes = abs(np.array([v.raw for v in jump_history])-raw_base)
-            jump = ((changes[:, FLEX] > np.deg2rad(POLICY['jump_flex_deg'])).any(axis=0)
-                    | ((changes[:, SIDE] > np.deg2rad(POLICY['jump_side_deg'])).any(axis=0) & HAS_SIDE))
-            cooldown[jump] = stamp+POLICY['cooldown_s']
-            # Quarantine rapid shape changes, retaining history for a later
-            # stable, confirmed contact; a jump never immediately grants motion.
+        jump, cooldown = guard
+        # Quarantine discards proof rather than deferring its authorization.
+        after = np.maximum(after, cooldown)
+        ids = np.zeros(4, dtype=np.int64) if episode is None else episode.episode_id.copy()
+        changed = np.zeros(4, bool) if episode is None or prev is None else ids != prev.episode_id
+        if episode is not None:
+            after = np.maximum(after, episode.evidence_after)
         recent = (*recent, sample)[-POLICY['history_capacity']:]
         axis_own = np.zeros(10, dtype=bool)
         own = np.zeros(4, dtype=bool)
@@ -140,16 +160,20 @@ class FingerParticipation:
         for f in range(4):
             cols = [FLEX[f], SIDE[f]] if HAS_SIDE[f] else [FLEX[f]]
             exited = not contact[f] and elapsed[f] > 0.
-            if exited:
-                after[f] = stamp
+            if exited or changed[f] or stamp < cooldown[f]:
+                after[f] = max(after[f], stamp)
                 evidence[cols] = 0.
                 authorized[cols] = False
-            elapsed[f] = elapsed[f]+dt if contact[f] else 0.
+            elapsed[f] = (max(0., stamp-episode.confirmed_at[f]) if contact[f] else 0.) if episode is not None else (elapsed[f]+dt if contact[f] else 0.)
             for c, k in enumerate(cols):
                 threshold = np.deg2rad(POLICY['flex_motion_deg' if c == 0 else 'side_motion_deg'])
+                if episode is not None:
+                    evidence[k] = episode.axis_until[k]
+                    authorized[k] &= bool(episode.frozen_axes[k])
+                    continue
                 if (base[k]-origin[k])*np.sign(proof_net[k]) < threshold*.5:
                     evidence[k] = 0.
-                if axis_own[k] and approach[f] >= POLICY['approach_width'] and not reset and not exited:
+                if axis_own[k] and approach[f] >= POLICY['approach_width'] and not reset and not exited and stamp >= cooldown[f]:
                     evidence[k] = stamp+POLICY['evidence_lifetime_s']
                     proof_net[k] = np.deg2rad(net_deg[f,c])
                     origin[k] = base[k]-proof_net[k]
@@ -160,22 +184,23 @@ class FingerParticipation:
             blocked = reset or (contact[f] and stamp < cooldown[f])
             confirmed = contact[f] and elapsed[f] >= POLICY['contact_confirm_s']-1e-9
             if confirmed and not blocked:
-                authorized[cols] |= evidence[cols] >= stamp
-            if not contact[f] and not blocked:
+                authorized[cols] |= (evidence[cols] >= stamp) if episode is None else episode.frozen_axes[cols]
+            if (not contact[f] or blocked) and not reset:
                 release[cols] |= abs(fixed[cols]-base[cols]) > 1e-12
             if blocked:
                 reasons[f] = 'clock_reset' if reset else 'shape_jump_cooldown'
+            if reset:
                 continue
             # Intent outlives instantaneous movement, but each axis has its own
             # authorization and bounded source-time budget (never cross-axis).
             for k in cols:
-                if confirmed and authorized[k]:
-                    budget[k] = self.radius[k]*min(dt/POLICY['transition_s'], 1.)
+                if confirmed and not blocked and authorized[k]:
+                    budget[k] = self.step_radius[k]*min(dt/POLICY['transition_s'], 1.)
                     lo[k] = max(self.lower[k], base[k]-self.radius[k], fixed[k]-budget[k])
                     hi[k] = min(self.upper[k], base[k]+self.radius[k], fixed[k]+budget[k])
                     participating[f] = True
-                elif not contact[f] and release[k]:
-                    budget[k] = self.radius[k]*min(dt/POLICY['release_s'], 1.)
+                elif (not contact[f] or blocked) and release[k]:
+                    budget[k] = self.step_radius[k]*min(dt/POLICY['release_s'], 1.)
                     offset = fixed[k]-base[k]
                     fixed[k] -= np.clip(offset, -budget[k], budget[k])
                     lo[k] = hi[k] = fixed[k]
@@ -187,8 +212,8 @@ class FingerParticipation:
                 reasons[f] = 'contact_exit_release'
             elif contact[f] and not confirmed:
                 reasons[f] = 'contact_confirmation'
-        state = State(recent, correction, cooldown, after, evidence, origin, proof_net, authorized, release, elapsed)
-        diagnostic = dict(eligible=participating.tolist(), reason=reasons,
+        state = State(recent, correction, cooldown, after, evidence, origin, proof_net, authorized, release, elapsed, ids)
+        diagnostic = dict(eligible=participating.tolist(), reason=reasons, episode_id=ids.tolist(),
                           authorized_axes=authorized.tolist(), axis_own_motion=axis_own.tolist(),
                           contact_elapsed_s=elapsed.tolist(),
                           evidence_remaining_s=np.maximum(evidence-stamp, 0.).tolist(),

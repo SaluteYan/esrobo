@@ -1,4 +1,5 @@
 """Left L20Lite geometry fitting. Pure computation; no SDK/ROS/CAN access."""
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -12,8 +13,8 @@ from esrobo_teleop.robot.linker_hand_driver import ACTIVE_HAND_JOINTS
 from .hand_participation import FingerParticipation, POLICY as PARTICIPATION_POLICY
 from .hand_contact import HandContact, POLICY as CONTACT_POLICY
 
-VERSION = "left-urdf-10-v8"
-POLICY = dict(pinch_start_width=1.1, pinch_ramp_width=.6,
+VERSION = "left-urdf-10-v13"
+POLICY = dict(finger_flex_mapping="three_segment_linkage_v1", pinch_start_width=1.1, pinch_ramp_width=.6,
               project_target_m=.002,
               project_transition_s=.080, clock_gap_s=.1,
               release_thumb_transition=True, participation_thumb_transition_s=.080, fixed_finger_contact="posture_soft_vector_v1",
@@ -429,11 +430,30 @@ class HandRetargeter:
         distance = np.linalg.norm(pair, axis=1)
         raw = target if synthetic else np.asarray(poses)[:, :3]
         human_distance = np.linalg.norm(raw[TIPS[1:]]-raw[5], axis=1)
+        geometric_base = self.direct_fingers(target)
+        raw_base = geometric_base if synthetic else self.direct_fingers(raw_target)
+        guard = self.participation.inspect(raw_base, stamp)
         contact_started = time.monotonic()
-        contact_state, contact_diagnostic = self.contact_detector.propose(human_distance, target, m.width, stamp)
+        contact_state, contact_diagnostic = self.contact_detector.propose(
+            human_distance, target, m.width, stamp,
+            human_width=m.width if synthetic else np.linalg.norm(raw[7]-raw[22]),
+            base=geometric_base, quarantine=stamp < guard[1])
         contact, projection = contact_state.active, contact_state.projection
         reset = contact_diagnostic["clock_reset"]
         contact_ms = (time.monotonic()-contact_started)*1000
+        participation_started = time.monotonic()
+        permission = self.participation.propose(geometric_base, raw_base, target, stamp, contact, episode=contact_state, guard=guard)
+        base = permission.fixed
+        constrained_contact = contact & np.asarray(permission.diagnostic["eligible"])
+        participation_ms = (time.monotonic()-participation_started)*1000
+        projection_dt = 0. if reset or self.source_time is None else stamp-self.source_time
+        projection = self.projection+np.clip(constrained_contact.astype(float)-self.projection,
+            -projection_dt/POLICY['project_transition_s'], projection_dt/POLICY['project_transition_s'])
+        contact_state = replace(contact_state, projection=projection.copy())
+        contact_diagnostic['projection_authorized'] = constrained_contact.tolist()
+        contact_diagnostic['projection_reason'] = [
+            'authorized_episode' if constrained_contact[f] else
+            'releasing' if projection[f] > 0 else 'no_current_episode_permission' for f in range(4)]
         if synthetic:
             # Explicit model fixtures retain their exact attainable vectors.
             projection = np.zeros(4)
@@ -458,17 +478,10 @@ class HandRetargeter:
         gates = np.clip((POLICY['pinch_start_width']-distance/m.width)/POLICY['pinch_ramp_width'], 0., 1.)
         gates = np.maximum(gates*gates*(3-2*gates), projection)
         active = np.flatnonzero(contact | (projection > 0.))
-        participation_started = time.monotonic()
-        geometric_base = self.direct_fingers(target)
-        raw_base = geometric_base if synthetic else self.direct_fingers(raw_target)
-        permission = self.participation.propose(geometric_base, raw_base, target, stamp, contact)
-        base = permission.fixed
         moving_indices = np.flatnonzero(permission.upper[3:]-permission.lower[3:] > 1e-12)+3
         moving = np.array([f for f in active if any(k in moving_indices
             for k in ([5] if f == 1 else [[3,4],[],[6,7],[8,9]][f]))], dtype=int)
-        constrained_contact = contact & np.asarray(permission.diagnostic["eligible"])
         strict = constrained_contact[active]
-        participation_ms = (time.monotonic()-participation_started)*1000
         target_plane, _ = self._plane(desired, np.zeros((3, 3, 3)))
         plane_confidence = float(np.linalg.norm(target_plane))
         weights = np.array(POLICY['open_direction_weights'])
