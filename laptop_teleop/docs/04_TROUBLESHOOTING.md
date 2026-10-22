@@ -4,7 +4,7 @@
 
 ## 基本检查
 
-异常处理的本地更新见 [07代码与计算：异常停止分流](07_CODE_AND_COMPUTATION.md#异常停止分流2026-10-21本地修改待上线)。受检执行失败只有减速、静止和健康验证全部通过才显示“已停止并保持；受检运动未完成”；`returned=false` 仍不是恢复IDLE成功。核对网关 `return_result` 诊断中的 `first_motion_rejection` 与 `failure_hold`，不要仅看重试后的 `entry_certificate_invalid`。
+异常处理的本地更新见 [07代码与计算：异常停止分流](07_CODE_AND_COMPUTATION.md#异常停止分流2026-10-21)。受检执行失败只有减速、静止和健康验证全部通过才显示“已停止并保持；受检运动未完成”；`returned=false` 仍不是恢复IDLE成功。核对网关 `return_result` 诊断中的 `first_motion_rejection` 与 `failure_hold`，不要仅看重试后的 `entry_certificate_invalid`。
 
 手部111→254→111异常导致旧几何证明失效时，当前修改仍不能保证不下落；无安全减速候选、反馈／控制器／力矩／发送故障及明确急停保留故障停止。电子急停不等于机械抱闸或已失能。本次修改尚未部署，不自动重启、使能、失能或回零。
 
@@ -236,6 +236,8 @@ PYTHONPATH=teleoperation/src python -m esrobo_teleop.debug.log_retention --apply
 JSON诊断可用 `gzip -dc <diagnostics.json.gz> > /tmp/diagnostics.json`。工具若写死历史原路径，应先核对该原路径不存在、不是活动文件，再仅恢复该文件；分析完成后可移除解压副本并保留归档。不要同时保留全部归档和全部解压副本。
 
 `tests/` 只存有效回归、固定 `fixtures/` 与独立 `tools/`。完整日志和一次性输出不放进测试目录。当前结构及运行入口见 [测试索引](../tests/README.md)；可清理字节码缓存，不能依据测试年限或文件数量删除有效用例。
+
+2026-10-22整理清单保存在 `log/retained/maintenance/cleanup_experiment_20261022/`。无名指／小指参数初筛的一次性 `scan.py`、`scan_thumb.py`、`replay.py` 已从原目录移至该目录 `retired_exploratory_programs.tar.gz`；需要复核历史方法时按存档相对路径恢复，平时使用 `scripts/` 下的维护入口。`ring_pinky_tuning_20261022/can_commands.json` 已无损压缩为同名 `.json.gz`，按上文方法解压读取。被否决的对称缩放 `candidate.npz` 已删除，其指标与失败记录 `candidate.json` 保留；最终单侧方案、基线和完整输入未删除。
 
 全仓库清理边界：
 

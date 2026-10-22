@@ -490,9 +490,10 @@ def test_hand_state_commit_requires_fresh_successful_publication(send_ok, stale)
         f.close()
 
 
-def test_worker_publishes_only_matching_acknowledgement(monkeypatch):
+@pytest.mark.parametrize('solver_mode', ['v13', 'wrist5'])
+def test_worker_publishes_only_matching_acknowledgement(monkeypatch, solver_mode):
     from esrobo_laptop import hand_worker
-    from esrobo_laptop import hand_retarget
+    from esrobo_laptop import hand_solver
     import numpy as np
     solvers = []
     class Solver:
@@ -516,7 +517,8 @@ def test_worker_publishes_only_matching_acknowledgement(monkeypatch):
         def send(self, value): self.sent.append(value)
         def recv(self): return next(messages)
         def close(self): pass
-    monkeypatch.setattr(hand_retarget, 'HandRetargeter', Solver)
+    monkeypatch.setattr(hand_solver, 'create_solver', Solver)
+    monkeypatch.setattr(hand_solver, 'contract', lambda cfg, digest=None: ('test-version', 'test'))
     monkeypatch.setattr('esrobo_laptop.pico_hand.PicoHands', Hands)
     messages = iter([
         ('sample', 1, dict(received_monotonic_ns=1)),
@@ -526,7 +528,8 @@ def test_worker_publishes_only_matching_acknowledgement(monkeypatch):
         ('sample', 3, dict(received_monotonic_ns=3)),
         ('publish', 2, True),  # Superseded candidate cannot commit either.
         ('publish', 3, True), None])
-    connection = Connection(); hand_worker._run(connection, None)
+    cfg = SimpleNamespace(hand=SimpleNamespace(left_retarget_mode='urdf_10', left_retarget_solver=solver_mode))
+    connection = Connection(); hand_worker._run(connection, cfg)
     assert solvers[0].committed == [4]  # Warm-up=1, then samples=2,3,4.
     assert all('candidate_id' not in r.get('result', {}) for r in connection.sent)
 

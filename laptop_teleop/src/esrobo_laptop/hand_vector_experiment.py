@@ -1,7 +1,7 @@
-"""Offline-only adapter to dex-retargeting's actual VectorOptimizer.
+"""Adapter to dex-retargeting's actual VectorOptimizer.
 
-No hardware imports/outputs, no change to the production HandRetargeter selection.
-Use the isolated experiment environment; see docs/09_TECHNICAL_SCHEME.md.
+No hardware imports/outputs. Live selection is explicit in hand_solver and uses
+the isolated worker environment; see docs/09_TECHNICAL_SCHEME.md.
 """
 import copy
 import hashlib
@@ -22,6 +22,7 @@ VERSION = 'left-dex-vector-experiment-v2'
 PRESETS = {
     'wrist5': [(1, int(i)) for i in TIPS],
     'wrist9': [(1, int(i)) for i in TIPS] + [(5, int(i)) for i in TIPS[1:]],
+    'root5': [(1, 5), (7, 10), (12, 15), (17, 20), (22, 25)],
     'palm10': [(0, int(i)) for i in TIPS] + [(0, i) for i in (3, 8, 13, 18, 23)],
     'bones19': [tuple(map(int, pair)) for pair in BONES] + [(5, int(i)) for i in TIPS[1:]],
 }
@@ -80,12 +81,15 @@ class VectorHandRetargeter:
     to avoid confounding the comparison with a second smoother.
     """
     def __init__(self, cfg, *, preset='wrist5', scale_mode='palm',
-                 scale_factor=1., reference_width_m=None):
+                 scale_factor=1., reference_width_m=None, objective_backend='upstream'):
         import torch
         import dex_retargeting.optimizer as upstream
         from dex_retargeting.retargeting_config import RetargetingConfig
         if preset not in PRESETS:
             raise ValueError('unknown vector preset')
+        if objective_backend not in ('upstream', 'analytic'):
+            raise ValueError('unknown vector objective backend')
+        self.objective_backend = objective_backend
         if scale_mode not in ('palm', 'fixed', 'none'):
             raise ValueError('unknown hand scale mode')
         if not np.isfinite(scale_factor) or scale_factor <= 0:
@@ -131,6 +135,19 @@ class VectorHandRetargeter:
         self.optimizer.set_joint_limit(np.column_stack((self.model.lower, self.model.upper)), epsilon=0.)
         self.optimizer.opt.set_maxeval(80)
         self.optimizer.opt.set_ftol_abs(1e-8)
+        self._origin_indices = self.optimizer.origin_link_indices.numpy().copy()
+        self._task_indices = self.optimizer.task_link_indices.numpy().copy()
+        children = {j.get('name')[5:]:j.find('child').get('link') for j in js
+                    if j.get('name', '').startswith('left_')}
+        landmarks = [(2,'thumb_cmc_pitch',None),(3,'thumb_mcp',None),
+                     (4,'thumb_ip',None),(5,'thumb_ip',self.model.tip_offsets[0])]
+        for f, finger in enumerate(FINGERS[1:]):
+            start = 6+5*f
+            landmarks.extend([(start,finger+('_mcp_pitch' if finger=='middle' else '_mcp_roll'),None),
+                (start+1,finger+'_mcp_pitch',None),(start+2,finger+'_pip',None),
+                (start+3,finger+'_dip',None),(start+4,finger+'_dip',self.model.tip_offsets[f+1])])
+        self._diagnostic_links = [(slot,robot.get_link_index(children[name]),offset)
+                                  for slot,name,offset in landmarks]
         self.previous = self.model.neutral.copy()
         self.source_time = None
         self._pending = None
@@ -143,7 +160,8 @@ class VectorHandRetargeter:
             wrist_marker='leftHand_link origin / PICO node 1',
             huber_delta_m=.02, normal_delta=.004, max_evaluations=80,
             output_filter=False, input_filter=True, exact_bounds=True,
-            ftol_abs=1e-8, consistent_temporal_objective=True)
+            ftol_abs=1e-8, consistent_temporal_objective=True,
+            objective_backend=objective_backend)
         self.fingerprint = hashlib.sha256(json.dumps(self.metadata, sort_keys=True).encode()).hexdigest()
 
     def human_points(self, poses):
@@ -178,7 +196,57 @@ class VectorHandRetargeter:
         self.discard()
         return True
 
-    def solve(self, poses, *, source_time, budget_s=.020, commit=False, target=None):
+    def _diagnostic_points(self, q):
+        # Reuse compiled FK; diagnostics need positions, not another full Jacobian.
+        opt = self.optimizer
+        full = np.zeros(opt.num_joints)
+        full[opt.idx_pin2target] = q
+        opt.adaptor.forward_qpos(full)
+        opt.robot.compute_forward_kinematics(full)
+        points = np.zeros((26,3))
+        for slot, link, offset in self._diagnostic_links:
+            pose = opt.robot.get_link_pose(link)
+            points[slot] = pose[:3,3] if offset is None else pose[:3,3]+pose[:3,:3]@offset
+        points[11] -= [0,0,.02]
+        points[0] = points[[7,12,17,22]].mean(axis=0)
+        return points
+
+    def _analytic_objective(self, vectors, previous):
+        """Same vector-distance SmoothL1 + temporal loss, without autograd.
+
+        FK, exact mimic Jacobians, SLSQP and tolerances remain upstream's.
+        Avoid constructing a Torch graph at every small solver evaluation.
+        """
+        opt = self.optimizer
+        full = np.zeros(opt.num_joints)
+        origins, tasks = self._origin_indices, self._task_indices
+        beta = float(opt.huber_loss.beta)
+        target = np.asarray(vectors)*opt.scaling
+        def objective(q, grad):
+            full[opt.idx_pin2target] = q
+            opt.adaptor.forward_qpos(full)
+            opt.robot.compute_forward_kinematics(full)
+            poses = [opt.robot.get_link_pose(i) for i in opt.computed_link_indices]
+            points = np.array([pose[:3, 3] for pose in poses])
+            delta = points[tasks]-points[origins]-target
+            distance = np.linalg.norm(delta, axis=1)
+            loss = np.where(distance < beta, .5*distance**2/beta, distance-.5*beta).mean()
+            change = q-previous
+            if grad.size:
+                jac = np.array([pose[:3, :3] @ opt.robot.compute_single_link_local_jacobian(full, i)[:3]
+                                for pose, i in zip(poses, opt.computed_link_indices)])
+                jac = opt.adaptor.backward_jacobian(jac)
+                direction = delta/np.maximum(distance, beta)[:, None]/len(distance)
+                grad[:] = np.einsum('vi,vij->j', direction, jac[tasks]-jac[origins]) + 2*opt.norm_delta*change
+            return float(loss+opt.norm_delta*(change@change))
+        return objective
+
+    def build_vectors(self, points):
+        """Objective geometry hook; the default keeps the original experiment."""
+        return points[self.pairs[:, 1]]-points[self.pairs[:, 0]]
+
+    def solve(self, poses, *, source_time, budget_s=.020, commit=False, target=None,
+              include_diagnostics=False):
         started = time.monotonic()
         self.discard()
         stamp = float(source_time)
@@ -199,13 +267,15 @@ class VectorHandRetargeter:
         # Both models use the neutral MCP centroid as the fixed palm marker.
         points = points.copy()
         points[0] = self.model.origin
-        vectors = points[self.pairs[:, 1]]-points[self.pairs[:, 0]]
+        vectors = self.build_vectors(points)
         upstream_objective = self.optimizer.get_objective_function(vectors, np.array([]), self.previous.copy())
         previous = self.previous.copy()
         def objective(q, grad):
             # Pinned upstream adds this regularizer's gradient, but omits its
             # scalar loss. Restore function/gradient consistency for SLSQP.
             return upstream_objective(q, grad) + .004*float((q-previous)@(q-previous))
+        if self.objective_backend == 'analytic':
+            objective = self._analytic_objective(vectors, previous)
         remaining = budget_s-(time.monotonic()-started)
         if remaining <= 0:
             raise TimeoutError('vector preprocessing exceeded deadline')
@@ -223,12 +293,38 @@ class VectorHandRetargeter:
         if np.any(q < self.model.lower-1e-9) or np.any(q > self.model.upper+1e-9):
             raise RuntimeError('vector output outside joint bounds')
         q = np.clip(q, self.model.lower, self.model.upper)
+        diagnostic = dict(solve_ms=elapsed*1000, status=status,
+                          evaluations=self.optimizer.opt.get_numevals(), preset=self.preset)
+        geometry = {}
+        if include_diagnostics:
+            solved = self._diagnostic_points(q)
+            wrist_error = (solved[TIPS]-solved[1])-(points[TIPS]-points[1])
+            pinch_error = (solved[TIPS[1:]]-solved[5])-(points[TIPS[1:]]-points[5])
+            diagnostic.update(tip_error_mm=(1000*np.linalg.norm(wrist_error, axis=1)).tolist(),
+                pinch_error_mm=(1000*np.linalg.norm(pinch_error, axis=1)).tolist(),
+                limited_axes=[n for i,n in enumerate(self.model.names)
+                              if min(q[i]-self.model.lower[i],self.model.upper[i]-q[i]) < 1e-5],
+                tip_error_reference='wrist_relative_vectors',
+                contact_projection=False)
+            if 'geometry_mode' in self.metadata:
+                objective_points = solved.copy()
+                objective_points[0] = self.model.origin
+                residual = objective_points[self.pairs[:,1]]-objective_points[self.pairs[:,0]]-vectors
+                diagnostic.update(target_geometry=self.metadata['geometry_mode'],
+                    lateral_geometry=self.metadata.get('lateral_geometry'),
+                    objective_vectors_m=vectors.tolist(),
+                    objective_error_mm=(1000*np.linalg.norm(residual,axis=1)).tolist(),
+                    tip_error_reference='unmodified_human_wrist_relative_vectors')
+            geometry = dict(target_points=points.tolist(), solved_points=solved.tolist())
+        elapsed = time.monotonic()-started
+        if elapsed >= budget_s:
+            raise TimeoutError('vector diagnostics exceeded deadline')
+        diagnostic['solve_ms'] = elapsed*1000
         self._serial += 1
         self._pending = (self._serial, q.copy(), stamp, shape)
-        result = dict(joints=q, candidate_id=self._serial, mapping_version=VERSION,
+        result = dict(joints=q.tolist(), candidate_id=self._serial, mapping_version=VERSION,
                       source_time=stamp, fingerprint=self.fingerprint,
-                      diagnostics=dict(solve_ms=elapsed*1000, status=status,
-                          evaluations=self.optimizer.opt.get_numevals(), preset=self.preset))
+                      diagnostics=diagnostic, **geometry)
         if commit:
             self.commit(self._serial)
         return result

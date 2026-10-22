@@ -188,6 +188,8 @@ def default_hand_mapper():
     from pathlib import Path
     from esrobo_teleop.config import load_config
     cfg = load_config(str(WORKSPACE/'teleoperation/config/teleop_config.yaml'))
+    from .hand_solver import selection
+    selection(cfg)  # Reject an invalid selection instead of falling back to geometry.
     if not Path(cfg.ik.urdf_path).is_absolute():
         cfg.ik.urdf_path = str(WORKSPACE/'teleoperation'/cfg.ik.urdf_path)
     if cfg.hand.left_retarget_mode == 'urdf_10':

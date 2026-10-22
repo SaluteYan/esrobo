@@ -42,6 +42,8 @@ class FreshBodyDevice(BodyDevice):
         self.used = {}
         self.hand_sequences = {}
         self.hand_mapping_fingerprint = None
+        from .hand_retarget import VERSION
+        self.hand_mapping_version = VERSION
         self.hand_mapping_upper = None
         self.hand_retarget_diagnostics = {}
         self.pico_hand_targets = {}
@@ -447,8 +449,7 @@ class FreshBodyDevice(BodyDevice):
                 continue
             sample = message["pico_hands"][side]
             if side == 'left' and self.hand_mapping_fingerprint is not None:
-                from .hand_retarget import VERSION
-                if (sample.get('mapping_version') != VERSION or
+                if (sample.get('mapping_version') != self.hand_mapping_version or
                         sample.get('mapping_fingerprint') != self.hand_mapping_fingerprint):
                     raise ValueError('left hand mapping version/model mismatch; restart PICO and laptop')
             angles = np.asarray(sample["joints"], dtype=float)

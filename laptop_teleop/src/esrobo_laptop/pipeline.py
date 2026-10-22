@@ -13,6 +13,9 @@ from .config import ROOT
 
 class Pipeline:
     def __init__(self, cfg, settings, contracts):
+        if settings.with_hand and 'left' in settings.sides:
+            from .hand_solver import selection
+            selection(cfg)
         if not settings.hand_only:
             # Load and warm the numerical backend before an arm gateway can be armed.
             from scipy.optimize import least_squares
@@ -47,8 +50,9 @@ class Pipeline:
         self.body = FreshBodyDevice(retarget, settings.sides, settings.with_hand, settings.hand_only)
         if settings.with_hand and 'left' in settings.sides and cfg.hand.left_retarget_mode == 'urdf_10':
             from .hand_retarget import HandModel
+            from .hand_solver import contract
             hand_model = HandModel(cfg)
-            self.body.hand_mapping_fingerprint = hand_model.digest
+            self.body.hand_mapping_version, self.body.hand_mapping_fingerprint = contract(cfg, hand_model.digest)
             self.body.hand_mapping_upper = hand_model.upper.copy()
         self.body._reference_diagnostic_path = ROOT / "log" / f"pico_reference_{time.time_ns()}.jsonl"
         self.wrists = {}

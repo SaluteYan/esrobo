@@ -41,6 +41,8 @@ python laptop_teleop/tests/tools/summarize_torque.py /path/to/torque.jsonl
 
 新增测试应覆盖尚未覆盖的行为、边界或真实回归，优先扩展既有参数化用例，不为每次常量、文案或文档修改机械新增文件。若功能明确废弃，删除对应断言并在统一 [修改日志](../docs/08_CHANGELOG.md)记录依据。保留有效的保护验证，不为减少数量删除独立故障场景。按修改范围运行一次足够的验证，只有新改动或未解决失败才重复；完整回归用于公共接口、跨模块变更及发布验收。详细选择依据见 [按修改范围验证](../docs/04_TROUBLESHOOTING.md#按修改范围验证)。
 
+2026-10-22实验分支整理仅移除可再生缓存及归档目录内已结束的一次性试验入口；现行v13和wrist5均仍可选，相关回归不视作废弃。维护向量参数时优先使用 `scripts/replay_hand_vector.py` 和 `scripts/compare_wrist_geometry.py`，不要再次复制参数扫描程序到测试目录。本次未新增用例或扩大默认测试范围；向量专项40项和发布提交专项5项通过，未重复完整回归。未跟踪的测试按仓库现有 `tests/` 忽略规则留在本机，不能将本机通过数量理解为远程检出后自动具备同一套测试。
+
 左手接触重定向可重复验收：
 
 长时间验收前，先把所需输入快照保存在 `log/retained/<本次验收>/`，按现有规则添加 `.keep`；不要依赖普通运行日志在整个测试期间仍被保留。活动日志只做窗口副本，不移动或截断原文件。
@@ -51,3 +53,10 @@ python laptop_teleop/tests/tools/benchmark_hand_contact.py --pico pico_motion.js
 ```
 
 两工具都保留 ACTIVE 前的原始历史；前者每 5 帧抽取一个高预算多初值参考解，并明确报告抽样数量及未找到可行解的样本。后者在隔离进程中回放原始 Body/双手到达节奏，复用实际掌面与右手计算，本地临时 UDP 端口仅验证发布延迟，不连接运行服务，也不模拟机器人动力学。自然张开候选是几何筛选，不能视为人工静止/自然张开标定。`fixtures/hand_contact/middle_boundary.json` 保存导致协调步长错误截断的最小数值回归样本，其预置状态是离线求解状态，不冒充实测机器人姿态。
+
+实验分支的 `test_hand_vector_experiment.py` 使用隔离向量环境运行，验证真实 FK／mimic 雅可比、可达目标、限位及候选提交；普通环境缺少可选依赖时跳过。本次从原实验归档恢复既有用例，没有将它加入默认冒烟：
+
+```bash
+PYTHONPATH="$PWD/laptop_teleop/src:$PWD/teleoperation/src:$PWD/robot_link" \
+  laptop_teleop/external/dex-vector-venv/bin/python -m pytest laptop_teleop/tests/test_hand_vector_experiment.py -q
+```

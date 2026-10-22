@@ -20,6 +20,7 @@ for p in ('laptop_teleop/src','teleoperation/src','robot_link'):
 from esrobo_laptop.config import read_settings,read_robot_config
 from esrobo_laptop.hand_retarget import HandRetargeter
 from esrobo_laptop.hand_vector_experiment import VectorHandRetargeter, PRESETS
+from esrobo_laptop.hand_vector_geometry import GeometryVectorHandRetargeter, GEOMETRY_MODES
 
 
 def main():
@@ -28,6 +29,10 @@ def main():
     ap.add_argument('--published',type=Path,required=True)
     ap.add_argument('--output',type=Path,required=True)
     ap.add_argument('--mode',choices=['v13', *PRESETS],required=True)
+    ap.add_argument('--geometry-mode',choices=GEOMETRY_MODES)
+    ap.add_argument('--thumb-ulnar-gain',type=float,help='override anatomical lateral gain; 1 reproduces v2')
+    ap.add_argument('--finger-lateral-offset-mm',nargs=4,type=float,help='index/middle/ring/little offsets; four zeros reproduce v2')
+    ap.add_argument('--objective-backend',choices=['upstream','analytic'],default='upstream')
     ap.add_argument('--scale-mode',choices=['palm','fixed','none'],default='palm')
     ap.add_argument('--scale-factor',type=float,default=1.)
     ap.add_argument('--reference-width-m',type=float)
@@ -35,16 +40,27 @@ def main():
     ap.add_argument('--repeats',type=int,default=3)
     ap.add_argument('--budget-ms',type=float,default=20.)
     a=ap.parse_args();a.output.mkdir(parents=True,exist_ok=True)
+    if a.geometry_mode and (a.mode!='wrist5' or a.scale_mode!='palm' or a.scale_factor!=1 or a.reference_width_m is not None):
+        ap.error('geometry comparisons use wrist5 entry with default input scaling')
     label=a.label or a.mode
     if Path(label).name != label or not label:ap.error('label must be a file name')
     if a.mode=='v13' and (a.scale_mode!='palm' or a.scale_factor!=1 or a.reference_width_m is not None):
         ap.error('v13 scaling is unchanged; scaling options apply only to vector experiments')
     z=dict(np.load(a.input));published=set(json.loads(a.published.read_text()))
     cfg=read_robot_config(read_settings(ROOT/'laptop_teleop/config/laptop.yaml'))
+    if a.thumb_ulnar_gain is not None:cfg.hand.left_vector_thumb_ulnar_gain=a.thumb_ulnar_gain
+    if a.finger_lateral_offset_mm is not None:cfg.hand.left_vector_finger_lateral_offset_mm=a.finger_lateral_offset_mm
+    if (a.thumb_ulnar_gain is not None or a.finger_lateral_offset_mm is not None) and a.geometry_mode!='aligned_thumb_fingers':
+        ap.error('lateral overrides require aligned_thumb_fingers')
     reports=[]
     for repeat in range(a.repeats):
-        s=HandRetargeter(cfg) if a.mode=='v13' else VectorHandRetargeter(cfg,preset=a.mode,scale_mode=a.scale_mode,
-            scale_factor=a.scale_factor,reference_width_m=a.reference_width_m)
+        if a.mode=='v13':
+            s=HandRetargeter(cfg)
+        elif a.geometry_mode:
+            s=GeometryVectorHandRetargeter(cfg,geometry_mode=a.geometry_mode)
+        else:
+            s=VectorHandRetargeter(cfg,preset=a.mode,scale_mode=a.scale_mode,
+                scale_factor=a.scale_factor,reference_width_m=a.reference_width_m,objective_backend=a.objective_backend)
         count=len(z['seq']);qs=np.full((count,10),np.nan);elapsed=np.zeros(count)
         accepted=np.zeros(count,dtype=bool);evaluations=np.zeros(count,dtype=int)
         errors=[];gc.collect()

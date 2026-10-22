@@ -320,6 +320,10 @@ hand:
   enabled_physical_joints: [0, 1, 2, 3, 4, 5, 9]
   left_enabled_physical_joints: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   left_retarget_mode: urdf_10
+  left_retarget_solver: wrist5  # experiment: wrist -> five fingertips; v13 remains selectable
+  left_vector_geometry: aligned_thumb_fingers  # shared palm reference + per-finger total length
+  left_vector_thumb_ulnar_gain: 1.10  # only thumb travel toward ring/little side; 5 mm smooth onset
+  left_vector_finger_lateral_offset_mm: [0.0, 0.0, 3.0, 0.0]  # index/middle/ring/little, model palm lateral
   # Palm-local optical finger shape; does not filter arm/palm orientation.
   left_shape_filter_enabled: true
   left_shape_filter_min_cutoff_hz: 2.0

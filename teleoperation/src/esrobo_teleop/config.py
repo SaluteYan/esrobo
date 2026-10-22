@@ -482,6 +482,11 @@ class HandConfig:
     left_enabled_physical_joints: Optional[list] = None
     right_enabled_physical_joints: Optional[list] = None
     left_retarget_mode: str = "legacy"
+    # wrist5 is an opt-in experiment; calibrated ten-axis output is unchanged.
+    left_retarget_solver: str = "v13"
+    left_vector_geometry: str = "original"  # opt-in wrist5 anatomical target construction
+    left_vector_thumb_ulnar_gain: float = 1.0
+    left_vector_finger_lateral_offset_mm: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0)
     # Optical finger shape only: palm-local metres before URDF retargeting.
     left_shape_filter_enabled: bool = True
     left_shape_filter_min_cutoff_hz: float = 2.0

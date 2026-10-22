@@ -40,8 +40,9 @@ class SyntheticSensors:
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.hand_mapping = {}
         if pipeline.cfg.hand.left_retarget_mode == 'urdf_10':
-            from .hand_retarget import VERSION, fingerprint
-            self.hand_mapping = dict(mapping_version=VERSION, mapping_fingerprint=fingerprint(pipeline.cfg))
+            from .hand_solver import contract
+            version, fingerprint = contract(pipeline.cfg)
+            self.hand_mapping = dict(mapping_version=version, mapping_fingerprint=fingerprint)
 
     def run(self):
         while not self.stop.is_set():

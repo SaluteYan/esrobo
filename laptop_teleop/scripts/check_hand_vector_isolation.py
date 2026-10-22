@@ -8,6 +8,12 @@ for p in ('laptop_teleop/src','teleoperation/src','robot_link'):sys.path.insert(
 from esrobo_laptop.config import read_settings,read_robot_config
 from esrobo_laptop.hand_retarget import HandRetargeter
 from esrobo_laptop.hand_vector_experiment import VectorHandRetargeter
+from esrobo_laptop.hand_vector_geometry import GeometryVectorHandRetargeter, GEOMETRY_MODES
+
+def create(cfg,mode):
+    if mode in GEOMETRY_MODES:
+        return GeometryVectorHandRetargeter(cfg,geometry_mode=mode)
+    return HandRetargeter(cfg) if mode=='v13' else VectorHandRetargeter(cfg,preset=mode,objective_backend='analytic')
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
@@ -21,7 +27,7 @@ def main():
         if len(chosen)<2:continue
         result[label]={}
         for mode in a.modes:
-            s=HandRetargeter(cfg) if mode=='v13' else VectorHandRetargeter(cfg,preset=mode)
+            s=create(cfg,mode)
             fixed=s.model.human_target(z['poses'][chosen[0]]);stamp=1.
             # Settled fixed posture, so residual convergence is not scored as thumb-induced.
             for _ in range(100):
@@ -33,7 +39,7 @@ def main():
                 q=np.asarray(r['joints']);qs.append(q)
                 p=s.model.forward(q)[0];gaps.append(np.linalg.norm(p[[10,15,20,25]]-p[5],axis=1)*1000)
             qs=np.array(qs);gaps=np.array(gaps)
-            control=HandRetargeter(cfg) if mode=='v13' else VectorHandRetargeter(cfg,preset=mode)
+            control=create(cfg,mode)
             stamp=1.;control_q=[]
             for j in range(100+len(chosen)):
                 cr=control.solve(None,target=fixed,source_time=stamp,budget_s=1.,commit=True);stamp+=.02

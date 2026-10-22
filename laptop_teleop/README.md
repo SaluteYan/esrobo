@@ -1,5 +1,11 @@
 # ESROBO 本机遥操作
 
+**当前实验分支选择：** `hand.left_retarget_solver: wrist5`，左手按手腕到五个指尖的向量联合求解；v13仍可配置切回。算法接入与验证边界见 [五向量运行接入](docs/07_CODE_AND_COMPUTATION.md#五向量运行接入2026-10-21)。磁盘配置不代表运行进程已更新，服务加载状态以本次部署记录为准。
+
+2026-10-22运行配置显式选择 `left_vector_geometry: aligned_thumb_fingers`，接入统一掌部参考系及四指总骨长缩放（当前含侧向修正的版本为 `left-dex-wrist5-anatomical-live-v3`）；旧配置默认仍为 `original`。四指姿态改善和剩余对捏间隙见 [技术方案](docs/09_TECHNICAL_SCHEME.md#参考点与逐指尺寸修正离线对照2026-10-22)。
+
+2026-10-22 12:16已同步几何v3侧向参数修正并重启网关／PICO，指纹一致。依据和剩余执行偏差见 [技术方案](docs/09_TECHNICAL_SCHEME.md#无名指小指侧向错位修正2026-10-22几何v3已同步)。
+
 `laptop_teleop` 在电脑上采集 PICO Body/Hand，完成参考标定、重定向和 IK，再通过认证 UDP 将关节目标发送给机器人 `robot_link` 网关。网页负责服务管理、预览、人工准备、状态和日志；机器人主机运行 CAN/ROS 驱动、反馈校验和轨迹执行。当前输入使用 PICO，不需要 SenseGlove。
 
 本文负责项目入口、**环境安装与配置**；日常操作和实现细节分别放在 [docs](docs/01_README.md)。

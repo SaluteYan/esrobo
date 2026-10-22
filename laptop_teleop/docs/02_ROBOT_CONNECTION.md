@@ -48,6 +48,10 @@ ssh esrobo@192.168.10.100 'cd /home/esrobo/Projects/esrobo && git rev-parse HEAD
 
 配置/URDF 指纹和接管协议由客户端检查。出现 fingerprint mismatch 时同步双方配置及模型，在现场确认停止和失能后重启网关；不绕过合同检查。机器人端 LinkerHand ROS 源码更新后还需重新构建该包并加载新的 `install/setup.bash`。
 
+实验分支选择 `hand.left_retarget_solver: wrist5` 时，向量依赖仅安装在笔记本：执行 `bash laptop_teleop/scripts/install_dex_vector_experiment.sh`，生成 `laptop_teleop/external/dex-vector-venv/`。采集父进程继续使用原环境，独立子进程加载固定版本的 dex-retargeting、Torch、Pinocchio 和 NLopt；机器人网关不安装这些求解依赖。缺少环境或优化器源码校验不一致会拒绝启动，不自动回退 v13。
+
+运行前同时更新两端配置及本机采集进程，核对采集映射版本和两端合同。当前配置含几何侧向修正，预期版本为 `left-dex-wrist5-anatomical-live-v3`；原始腕向量配置才使用 `left-dex-wrist5-live-v1`。只复制到 `.deploy-staging/` 表示已暂存，不能视为已生效。缺少新鲜七轴反馈或使能状态时不重启服务，也不通过自动失能取得部署条件。
+
 ## 机器人端启动
 
 推荐在网页按所选模式启动服务。命令行替代流程如下；不要与网页启动的同名服务并行。
