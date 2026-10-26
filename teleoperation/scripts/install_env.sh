@@ -1,48 +1,37 @@
 #!/usr/bin/env bash
-# Create the conda environment for ESROBO real-machine teleoperation and
-# install the required packages (including pyAgxArm from the ESROBO workspace).
-#
-# Usage:  ./scripts/install_env.sh [--env-name teleop_esrobo]
-set -eu
+# Install Miniforge when needed, create the laptop environment, and install local packages.
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
-ENV_NAME="${1:-teleop_esrobo}"
-MINICONDA_DIR="${MINICONDA_DIR:-/home/esrobo/miniconda3}"
-CONDA_BIN="${MINICONDA_DIR}/bin/conda"
-PYAGXARM_PATH="${PYAGXARM_PATH:-/home/esrobo/Projects/esrobo/src/pyAgxArm-master}"
-
-echo "==> conda: ${CONDA_BIN}  env: ${ENV_NAME}"
-
-if [ ! -x "${CONDA_BIN}" ]; then
-    echo "ERROR: conda not found at ${CONDA_BIN}. Install Miniconda first or set MINICONDA_DIR."
-    exit 1
+CONDA_BIN="${CONDA_EXE:-${MINIFORGE_DIR}/bin/conda}"
+if [[ ! -x "${CONDA_BIN}" ]]; then
+    case "$(uname -m)" in
+        x86_64) installer_arch=x86_64 ;;
+        aarch64|arm64) installer_arch=aarch64 ;;
+        *) echo "不支持的 CPU 架构：$(uname -m)" >&2; exit 1 ;;
+    esac
+    installer="$(mktemp --suffix=.sh)"
+    trap 'rm -f "${installer:-}"' EXIT
+    url="${MINIFORGE_URL:-https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-${installer_arch}.sh}"
+    echo "下载 Miniforge：${url}"
+    curl -fL --retry 3 -o "${installer}" "${url}"
+    bash "${installer}" -b -p "${MINIFORGE_DIR}"
+    CONDA_BIN="${MINIFORGE_DIR}/bin/conda"
 fi
 
-# Accept Anaconda channel ToS so conda-forge installs don't block.
-"${CONDA_BIN}" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true
-"${CONDA_BIN}" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true
-
-if ! "${CONDA_BIN}" env list | grep -q "${ENV_NAME}"; then
-    echo "==> creating env ${ENV_NAME}"
-    "${CONDA_BIN}" create -n "${ENV_NAME}" -c conda-forge python=3.10 numpy scipy pyyaml python-can pinocchio -y
-fi
-
-PYTHON="${MINICONDA_DIR}/envs/${ENV_NAME}/bin/python"
-PIP="${MINICONDA_DIR}/envs/${ENV_NAME}/bin/pip"
-
-echo "==> pip installing pink / qpsolvers / proxqp"
-"${PIP}" install --upgrade pip >/dev/null 2>&1
-"${PIP}" install pink qpsolvers proxsuite proxqp
-
-echo "==> installing pyAgxArm SDK from ${PYAGXARM_PATH}"
-if [ -d "${PYAGXARM_PATH}" ]; then
-    "${PIP}" install "${PYAGXARM_PATH}"
+if "${CONDA_BIN}" env list | awk '{print $1}' | grep -Fxq "${CONDA_ENV_NAME}"; then
+    echo "更新 Conda 环境：${CONDA_ENV_NAME}"
+    "${CONDA_BIN}" env update -n "${CONDA_ENV_NAME}" -f "${LAPTOP_ROOT}/environment.yml" --prune
 else
-    echo "WARN: pyAgxArm not found at ${PYAGXARM_PATH}; set PYAGXARM_PATH."
+    echo "创建 Conda 环境：${CONDA_ENV_NAME}"
+    "${CONDA_BIN}" env create -n "${CONDA_ENV_NAME}" -f "${LAPTOP_ROOT}/environment.yml"
 fi
 
-echo "==> verifying imports"
-export PYTHONPATH=""
-"${PYTHON}" -c "import numpy, scipy, can, yaml, pinocchio, pink; from pink import solve_ik; import pyAgxArm; print('env OK')"
+LAPTOP_PYTHON="${CONDA_ENV_PREFIX}/bin/python"
+"${LAPTOP_PYTHON}" -m pip install -e "${LAPTOP_ROOT}[test,build]"
+# esrobo_laptop and esrobo_teleop now belong to the same distribution.
+"${LAPTOP_PYTHON}" -m pip install --no-deps -e "${LAPTOP_ROOT}/../robot_link"
 
-echo
-echo "Activate with:  source ${MINICONDA_DIR}/etc/profile.d/conda.sh && conda activate ${ENV_NAME}"
+echo "环境安装完成。激活命令："
+echo "  source ${MINIFORGE_DIR}/etc/profile.d/conda.sh && conda activate ${CONDA_ENV_NAME}"
+"${LAPTOP_ROOT}/scripts/run_laptop.sh" check

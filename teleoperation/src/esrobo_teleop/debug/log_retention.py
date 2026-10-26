@@ -13,7 +13,7 @@ import time
 STATE_FILES = {'dashboard_teleop.json', 'dashboard_waist_moved.json',
                'COLCON_IGNORE', 'CACHEDIR.TAG', '.keep'}
 SERIES = re.compile(r'(.+)_\d{16,20}\.jsonl$')
-LOG_DIRS = ('log', 'laptop_teleop/log', 'teleoperation/log', 'robot_link/log')
+LOG_DIRS = ('log', 'teleoperation/log', 'robot_link/log')
 
 
 def open_file_ids():

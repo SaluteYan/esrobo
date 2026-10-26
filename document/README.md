@@ -28,7 +28,7 @@
 
 ## 平台应用资料
 
-PICO 本机遥操作的环境、网络、网页、计算和验证资料位于 [应用文档目录](../laptop_teleop/docs/01_README.md)。IsaacLab 仿真、资产和回放说明见现有 [Dual-arm-teleoperation 仓库](https://github.com/SaluteYan/Dual-arm-teleoperation)。应用专用算法与实验记录由各项目维护，平台文档集中解释可复用设备与接口。
+PICO 本机遥操作的环境、网络、网页、计算和验证资料位于 [应用文档目录](../teleoperation/docs/01_README.md)。IsaacLab 仿真、资产和回放说明见现有 [Dual-arm-teleoperation 仓库](https://github.com/SaluteYan/Dual-arm-teleoperation)。应用专用算法与实验记录由各项目维护，平台文档集中解释可复用设备与接口。
 
 ## 阅读顺序
 
@@ -38,3 +38,5 @@ PICO 本机遥操作的环境、网络、网页、计算和验证资料位于 [�
 4. **开展仿真实验**：仿真仓库的版本清单 → 模型资产 → 仿真环境 → 复现与回放。
 
 文档更新应说明适用源码版本及验证范围，区分静态检查、离线模拟、历史现场记录与本次实机结果。
+
+组织发布与仓库来源的历史记录见 [REPOSITORY_HISTORY.md](REPOSITORY_HISTORY.md)；当前目录结构以各模块 README 为准。

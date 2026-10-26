@@ -31,7 +31,7 @@ def main() -> int:
     deadline = time.monotonic() + max(0.0, args.wait_seconds)
     previous_sequence = None
     if not hasattr(xrt, "get_body_sample"):
-        print("ERROR: rebuild PICO SDK with laptop_teleop/scripts/install_pico.sh", file=sys.stderr)
+        print("ERROR: rebuild PICO SDK with teleoperation/scripts/install_pico.sh", file=sys.stderr)
         return 2
     xrt.init()
     try:

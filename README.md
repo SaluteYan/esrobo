@@ -14,7 +14,7 @@
 
 ESROBO 是一套集成移动底盘、双七轴机械臂和双五指灵巧手的机器人平台。本仓库提供开发该平台所需的设备驱动、硬件文档、模型和机器人主机通信接口，供遥操作、仿真及后续研究项目复用。主要部署环境为 **Ubuntu 22.04 / ROS 2 Humble**。
 
-平台代码与具体应用分层介绍：先了解机器人、接通设备和通信接口，再选择平台上的项目。当前仓库仍保留本机遥操作及共用控制组件；新组织与独立仓库的整理状态见 [组织与仓库布局](organization/README.md)。
+平台代码与具体应用分层介绍：先了解机器人、接通设备和通信接口，再选择平台上的项目。当前仓库以统一的 `teleoperation/` 目录维护本机遥操作及共用控制组件；新组织与独立仓库的整理状态见 [组织与仓库布局](document/REPOSITORY_HISTORY.md)。
 
 ## 机器人平台
 
@@ -77,8 +77,8 @@ flowchart TB
 | --- | --- |
 | 了解或搭建 ESROBO | [硬件与手册](document/README.md) → [逐部件调试](HARDWARE_BRINGUP.md) → [驱动索引](src/README.md) |
 | 在平台上实现新控制程序 | [通信模块](robot_link/README.md) → [协议](robot_link/PROTOCOL.md) → [执行行为](robot_link/ROBOT_EXECUTION.md) → mock 端点联调 |
-| 使用当前 PICO 遥操作 | [应用 README](laptop_teleop/README.md) → [两机连接](laptop_teleop/docs/02_ROBOT_CONNECTION.md) → [网页操作](laptop_teleop/docs/05_WEB_CONSOLE.md) |
-| 研究重定向、IK 与灵巧手算法 | [代码与计算](laptop_teleop/docs/07_CODE_AND_COMPUTATION.md) → [技术方案](laptop_teleop/docs/09_TECHNICAL_SCHEME.md) |
+| 使用当前 PICO 遥操作 | [应用 README](teleoperation/README.md) → [两机连接](teleoperation/docs/02_ROBOT_CONNECTION.md) → [网页操作](teleoperation/docs/05_WEB_CONSOLE.md) |
+| 研究重定向、IK 与灵巧手算法 | [代码与计算](teleoperation/docs/07_CODE_AND_COMPUTATION.md) → [技术方案](teleoperation/docs/09_TECHNICAL_SCHEME.md) |
 | 运行仿真与回放 | [现有仿真项目](https://github.com/SaluteYan/Dual-arm-teleoperation)的环境、资产和复现说明 |
 
 机器人驱动使用 ROS 2 工作空间，通信客户端和本机应用是独立 Python 包。安装方式以各模块 README 为准；只克隆源码不能替代 SDK、模型资产、环境与设备准备。
@@ -89,7 +89,7 @@ flowchart TB
 
 | 项目 | 内容 | 当前入口与状态 |
 | --- | --- | --- |
-| **PICO 实机遥操作** | PICO Body/Hand 输入、人体标定、臂手重定向、IK、网页控制台和双机执行 | [`laptop_teleop`](laptop_teleop/README.md)；代码在本仓库，拟独立为 `esrobo-teleop` |
+| **PICO 实机遥操作** | PICO Body/Hand 输入、人体标定、臂手重定向、IK、网页控制台和双机执行 | [`teleoperation`](teleoperation/README.md)；代码在本仓库，拟独立为 `esrobo-teleop` |
 | **仿真遥操作与回放** | IsaacLab 仿真基线、ESROBO 资产、PICO/SenseGlove 输入与录制回放 | [Dual-arm-teleoperation](https://github.com/SaluteYan/Dual-arm-teleoperation)；现有独立仓库，新组织归属待整理 |
 
 新的平台项目在此追加实际仓库链接、用途、所需平台版本和验证范围。尚未建立的项目不提供虚构仓库链接。
@@ -103,17 +103,15 @@ esrobo/
 ├── src/                     ROS 2 设备驱动与第三方 SDK
 ├── document/                文档索引与厂家手册
 ├── robot_link/              通信协议、客户端和机器人执行网关
-├── teleoperation/           当前共用模型、IK、驱动与旧一体式入口
-├── laptop_teleop/           新实现的 PICO 本机遥操作项目
-├── organization/            新 GitHub 组织主页及仓库整理说明
+├── teleoperation/           统一遥操作：本机采集／计算、共享控制组件与模型
 ├── start_can.sh             CAN 初始化参考
 └── 99-fixed-can.rules       设备命名参考
 ```
 
-`teleoperation/` 的算法源自仿真项目，但当前目录还承载实机共用组件：`robot_link` 导入其中的 NERO/手部驱动，`laptop_teleop` 导入其中的配置、人体重定向和 IK。该目录的 `--no-robot` 与模拟人体输入用于离线检查，不能等同于完整 IsaacLab 动力学仿真。独立项目拆分需先明确这些公共组件的依赖和版本，详见 [仓库整理方案](organization/README.md)。
+`teleoperation/` 最初是运行在机器人上的一体式遥操作程序，目前已统一为分布式架构：`src/esrobo_laptop` 在本机采集、运算和下发目标，`src/esrobo_teleop` 提供共用模型、IK 与机器人端运动组件，`robot_link/` 在机器人主机执行通信和底层控制。旧单机控制入口已删除，当前运行和迁移说明见 [遥操作 README](teleoperation/README.md)。
 
 ## 开发与验证
 
-修改设备接口、配置或通信行为时，同步更新对应文档并记录验证范围。保持两端协议、关节语义、配置和模型版本一致。历史现场记录、软件测试与本次实机验收分开说明；当前运行限制及问题见 [故障排查](laptop_teleop/docs/04_TROUBLESHOOTING.md)。
+修改设备接口、配置或通信行为时，同步更新对应文档并记录验证范围。保持两端协议、关节语义、配置和模型版本一致。历史现场记录、软件测试与本次实机验收分开说明；当前运行限制及问题见 [故障排查](teleoperation/docs/04_TROUBLESHOOTING.md)。
 
 第三方驱动、SDK 和模型沿用各目录的来源与许可说明。本机密钥、标定、环境、活动日志及部署备份不作为平台发布内容。

@@ -64,8 +64,8 @@ def metadata(root, **fields):
         head = None
     hashes = {}
     unavailable = []
-    for folder in ('laptop_teleop/src', 'robot_link/esrobo_link', 'teleoperation/src',
-                   'laptop_teleop/config', 'teleoperation/config', 'teleoperation/urdf'):
+    for folder in ('teleoperation/src', 'robot_link/esrobo_link',
+                   'teleoperation/config', 'teleoperation/urdf'):
         for path in sorted((root/folder).rglob('*')):
             if path.suffix in ('.py', '.yaml', '.urdf') and path.is_file():
                 try:

@@ -36,7 +36,7 @@ flowchart LR
 机器人端仍保留 FK、轨迹约束和碰撞模型，供受检接近、回零及配置启用的运动检查使用。具体速度、关节范围、力矩与碰撞策略由当前配置和执行实现决定，见 [执行流程](ROBOT_EXECUTION.md)；早期开发记录不作为当前参数说明。
 
 **支持单侧机械臂、可选同侧 L10 灵巧手、单侧仅灵巧手，以及双臂＋双手。** 单侧使用 `--side left/right`，仅灵巧手再增加 `--with-hand --hand-only`，四部件联合使用 `--side both`（自动包含双手）。所有模式默认模拟，真实硬件必须显式 `--hardware`。双侧必须使用一个网关，禁止启动两个单侧网关。仅灵巧手合同拒绝机械臂目标，网关只使能所选手，并持续验证对应机械臂七轴全部失能。腰部、头部保持原模型固定前提。
-当前 PICO Body/Hand 采集、重定向、分区 IK 和客户端入口见 [`laptop_teleop`](../laptop_teleop/README.md)，默认机器人地址为 `192.168.10.100`。部署与历史联调记录见该项目文档；新环境仍需分别核验依赖、合同、服务加载和实机行为。旧 SenseGlove 及一体式脚本用于旧路径维护。
+当前 PICO Body/Hand 采集、重定向、分区 IK 和客户端入口见 [`teleoperation`](../teleoperation/README.md)，默认机器人地址为 `192.168.10.100`。部署与历史联调记录见该项目文档；新环境仍需分别核验依赖、合同、服务加载和实机行为。可选 SenseGlove 桥接仍保留；旧一体式控制入口已删除。
 负载拆分不能证明此前整机崩溃已解决，操作系统卡死时 Python 看门狗也无法执行。
 
 ## 开发者入口
@@ -51,7 +51,7 @@ flowchart LR
 | [monitor.py](esrobo_link/monitor.py) | 只读检查合同和状态，使用同一独占会话机制 |
 | [camera.py](esrobo_link/camera.py) | 独立图像采集／MJPEG 服务 |
 
-新项目先用 mock 网关确认连接与状态，再按 [协议](PROTOCOL.md)对齐关节顺序、弧度／手部单位、配置合同和输入时效。客户端只提交新鲜目标，不重放旧帧；`accepted_seq` 是接纳序号，不是到位证明。接管、保持、恢复等能力以网关合同为准，旧 `examples/` 辅助函数不覆盖现行完整接管状态机；完整接入参考当前应用的 [app.py](../laptop_teleop/src/esrobo_laptop/app.py)。
+新项目先用 mock 网关确认连接与状态，再按 [协议](PROTOCOL.md)对齐关节顺序、弧度／手部单位、配置合同和输入时效。客户端只提交新鲜目标，不重放旧帧；`accepted_seq` 是接纳序号，不是到位证明。接管、保持、恢复等能力以网关合同为准，旧 `examples/` 辅助函数不覆盖现行完整接管状态机；完整接入参考当前应用的 [app.py](../teleoperation/src/esrobo_laptop/app.py)。
 
 通信客户端与 mock 网关仅依赖 Python 标准库；真实后端还依赖 `teleoperation` 中的运动组件和机器人 SDK。当前网络关节接口主要面向机械臂／灵巧手，不能因平台存在底盘、腰部驱动就假定这些设备已经具备同样的网络目标接口。
 
@@ -104,7 +104,7 @@ PYTHONPATH=robot_link python3 -m unittest discover -s robot_link/tests -v
 ### 2. 可选：只启动灵巧手底层与本机桥
 
 仅 `--with-hand` 需要以下服务，两个终端分别运行。以下是左手；右手改为 `hand_type:=right`、`can:=can_hand1`、`--side right`。
-CAN 接口初始化按原[运行手册](../teleoperation/TELEOPERATION_RUNBOOK.md)准备，不运行旧联合启动脚本，避免又在机器人启动 SenseCom/PICO/网页。
+CAN 接口初始化按[硬件调试](../HARDWARE_BRINGUP.md)准备，不运行旧联合启动脚本，避免又在机器人启动 SenseCom/PICO/网页。
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -142,7 +142,7 @@ PYTHONPATH="$PWD/robot_link:$PWD/teleoperation/src" \
 
 启动打印 `contract`，包含关节顺序、URDF 弧度限位、电机映射、速度/加速度及配置指纹。核对笔记本模型和标定后保存该指纹，客户端用 `expected_contract_id` 固定它。修改配置后需要重新核对，不能盲目接受新指纹。
 
-单臂模式输入一次 `e` 后执行准备流程：带手模式先核验臂健康失能，在当前位置受检恢复灵巧手自然张开零位并核验到位；机械臂沿受检路径回到 URDF 零位并确认七轴失能。随后网关进入 `CALIBRATING`，等待笔记本锁定 PICO 标定位姿。接管协议 7 使用两段固定目标接近：先移动 J1–J5，确认到位并停稳后，再移动 J6/J7 到同一次标定目标，手指维持原位；接近碰撞检查覆盖机械臂和腕部，排除掌体及手指；锁定目标后使用独立保活，到位时重新核验新鲜 PICO 输入。网页控制台自动提交 `g`，网关规划外展路径并慢速接近，到位后核验实测姿态和新令牌，再开始完整实时跟随。详见 [接管实现](../laptop_teleop/docs/07_CODE_AND_COMPUTATION.md#标定后初始接近)。准备期间输入 `s` 或 `x` 可取消并停止。控制器上电不发反馈时仍明确拒绝；先按旧手册在现场解决反馈问题。
+单臂模式输入一次 `e` 后执行准备流程：带手模式先核验臂健康失能，在当前位置受检恢复灵巧手自然张开零位并核验到位；机械臂沿受检路径回到 URDF 零位并确认七轴失能。随后网关进入 `CALIBRATING`，等待笔记本锁定 PICO 标定位姿。接管协议 7 使用两段固定目标接近：先移动 J1–J5，确认到位并停稳后，再移动 J6/J7 到同一次标定目标，手指维持原位；接近碰撞检查覆盖机械臂和腕部，排除掌体及手指；锁定目标后使用独立保活，到位时重新核验新鲜 PICO 输入。网页控制台自动提交 `g`，网关规划外展路径并慢速接近，到位后核验实测姿态和新令牌，再开始完整实时跟随。详见 [接管实现](../teleoperation/docs/07_CODE_AND_COMPUTATION.md#标定后初始接近)。准备期间输入 `s` 或 `x` 可取消并停止。控制器上电不发反馈时仍明确拒绝；先按旧手册在现场解决反馈问题。
 
 真实双臂网关暂不接受这项自动准备，因为当前没有双臂互碰扫掠检查；`e` 会在运动前拒绝。双臂模式必须使用现场验证过的恢复流程。
 
@@ -198,7 +198,7 @@ client.send_dual_target(
 完整启用过程参照 `examples/laptop_integration.py` 中的 `send_dual_solved_frame`：分别传入
 `left_arm/right_arm/left_hand/right_hand` 四路原始输入的本机接收时间；其中任一路过期就不发送。
 IDLE/ARMING 发送四部件的实测保持姿态，ACTIVE 才发送求解目标。反馈位于
-`state["feedback"]["sides"]["left"/"right"]`。可运行的笔记本计算入口及启动步骤见 [`laptop_teleop`](../laptop_teleop/README.md)。
+`state["feedback"]["sides"]["left"/"right"]`。可运行的笔记本计算入口及启动步骤见 [`teleoperation`](../teleoperation/README.md)。
 
 ## 接入笔记本计算程序
 
@@ -217,7 +217,7 @@ client.send_target(arm_urdf_rad=q7.tolist(), hand_unit=hand10.tolist())
 client.close()  # 最佳努力 STOP；丢包时仍由机器人有效期看门狗处理
 ```
 
-上面只展示基础 API；当前真实单臂 `entry_protocol=7` 还必须完成固定目标接近、原始源姿态和到位令牌握手，使用 `laptop_teleop` 的 `Controller` 完成流程。旧示例不具备新的接管握手，不能用于真实单臂启动。不得在定时线程里无限重复最后一帧人体目标来维持网络有效期。输入丢失、求解异常时停止发目标或调用 `stop()`。
+上面只展示基础 API；当前真实单臂 `entry_protocol=7` 还必须完成固定目标接近、原始源姿态和到位令牌握手，使用 `esrobo_laptop` 的 `Controller` 完成流程。旧示例不具备新的接管握手，不能用于真实单臂启动。不得在定时线程里无限重复最后一帧人体目标来维持网络有效期。输入丢失、求解异常时停止发目标或调用 `stop()`。
 
 - 手臂目标是选定侧 J1–J7 的 **URDF 弧度**，不是角度，也不是电机原始角度。电机方向/偏置仅机器人应用一次。
 - 手目标是 **L10 物理十轴顺序的 0–255 整数**，不是现有 `BodyDevice` 的手指弧度数组。笔记本需复用现有映射、标定和手指顺序；不要直接把弧度乘 255。

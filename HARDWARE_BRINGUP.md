@@ -4,9 +4,9 @@
 
 本文档保留此前根 README 中的逐部件调试命令，供现场排障参考。设备状态、编码器零位、CAN 枚举和控制器故障会随部署变化；执行任何运动命令前须重新核对现场反馈。第一次上电调试时不要直接启动整机总 launch，建议按本文档顺序逐项验证。
 
-当前本机计算端入口见 [`laptop_teleop/README.md`](laptop_teleop/README.md)：采集 PICO Body 与 Hand，执行重定向和 IK，通过 UDP 16000 向 `192.168.10.100` 上的 [`robot_link`](robot_link/README.md) 网关发送目标。当前流程不依赖 SenseGlove。首次安装、SSH 配置和每日启动指令见 [`laptop_teleop/docs/`](laptop_teleop/docs/01_README.md)。SSH 用于机器人端操作，CAN/ROS 底层驱动继续运行在机器人主机。
+当前本机计算端入口见 [`teleoperation/README.md`](teleoperation/README.md)：采集 PICO Body 与 Hand，执行重定向和 IK，通过 UDP 16000 向 `192.168.10.100` 上的 [`robot_link`](robot_link/README.md) 网关发送目标。当前流程不依赖 SenseGlove。首次安装、SSH 配置和每日启动指令见 [`teleoperation/docs/`](teleoperation/docs/01_README.md)。SSH 用于机器人端操作，CAN/ROS 底层驱动继续运行在机器人主机。
 
-本机统一网页入口：在仓库根目录运行 `./laptop_teleop/scripts/run_dashboard.sh`，打开 `http://127.0.0.1:8080`。页面集中管理机器人/本机程序、模式与标定，可在相机和 PICO 骨架间切换，并提供运动停止及左臂、右臂、双手、头部的独立失能。具体步骤见 [网页操作文档](laptop_teleop/docs/05_WEB_CONSOLE.md)。
+本机统一网页入口：在仓库根目录运行 `./teleoperation/scripts/run_dashboard.sh`，打开 `http://127.0.0.1:8080`。页面集中管理机器人/本机程序、模式与标定，可在相机和 PICO 骨架间切换，并提供运动停止及左臂、右臂、双手、头部的独立失能。具体步骤见 [网页操作文档](teleoperation/docs/05_WEB_CONSOLE.md)。
 
 ## 硬件组成
 
@@ -510,7 +510,7 @@ ros2 launch servo_driver start_servo.py
 
 默认只读，不自动使能或移动；使用 `ros2 topic echo /head/state --once` 检查反馈。
 旧 `/servo/ctrl` 接口已移除。需要调整时按
-[操作手册第 11 节](teleoperation/TELEOPERATION_RUNBOOK.md#11-头部相机与网页视角调整)
+[网页操作指南](teleoperation/docs/05_WEB_CONSOLE.md)
 先托稳头部，使用 `allow_motion:=true` 启动驱动，通过 PICO 网页的“头部相机”页
 查看实时图像、开启调整、设置目标和锁定姿态。成功到位后可以连续调整，无需逐次调用 ROS 命令。
 ID1 俯仰范围 1000～2700，ID2 左右范围 2000～5000，单位为原始计数；

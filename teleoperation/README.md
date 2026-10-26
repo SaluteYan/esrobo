@@ -1,309 +1,174 @@
-# ESROBO 双臂 + 灵巧手 实机遥操作
+# ESROBO 分布式遥操作
 
-实际设备启动、标定、按键和故障排查步骤见
-[`TELEOPERATION_RUNBOOK.md`](TELEOPERATION_RUNBOOK.md)。
+**当前实验分支选择：** `hand.left_retarget_solver: wrist5`，左手按手腕到五个指尖的向量联合求解；v13仍可配置切回。算法接入与验证边界见 [五向量运行接入](docs/07_CODE_AND_COMPUTATION.md#五向量运行接入2026-10-21)。磁盘配置不代表运行进程已更新，服务加载状态以本次部署记录为准。
 
-当前程序实际执行的数据流、IK、轨迹限制、安全检查和回零状态机见
-[`TELEOPERATION_RUNTIME_LOGIC.md`](TELEOPERATION_RUNTIME_LOGIC.md)。历史修改原因仍记录在
-[`TELEOPERATION_CHANGELOG.md`](TELEOPERATION_CHANGELOG.md)。
+2026-10-22运行配置显式选择 `left_vector_geometry: aligned_thumb_fingers`，接入统一掌部参考系及四指总骨长缩放（当前含侧向修正的版本为 `left-dex-wrist5-anatomical-live-v3`）；旧配置默认仍为 `original`。四指姿态改善和剩余对捏间隙见 [技术方案](docs/09_TECHNICAL_SCHEME.md#参考点与逐指尺寸修正离线对照2026-10-22)。
 
-独立的 **实机运动** 遥操作包，放在 ESROBO 项目根目录下的 `teleoperation/` 文件夹中，
-与原有 esrobo ROS2 工作空间代码完全分开（不混源码、不改动 `src/` 里的任何东西）。
+2026-10-22 12:16已同步几何v3侧向参数修正并重启网关／PICO，指纹一致。依据和剩余执行偏差见 [技术方案](docs/09_TECHNICAL_SCHEME.md#无名指小指侧向错位修正2026-10-22几何v3已同步)。
 
-核心思路：沿用 [`Dual-arm-teleoperation`](https://github.com/SaluteYan/Dual-arm-teleoperation)
-仓库的遥操作算法（PICO 全身骨骼 `arm_vector` 重定向 + Pink IK），但把 **IsaacLab / PhysX 仿真层**
-替换为 ESROBO 真机的底层 SDK：
+`teleoperation/` 是唯一遥操作目录，内部 `esrobo_laptop` 在电脑上采集 PICO Body/Hand，完成参考标定、重定向和 IK，再通过认证 UDP 将关节目标发送给机器人 `robot_link` 网关。网页负责服务管理、预览、人工准备、状态和日志；机器人主机运行 CAN/ROS 驱动、反馈校验和轨迹执行。当前输入使用 PICO，不需要 SenseGlove。
 
-- 双臂 **松灵 NERO 七轴机械臂**：直接用 `pyAgxArm` SDK 驱动（左 `can_piper1`，右 `can_piper2`）。
-- 双手 **LinkerHand L20Lite 灵巧手**：通过 ROS2 topic 控制（`/cb_left|right_hand_control_cmd`）。
-- 手指/IMU 输入：**SenseGlove Nova 2**；手臂输入：**PICO 全身骨骼追踪**（PICO 负责手臂，SenseGlove 负责手指+IMU）。
+`esrobo_teleop` 保留机器人网关依赖的配置、模型、IK、轨迹及驱动组件；`robot_link/` 继续作为独立通信模块。旧的机器人单机采集／求解／控制入口已删除。目录迁移及删除清单见 [修改日志](docs/08_CHANGELOG.md)。
 
-## 目录结构
+本文负责项目入口、**环境安装与配置**；日常操作和实现细节分别放在 [docs](docs/01_README.md)。
+
+## 快速入口
+
+环境已经就绪时，在仓库根目录运行：
+
+```bash
+./teleoperation/scripts/run_dashboard.sh
+```
+
+打开 **http://127.0.0.1:8080**。网页启动不自动使能或运动。按 [网页指南](docs/05_WEB_CONSOLE.md)选择模式、连接机器人、检查采集、预览，再人工准备。完整每日步骤见 [运行手册](docs/03_OPERATION_RUNBOOK.md)。
+
+## 环境安装与配置
+
+本机部署以 Ubuntu 22.04 amd64 为基准，默认 Miniforge 在当前用户的 `~/miniforge3`、环境为 `esrobo_laptop`，机器人为 Ubuntu/ROS 2 Humble。路径由 `scripts/common.sh` 等部署设置决定；新机器不要把示例路径当成已安装状态。
+
+### 安装当前 PICO 计算端
+
+从仓库根目录执行：
+
+```bash
+./teleoperation/scripts/install_env.sh
+./teleoperation/scripts/install_pico.sh
+```
+
+`install_env.sh` 安装用户目录 Miniforge、创建 Conda 环境并安装本项目；`install_pico.sh` 校验并安装 PC Service，获取外部源码、应用仓库 SDK 补丁、构建原生库与 Python 绑定。系统安装使用交互 sudo，不保存密码。升级 SDK 也运行 `install_pico.sh`，随后重启唯一采集进程。
+
+`setup_all.sh` 是兼容完整安装入口，还会构建旧 SenseGlove 工作空间；当前 PICO 部署不必执行这一旧设备安装。机器人端 LinkerHand ROS 驱动仍需保留。
+
+环境文件与用途：
+
+| 文件 | 用途 |
+| --- | --- |
+| [environment.yml](environment.yml) | Conda Python 3.10、NumPy/SciPy、Pinocchio、PyYAML、Paramiko、编译工具和测试依赖。 |
+| [pyproject.toml](pyproject.toml) | 本机 Python 包元数据及 pip 安装依赖。 |
+| [config/laptop.yaml](config/laptop.yaml) | 网关地址、模式、密钥路径、输入端口与时效、50 Hz 控制及频率门禁。 |
+| [config/teleop_config.yaml](config/teleop_config.yaml) | 两端一致的模型、映射、IK、驱动与保护参数。 |
+| `scripts/common.sh` | 脚本路径和 Miniforge/环境定位。 |
+| `scripts/patch_pico_sdk.py`、`scripts/pico_component_sample.hpp` | SDK 组件快照、新帧通知和接口版本补丁。 |
+
+这些机器可读文件保留为实际安装/配置入口，README 不替代它们。安装目录、密钥和运行日志不提交 Git。
+
+### 机器人端环境
+
+机器人仅安装执行组件与底层 SDK，不启动 PICO 采集或本机网页。`environment.robot.yml` 保留现有 `teleop_esrobo` 环境名，入口为：
+
+```bash
+CONDA_EXE=/实际路径/miniconda3/bin/conda ./teleoperation/scripts/install_robot_env.sh
+```
+
+ROS 驱动仍使用系统 ROS 2 环境；网关启动见 [robot_link](../robot_link/README.md)。两个 Python 包统一由 `esrobo-teleoperation` 安装。已有环境先移除旧 editable 分发注册，再重新安装（不删除环境、SDK、标定或日志）：
+
+```bash
+python -m pip uninstall esrobo-laptop-teleop esrobo-teleop-real
+python -m pip install --no-deps -e ./teleoperation -e ./robot_link
+```
+
+这些命令从仓库根目录执行；首次安装使用上面的对应环境安装器。在停止运行程序后迁移旧目录中的 `external/`、本机配置及需保留的日志，禁止直接用新目录覆盖已有标定。本次整理的工作区没有这些外部依赖或现场数据需要迁移。
+
+### Python 与 SDK 验证
+
+```bash
+source /home/ddc/miniforge3/etc/profile.d/conda.sh
+conda activate esrobo_laptop
+python -c 'import numpy, scipy, yaml, pinocchio; print("IK environment OK")'
+```
+
+脚本默认直接调用环境 Python，不要求先激活。Miniforge 在其他位置时可设置：
+
+```bash
+MINIFORGE_DIR=/实际路径/miniforge3 ./teleoperation/scripts/install_env.sh
+```
+
+验证 SDK 通知接口：
+
+```bash
+PY=/home/ddc/miniforge3/envs/esrobo_laptop/bin/python
+LIB="$PWD/teleoperation/external/XRoboToolkit-PC-Service-Pybind/lib"
+PYTHONNOUSERSITE=1 LD_LIBRARY_PATH="$LIB:/home/ddc/miniforge3/envs/esrobo_laptop/lib" \
+  "$PY" -c 'import xrobotoolkit_sdk as s; assert s.get_tracking_updates_version()==1; assert all(callable(getattr(s,n,None)) for n in ("wait_tracking_updates","get_tracking_diagnostics","close")); print("PICO SDK notifications v1 OK")'
+```
+
+旧 SDK 明确要求重建，不回退到读取缓存时刻作为新时间。通知/独立转发规则见 [PICO 输入](docs/06_PICO_HAND_INPUT.md)。
+
+### ROS 与网络边界
+
+机器人侧的双手、相机等使用 ROS 2 Humble 和已构建工作空间；构建用系统 Python，不在 Conda 中替代 ROS Python。机器人配置与部署见 [连接指南](docs/02_ROBOT_CONNECTION.md)及 [硬件调试](../HARDWARE_BRINGUP.md)。
+
+头显连接本机当前局域网 IP，PC Service 接入 TCP 63901；本机 SDK 使用 127.0.0.1:60061。运动目标/反馈使用机器人 UDP 16000，本机 Body/Hand 默认 UDP 15050，手部机器人桥 15051/15052。共享密钥位于 `~/.config/esrobo/robot-link.key`，两端一致且权限 600，不能写入 YAML 或仓库。
+
+```bash
+./teleoperation/scripts/run_laptop.sh check --side right
+./teleoperation/scripts/xrobotoolkit_service.sh status
+```
+
+`check_environment.sh` 检查当前计算端与 PICO Service，不再把可选 SenseGlove 依赖作为必要条件。
+
+## 运行模式
+
+| 模式 | 本机参数 | 网关参数 | 必需 PICO 输入 |
+| --- | --- | --- | --- |
+| 右臂＋右手 | `--side right` | `--side right --with-hand` | 右 Body/Hand/掌面。 |
+| 左臂＋左手 | `--side left` | `--side left --with-hand` | 左 Body/Hand/掌面。 |
+| 纯右臂 | `--side right --arm-only` | `--side right` | 右 Body。 |
+| 纯左臂 | `--side left --arm-only` | `--side left` | 左 Body。 |
+| 仅右手 | `--side right --hand-only` | `--side right --with-hand --hand-only` | 右 Hand，机械臂七轴失能。 |
+| 仅左手 | `--side left --hand-only` | `--side left --with-hand --hand-only` | 左 Hand，机械臂七轴失能。 |
+| 双臂双手 | 默认 | `--side both` | 双侧完整输入；不支持自动准备/回零。 |
+
+网页按模式启动程序，已有网关不会随下拉框切换。本机和网关的侧别、手模式、协议、机器人配置及 URDF 指纹须一致。
+
+## 源码边界
 
 ```text
 teleoperation/
-├── environment.yml                  # conda 环境定义（teleop_esrobo）
-├── pyproject.toml                   # Python 包元数据
-├── config/teleop_config.yaml        # 实机遥操作参数（CAN、重定向、IK、手部）
-├── urdf/esrobo_waist_with_head.urdf # 整机 URDF（Pink IK 用，来自仓库）
-├── src/esrobo_teleop/               # 实机遥操作核心包（纯 NumPy，不依赖 IsaacLab）
-│   ├── config.py                    # 配置 dataclass + YAML 加载
-│   ├── math_utils.py                # 四元数/旋转/手臂向量数学工具（移植）
-│   ├── teleop_node.py               # 主循环：UDP→重定向→IK→双臂→手
-│   ├── device/body_device.py        # UDP 接收 + arm_vector 重定向（PICO）
-│   ├── ik/solver.py                 # Pink IK（整机 URDF，14 臂关节）
-│   └── robot/
-│       ├── nero_driver.py           # NERO 双臂驱动 + URDF↔物理关节映射
-│       └── linker_hand_driver.py    # 灵巧手 10→20 关节扩展 + UDP/ROS2 输出
-├── scripts/
-│   ├── install_env.sh               # 创建 conda 环境并安装依赖
-│   ├── run_teleop.sh                # 启动实机遥操作
-│   ├── calibrate_arms.py            # 双臂上电/校准/自测
-│   └── sim_body_input.py            # 无硬件仿真输入（离线测试）
-└── bridges/                         # 桥接进程（依赖外部 SDK，见下文）
-    ├── hand_ros_bridge.py           # 手部 UDP → LinkerHand ROS2 topic
-    ├── xrobotoolkit_body_udp_bridge.py      # PICO→UDP（XRoboToolkit）
-    ├── pico_full_body_udp_bridge.py         # PICO→UDP（IsaacTeleop）
-    ├── senseglove_ros_to_esrobo_hand_bridge.py  # SenseGlove→UDP
-    └── run_*.sh                     # 参考启动脚本
+├── README.md / pyproject.toml       统一入口与一个 Python 分发包
+├── environment.yml                 本机采集和计算环境
+├── environment.robot.yml           机器人执行环境
+├── config/                         laptop.yaml 与 teleop_config.yaml
+├── src/esrobo_laptop/               本机采集、映射、IK 流水线、网页
+├── src/esrobo_teleop/               共用模型配置、IK、轨迹及设备适配器
+├── bridges/                        PICO／可选 SenseGlove 输入与机器人手桥
+├── urdf/ / assets/                 模型与按固定版本获取的碰撞资源
+├── scripts/                        分端安装、启动、诊断、分析与测试
+├── web/                            控制台及 pico_skeleton_viewer
+├── docs/                           当前运行文档与统一修改日志
+├── tests/ / tools/                 现有回归、离线回放和分析工具
+├── linker_hand_console/            独立手部诊断台
+└── external/ / log/                本机依赖与日志，不提交
 ```
 
-## 1. 安装 conda 环境
+Body 和 Hand 由一个 SDK 订阅独立提交/转发，控制端按真实时间和组件序号配对。单臂准备先受检归零灵巧手、再回臂，完成后标定，首次接近先让 J1–J5 到位、再让 J6/J7 到达同一次标定目标，手指保持实测值，两段到位后进行全轴实时跟随；显式受检恢复则先在当前失能臂姿态把手归零，再执行七轴回零。阶段规则和保护见 [计算逻辑](docs/07_CODE_AND_COMPUTATION.md)。
 
-本项目使用 conda 环境 `teleop_esrobo`（Python 3.10，与系统 ROS2 Humble 一致）。
+源码更新、两机同步、进程加载和真机验收分别完成。软件回归不会启动真实运动接口：
 
 ```bash
-# 若本机还没有 miniconda（sudo 不可用时可装到用户目录）：
-bash <(curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh) -b -p ~/miniconda3
-# 若首次安装需先接受 Anaconda 渠道条款：
-~/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-~/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
-
-# 一键安装环境（创建 env、装 numpy/scipy/pinocchio/pink/python-can、装 pyAgxArm）：
-cd /home/esrobo/Projects/esrobo/teleoperation
-./scripts/install_env.sh
+./teleoperation/scripts/test.sh
+# 默认布局、连续死区和 PICO 冒烟；指定文件只跑该文件
+./teleoperation/scripts/test.sh teleoperation/tests/test_wrist_handover.py
+# 跨模块变更／发布前显式运行完整功能回归
+./teleoperation/scripts/test.sh --full
 ```
 
-> `install_env.sh` 会从 `/home/esrobo/Projects/esrobo/src/pyAgxArm-master` 安装 NERO 底层 SDK
-> （可用 `PYAGXARM_PATH` 覆盖）。`pink` 需从官方仓库安装（PyPI 上的 `pink` 0.8.1 是另一个格式化工具）。
+采集时序性能验收单独运行 `test.sh --performance`；完整基准使用独立 `tests/tools/profile_runtime.py` 等工具。正式运行不加载逐函数性能包装器。按改动选用 `--hand`、`--handover`、`--transport`、`--web`、`--arm` 或具体用例，避免每次小改动运行完整回归；详见 [验证范围](docs/04_TROUBLESHOOTING.md#按修改范围验证)。
 
-激活环境：
+`log/retained/` 中部分历史 JSON／JSONL 已改为同名 `.gz` 无损归档；需要回放时按[维护说明](docs/04_TROUBLESHOOTING.md#日志与测试目录维护)解压所需文件。运行状态、活动采集、模型、安装环境及有效测试样本不属于清理对象。`__pycache__/` 和 `.pytest_cache/` 可再生；清理它们不等于删除测试，也不需要重新执行全套运动回归。
 
-```bash
-source ~/miniconda3/etc/profile.d/conda.sh && conda activate teleop_esrobo
-```
+## 文档导航
 
-## 2. 硬件 / 通信准备
-
-确认 CAN 接口已就绪（`start_can.sh` 已执行过，接口名见 `99-fixed-can.rules`）：
-
-```bash
-ip -br link show type can     # 应看到 can_piper1 / can_piper2 / can_hand1 / can_hand2 ...
-```
-
-只读硬件状态检查（不会使能或发送运动命令）：
-
-```bash
-cd /home/esrobo/Projects/esrobo/teleoperation
-source ~/miniconda3/etc/profile.d/conda.sh && conda activate teleop_esrobo
-export PYTHONPATH=src
-python scripts/calibrate_arms.py probe --config config/teleop_config.yaml
-python scripts/calibrate_arms.py validate --config config/teleop_config.yaml
-```
-
-若返回 `firmware=None joints=None`，说明 CAN 没有收到机械臂反馈。此时程序会拒绝使能，
-不得用零角代替当前角度。灵巧手驱动启动后可只读检查：
-
-```bash
-ros2 topic echo /cb_left_hand_state --once
-ros2 topic echo /cb_right_hand_state --once
-```
-
-## 3. 启动实机遥操作
-
-架构为多个独立进程，通过 UDP/ROS2 通信：
-
-```
-PICO/XRoboToolkit ──► xrobotoolkit_body_udp_bridge.py ──► UDP:15050 ─┐
-                                                                     ▼
-SenseGlove Nova2 ──► senseglove_ros_to_esrobo_hand_bridge.py ──► UDP:15050 ──► teleop_node
-                                                                            │
-                                                    ┌────────────────────────┤
-                                                    ▼                        ▼
-                                        NERO 双臂 (pyAgxArm)      LinkerHand (ROS2 topic)
-```
-
-**进程 1 — 核心遥操作（conda 环境）**：接收 UDP，做重定向 + IK，驱动双臂和手。
-
-```bash
-cd /home/esrobo/Projects/esrobo/teleoperation
-./scripts/run_teleop.sh            # 默认按 config/teleop_config.yaml
-./scripts/run_teleop.sh --no-robot # 离线模式：只算 IK，不命令手臂
-```
-
-运行时按键：`e` 使能/开始跟随，`s` 停止/保持，`x` 发送电子急停，`q` 退出。
-默认未使能；按 `e` 时必须先取得有效关节反馈，并以该反馈作为本次会话初始角。
-
-**进程 2 — PICO 全身骨骼桥接（依赖 XRoboToolkit / IsaacTeleop）**：
-见 `bridges/xrobotoolkit_body_udp_bridge.py`（参考启动 `bridges/run_xrobotoolkit_body_to_esrobo_teleop_bridge.sh`）。
-这些桥接需要 PICO 头显 + XRoboToolkit PC Service，或 IsaacTeleop，属外部硬件 SDK，不在本环境内安装。
-
-**进程 3 — SenseGlove 桥接（系统 ROS2）**：
-```bash
-source /opt/ros/humble/setup.bash
-source /home/esrobo/Projects/esrobo/install/setup.bash   # 若已构建
-ros2 run senseglove_ros senseglove_ros_node ...          # SenseGlove 官方驱动
-python3 bridges/senseglove_ros_to_esrobo_hand_bridge.py --left-serial <左> --right-serial <右>
-```
-
-**进程 4 — 灵巧手 ROS 桥接（系统 ROS2）**：把核心进程（conda 内）发到 UDP:15051 的手指数据
-转发给 LinkerHand ROS2 节点：
-```bash
-source /opt/ros/humble/setup.bash
-ros2 launch linker_hand_ros2_sdk linker_hand_double.launch.py   # 启动灵巧手驱动
-python3 bridges/hand_ros_bridge.py --port 15051                 # UDP→ROS2 topic
-```
-
-### 3.1 SenseGlove 手指 + IMU 遥操作（仅灵巧手）
-
-先只做手指运动 + IMU 数据遥操作，不驱动双臂：
-
-```bash
-# 终端1：LinkerHand 硬件驱动（系统 ROS2，若未随整机启动）
-source /opt/ros/humble/setup.bash
-source /home/esrobo/Projects/esrobo/install/setup.bash   # esrobo 工作区（含 linker_hand_ros2_sdk）
-ros2 launch linker_hand_ros2_sdk linker_hand_double.launch.py
-
-# 终端2：手部 UDP → LinkerHand topic（系统 ROS2）
-source /opt/ros/humble/setup.bash
-python3 bridges/hand_ros_bridge.py --port 15051
-
-# 终端3：SenseGlove 硬件驱动（系统 ROS2，见第 7 节）
-source /opt/ros/humble/setup.bash
-source .../external/senseglove_ros/install/setup.bash
-ros2 launch senseglove_bringup senseglove.launch.py
-
-# 终端4：SenseGlove → UDP:15050（先做第 4.1 节标定；--recalibrate 只在首次/换手套时）
-python3 bridges/senseglove_ros_to_esrobo_hand_bridge.py --left-serial <左> --right-serial <右>
-
-# 终端5：手部遥操作核心（conda 环境）
-./scripts/run_hand_teleop.sh            # 启动后按 'h' 使能灵巧手，'q' 退出
-```
-
-**安全限制（`hand.*` 配置）**：
-- 手部默认**不使能**，必须按 `h`（或 `--enable`）才开始运动。
-- 按 `h` 前必须同时收到左右手新鲜的 `/cb_*_hand_state`；反馈中断 0.5 秒自动停止下发。
-- 输出严格钳位到 `[out_min, out_max]`（默认 0–255）。
-- 每命令最大变化 `max_step`、每秒最大速度 `max_velocity`，防止手指突变。
-- 首次使能从 `/cb_*_hand_state` 读取到的当前姿态起步，不使用假定的 `home` 状态。
-- `scripts/hand_safe_test.py` 用于真机逐关节核对方向/顺序后再使能。
-
-> 本阶段只控制灵巧手手指；IMU 提供的手腕朝向（`hand_orientation_deltas`）已随 UDP 一并
-> 接收，但要驱动手腕/手臂跟随需开启双臂遥操作。
-
-## 4. 标定流程
-
-1. **手臂初始角 / 侧向映射**：先运行 `calibrate_arms.py validate`，只读确认物理角、
-   URDF 角、SDK 软限位及映射往返一致。不要调用 SDK `reset()` 回零；该 API 是急停后复位并
-   掉使能，不是轨迹规划回零。
-2. **重定向原点标定**：启动核心遥操作后，保持自然站立、双手自然下垂约 2.5 秒，
-   出现 `Calibration locked (natural-hold origin)` 即锁定为原点（对应
-   `auto_start_reference_*` 参数）。之后手臂运动相对该原点映射。
-3. **左右手交叉**：若机器人左右映射反了，把 `retarget.swap_left_right_targets` 改为 `true`。
-
-### 4.1 SenseGlove 手指/IMU 标定（遥操作前必须做）
-
-SenseGlove 的**两姿态标定**由桥接进程完成（生成 `config/senseglove_esrobo_calibration.json`）：
-
-```bash
-# 首次或手套佩戴变化后，用 --recalibrate 强制重新标定
-python3 bridges/senseglove_ros_to_esrobo_hand_bridge.py \
-    --left-serial <左> --right-serial <右> --recalibrate
-```
-按提示依次做两个姿态（每个约 10s，ENTER 开始）：
-1. **1/2 张手 + IMU 中性**：双手自然张开、手指伸直，保持你希望映射到手部初始位姿的手腕朝向。
-2. **2/2 握拳**：双手握拳。
-
-标定文件存在后，日常运行无需重复标定（除非换手套/佩戴松紧变化），直接运行即可自动加载。
-
-### 4.2 LinkerHand 关节顺序/方向安全标定（首次上真手）
-
-由于物理手关节顺序、方向与 0-255 映射需真机核对，先做逐关节安全测试：
-
-```bash
-# 需 LinkerHand 驱动已启动；按关节逐个动一点，记录哪个索引对应哪根手指/哪个方向
-python3 scripts/hand_safe_test.py --side left --joint 0 --delta 8 --confirm-motion
-python3 scripts/hand_safe_test.py --side right --joint 2 --delta 8 --confirm-motion
-```
-L10 顺序已按硬件 SDK 固定映射。当前左手通过 `left_enabled_physical_joints` 启用全部十轴，
-使用原始 PICO 26 点的 URDF 拟合；右手保留 `[0,1,2,3,4,5,9]` 和既有端点。
-左手新增侧摆及旋转采用当前名义控制模型，不代表完成新增实机标定，见
-[左手十轴重定向](../laptop_teleop/docs/07_CODE_AND_COMPUTATION.md#左手-l20lite-十轴重定向)。
-
-## 5. 离线测试（无需硬件）
-
-`tests/` 的回归源码与 `fixtures/` 用于模型、保护和故障复现；`log/` 是运行产物，不能混为一类清理。可删除已确认的模拟输出及字节码缓存，保留有效测试、URDF与 `assets/` 网格。历史故障和回放资料集中在本机 `laptop_teleop/log/retained/`，部分文件已无损压缩；读取方式及全仓库清理边界见[日志与测试目录维护](../laptop_teleop/docs/04_TROUBLESHOOTING.md#日志与测试目录维护)。仅整理文件不运行下面的仿真程序，也不启动任何硬件。
-
-```bash
-cd /home/esrobo/Projects/esrobo/teleoperation
-source ~/miniconda3/etc/profile.d/conda.sh && conda activate teleop_esrobo
-
-# 终端1：仿真输入
-python scripts/sim_body_input.py --hz 60 --swing
-
-# 终端2：核心遥操作（不命令手臂）
-./scripts/run_teleop.sh --no-robot
-```
-
-终端2 出现 `Calibration locked` 后即开始输出 IK 关节目标（控制台打印），验证整条
-UDP→重定向→IK 链路。
-
-## 6. 关键参数（config/teleop_config.yaml）
-
-| 参数 | 说明 |
+| 需要解决的问题 | 文档 |
 | --- | --- |
-| `robot.command_mode` | 默认 `j`（SDK 平滑位置速度模式）；`js` 为无平滑高风险透传，默认禁止 |
-| `robot.max_joint_step` | 单步关节最大变化（rad）安全钳位 |
-| `robot.left/right_joint_offsets` | `physical = direction * URDF + offset`；关节2为 `+π/2` |
-| `robot.max_joint_velocity` | J1-J4 首次联调为 `5/5/6/6 deg/s`，J5-J7 为 `10 deg/s`；同时受逐关节加速度和单步限制 |
-| `robot.max_joint_deviation_from_start` | 初测时各关节不得偏离按 `e` 捕获的初始角超过 0.35 rad |
-| `retarget.arm_vector_position_mode` | `segment_direction_relative`（仅用最小旋转对齐自然下垂的上臂方向，不用近共线的肩肘腕点重定义 H1/H2 水平轴） |
-| `retarget.swap_left_right_targets` | 左右手映射交叉开关 |
-| `ik.enable_elbow_tasks` | 是否用肘部任务辅助 IK |
-| `ik.dt` | IK 步长 |
-| `hand.mode` | `udp`（经 hand_ros_bridge 转发）/ `ros2`（直接发布） |
+| 连接机器人、共享密钥、部署服务 | [02 两机连接](docs/02_ROBOT_CONNECTION.md) |
+| 每次运行和结束顺序、命令行替代 | [03 日常操作](docs/03_OPERATION_RUNBOOK.md) |
+| 超时、频率、控制器、手部和独立测量 | [04 故障排查](docs/04_TROUBLESHOOTING.md) |
+| 网页按钮、模式、骨架层、恢复 | [05 网页控制台](docs/05_WEB_CONSOLE.md) |
+| SDK、组件时间、Body/Hand 转发与同步 | [06 PICO 输入](docs/06_PICO_HAND_INPUT.md) |
+| 源码职责、映射/IK、接近和回零实现 | [07 代码与计算](docs/07_CODE_AND_COMPUTATION.md) |
+| 灵巧手运动学、对捏机制与单指运动问题 | [09 遥操作与灵巧手技术方案](docs/09_TECHNICAL_SCHEME.md) |
 
-> **注意**：所有位姿 / 肩肘 / 臂长参数都来自仓库的 IsaacLab 标定值（`config.py` 默认值）。
-> 首次上真机请务必先用 `calibrate_arms.py` 核对关节方向与限位，再逐步使能跟随，手始终放在急停上。
+旧 SenseGlove 脚本保留用于设备维护，当前网页和 PICO 计算无需启动。认证密钥、现场运行记录、构建产物和历史测量汇总不上传远程仓库。
 
-## 7. 外部 SDK 构建状态（XRoboToolkit / SenseGlove）
-
-以下外部 SDK 已从 GitHub 克隆到 `teleoperation/external/` 并配置，可一键复现：
-
-```bash
-cd /home/esrobo/Projects/esrobo/teleoperation
-./scripts/build_external_sdks.sh
-```
-
-| 依赖 | 来源 | 状态 | 说明 |
-| --- | --- | --- | --- |
-| `XRoboToolkit-PC-Service` | [XR-Robotics](https://github.com/XR-Robotics/XRoboToolkit-PC-Service) | ✅ 已构建 | 编译出 `libPXREARobotSDK.so` |
-| `XRoboToolkit-PC-Service-Pybind` | [XR-Robotics](https://github.com/XR-Robotics/XRoboToolkit-PC-Service-Pybind) | ✅ 已构建 | `xrobotoolkit_sdk` 已装进 conda 环境 |
-| `XRoboToolkit-Teleop-Sample-Python` | [XR-Robotics](https://github.com/XR-Robotics/XRoboToolkit-Teleop-Sample-Python) | ✅ 已克隆 | 参考数据链路 |
-| `senseglove_ros`（`humble-dev` @ `a14a468`） | [Adjuvo/senseglove_ros](https://github.com/Adjuvo/senseglove_ros) | ✅ 已构建 | 全工作区原生编译，含 `senseglove_msgs`/`senseglove_hardware`/`senseglove_api` |
-
-**XRoboToolkit（PICO 双臂）— 已配置可用**
-```bash
-# conda 环境已含 xrobotoolkit_sdk；启动 PICO 全身骨骼 → UDP:15050
-./bridges/run_xrobotoolkit_bridge.sh --rate-hz 90
-```
-> 运行时需 PICO 头显运行 XRoboToolkit 应用 + 电脑运行 XRoboToolkit-PC-Service。
-
-**SenseGlove Nova2（手指/IMU）— 本机可直接使用 ✅**
-本机为 Ubuntu 22.04（glibc 2.35）。**关键点**：必须用 **`humble-dev` 分支 @ commit `a14a468`**
-（"hardware interface: humble port fixes"）。该版本自带 x86-64/release 预编译
-`libsgcore.so`（md5 `5e73d2a8…`）**只要求 glibc 2.34（≤ 2.35）**，所以在本机原生
-colcon build + 系统 `/usr/bin/python3`（ROS2 Humble）即可正常运行，无需 Docker/重编/换系统。
-
-> ⚠️ 不要用上游 `humble` 分支或更新的 tag——它们的 `libsgcore.so` 用更新的工具链编译，
-> 要求 glibc 2.38，在本机无法运行（厂商只给预编译库、无源码）。
-
-启动（先跑硬件驱动，再跑桥接）：
-```bash
-# 终端1：SenseGlove 硬件驱动（系统 ROS2 Humble）
-source /opt/ros/humble/setup.bash
-source /home/esrobo/Projects/esrobo/teleoperation/external/senseglove_ros/install/setup.bash
-ros2 launch senseglove_bringup senseglove.launch.py
-
-# 终端2：手指/IMU → UDP:15050
-./bridges/run_senseglove_bridge.sh --left-serial <左> --right-serial <右>
-```
-> 若 topic 命名不是默认的 `/senseglove/glove<serial>/{lh|rh}/senseglove_states`，
-> 用 `--left-topic/--right-topic` 覆盖。
-> 手套通过蓝牙连接（Nova2 需先在 SenseCom 里配对/连接），`senseglove_bringup` 会加载
-> `senseglove_bringup/config/gloves.yaml`（按 serial 配置每只手套）。
-
-## 许可证
-
-算法代码移植自 `Dual-arm-teleoperation` 仓库，其源码沿用各自 SPDX 头（多数 BSD-3-Clause）。
-`pyAgxArm`、`LinkerHand`、SenseGlove 等 SDK 遵循各自第三方许可证。
+左手 L20Lite 十轴映射、官方手册约束及离线三维回放见 [左手十轴重定向](docs/07_CODE_AND_COMPUTATION.md#左手-l20lite-十轴重定向)。
