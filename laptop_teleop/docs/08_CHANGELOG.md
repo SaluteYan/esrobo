@@ -2,6 +2,25 @@
 
 按日期倒序维护。当前功能以 02–07 文档及源码为准；此处保存修改过程、选择理由和当时验证结果，不作为机器人已就绪证明。后续在本文件追加条目，不再按每次修改新建专题文件。
 
+## 2026-10-26 平台与组织主页整理
+
+- 按用户要求准备 HUSTESROBO 组织主页和独立平台仓库，保留 `SaluteYan/esrobo` 原远程。根 README 改为平台总览，新增驱动与文档索引，更新通信模块导航；具体发布范围见 [组织整理说明](../../organization/README.md)。
+- 核对实际依赖后保留平台共用 `teleoperation` 包，避免将实机驱动、IK、配置和运动检查误当作纯仿真内容整体移走。新平台不复制 `laptop_teleop`，应用链接指向原仓库；仿真入口使用现有 `SaluteYan/Dual-arm-teleoperation`。
+- 两个独立发布目录位于 `/home/yan/PhdResearch/HUSTESROBO/`；平台从 `318b1d0` 的已跟踪内容导出，补齐 UGV SDK 子模块来源，运行源码不变。新组织的应用独立化尚未实施。
+- 本轮仅做文档、导出与静态／CLI 检查，不运行硬件、不重启服务。远程发布结果在组织整理说明中维护。
+- 发布完成：新平台 `HUSTESROBO/ESROBO@c7467ef`、组织主页 `HUSTESROBO/.github@7a6f91b` 已推送并核验远程 SHA；公开组织首页已显示正文，平台文档、驱动及协议入口可访问。原远程仓库保持不变。
+
+## 2026-10-26 本地同步实验分支与代码现状核对
+
+- 在 `/home/yan/PhdResearch/DualArmTeleopWithESROBO` 从干净的本地 `main`（`6ffecfd`）执行远程获取，创建并切换到跟踪分支 `experiment/dex-vector-retargeting-20261021`。远程没有精确名为 `experiment` 的分支，此为唯一 `experiment/` 分支。本次同步源码为 `318b1d04786f1b6b11254e62b7628178910cd48c`（2026-10-22 17:15:44 +08:00）；本地 HEAD 与上游一致，已包含远程 `main` 的 `985045f`，比它多 3 个提交。没有合并到本地 main。
+- 依据根 README、本文档目录的 06/07/09、通信协议及实际代码重新核对：日常入口是 `laptop_teleop` 网页；PICO Body/Hand 经独立组件采集、原始时间戳与新帧检查，进入重定向、分区 IK 和手部映射，通过 HMAC UDP 16000 交给 `robot_link`，机器人端复用 `teleoperation` 的轨迹与 CAN/ROS 驱动。SenseGlove 为保留的旧路径。现行臂方向配置为 `segment_direction_absolute`，肘角为 `direct_absolute`；J1–J4 位置 IK 与 J5–J7 掌面姿态求解、J6/J7 稳定滤波分层处理。
+- 本分支相对远程 main 的核心变化是左手运行求解器：YAML 显式选 `wrist5`、`aligned_thumb_fingers`、拇指尺侧增益 `1.10` 与四指侧向偏置 `[0,0,3,0] mm`。`hand_solver.py` 由这些配置生成 `left-dex-wrist5-anatomical-live-v3` 合同；`hand_vector_geometry.py` 对齐掌部参考、按四指总骨长归一化，再构造五个目标向量。`hand_vector_experiment.py` 使用真实 URDF/mimic 雅可比、向量 SmoothL1 与时间正则，保留十主动轴交集限位。此路径不使用 v13 接触投影；v13 仍可选，右手保持原映射。
+- `hand_worker.py` 将可选向量依赖隔离到独立解释器，求解和父进程收取分别有 20/30 ms 期限，源有效期仍为 100 ms。候选只有在匹配序号成功发布后才提交热启动及滤波状态，失败不更新旧输入时效。十轴角度继续通过既有标定转为 0–255 命令，执行保留 900 单位/s、单步 18 等限制。几何目标残差不能当作实体接触或到位证据。
+- 接管与安全状态以当前源码为准：单臂 `entry_protocol=7` 锁定完整目标，分段完成 J1–J5 与 J6/J7 后进入 ACTIVE；输入恢复要求连续新鲜有效帧，运动仍由机器人轨迹约束。`HOLD_LATCHED` 与硬件故障停止分开。当前 `torso_collision_enabled=true`、`teleop_torso_collision_enabled=false`；`DualBackend.supports_prepare/supports_return` 均为 false，尚无完整双臂互碰扫掠认证。历史安全方案和同步日志不能替代本次硬件状态验证。
+- 可复现性检查：本机缺少默认 `esrobo_laptop` Conda 解释器、`laptop_teleop/.venv/bin/python` 及 `external/dex-vector-venv/bin/python`；运行 `run_laptop.sh check` 在环境检查阶段退出。默认冒烟引用的 `test_hand_handover.py`、`test_joint_trajectory.py`、`test_recent_rate.py` 及向量专项 `test_hand_vector_experiment.py` 均不在此次检出中，`robot_link/tests` 目录也不存在。根 `.gitignore` 忽略各层 `tests/`，与现有测试 README 对本机未跟踪测试的说明一致；不能据历史通过数量声称远程检出具有同样覆盖。向量安装脚本使用 `.venv`，常规入口默认查找 Conda，后续部署还需核对两者的环境路径约定。
+- 子模块源码已存在，Ranger、RealSense、UGV SDK 的 HEAD 均与主仓库 gitlink 一致；`.gitmodules` 仍缺 `src/ugv_sdk` 映射，不能据现有目录推断全新递归克隆完整可用。
+- 本次验证仅为静态检查：三个应用目录内已跟踪的 139 个 Python 文件 AST 解析、38 个 shell 脚本 `bash -n`、1 个遥操作 URDF XML 解析全部通过。没有运行 pytest、完整 ROS 构建或实机验证，没有连接机器人或重启服务。本次仅追加此同步与理解记录，不修改运行代码；记录保留为本地文档变更，无需向远程推送运行代码。
+
 ## 2026-10-22 实验分支提交前整理
 
 - 清理114个可再生缓存、完全重复的控制台报告、已部署的临时包及被否决的对称拇指缩放候选明细；对应失败与指标报告保留。3个一次性参数试验程序移入经SHA256验证的压缩存档，日常复现使用现有 `replay_hand_vector.py` 和 `compare_wrist_geometry.py`，正式工厂最终回放脚本及其输入、基线、结果仍保留。

@@ -1,6 +1,6 @@
-# ESROBO 分布式遥操作通信
+# ESROBO 机器人通信接口
 
-此目录将“笔记本计算目标”和“机器人执行目标”分开。笔记本为 Ubuntu/Linux。
+`robot_link` 是 ESROBO 平台应用与机器人主机之间的通信层，包含 Python 客户端、协议实现和执行网关。应用在 Ubuntu/Linux 电脑上生成目标，机器人主机校验目标、约束运动并回传实测反馈。当前 PICO 遥操作是它的一个使用项目，其他应用也可按同一合同接入。
 通信协议详见 [PROTOCOL.md](PROTOCOL.md)，机器人收到目标后的完整执行过程见
 [ROBOT_EXECUTION.md](ROBOT_EXECUTION.md)，开发和验收记录见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
@@ -19,7 +19,7 @@
 
 ```mermaid
 flowchart LR
-  P[PICO / SenseGlove] --> L[笔记本：标定、重定向、IK、网页]
+  P[应用输入：当前 PICO Body / Hand] --> L[笔记本：标定、重定向、IK、网页]
   L -->|UDP 16000：关节目标| R[机器人：会话校验、轨迹限制、反馈检查]
   R -->|UDP：实测关节与故障状态| L
   R --> A[机械臂 CAN / 灵巧手底层驱动]
@@ -29,15 +29,31 @@ flowchart LR
 
 | 所在位置 | 负责工作 |
 | --- | --- |
-| 笔记本 | PICO、SenseCom/SenseGlove、人体标定、重定向、IK、网页骨架和数据显示 |
+| 笔记本 | 应用输入、标定、重定向、IK、网页或其他应用界面 |
 | 机器人主机 | CAN 通信、实测反馈、原有关节速度/加速度/跟随差/力矩检查、显式安全回零、相机采集 |
 | 网络 | 已计算目标和实测状态；不传控制器原始 CAN 帧，不在机器人运行人体 IK |
 
-机器人端仍保留 FK 和碰撞模型，供末端速度限制、启动检查和安全回零使用。未调整原有速度、关节范围、力矩阈值或控制模式；实时跟随是否检查碰撞沿用配置。
+机器人端仍保留 FK、轨迹约束和碰撞模型，供受检接近、回零及配置启用的运动检查使用。具体速度、关节范围、力矩与碰撞策略由当前配置和执行实现决定，见 [执行流程](ROBOT_EXECUTION.md)；早期开发记录不作为当前参数说明。
 
 **支持单侧机械臂、可选同侧 L10 灵巧手、单侧仅灵巧手，以及双臂＋双手。** 单侧使用 `--side left/right`，仅灵巧手再增加 `--with-hand --hand-only`，四部件联合使用 `--side both`（自动包含双手）。所有模式默认模拟，真实硬件必须显式 `--hardware`。双侧必须使用一个网关，禁止启动两个单侧网关。仅灵巧手合同拒绝机械臂目标，网关只使能所选手，并持续验证对应机械臂七轴全部失能。腰部、头部保持原模型固定前提。
-笔记本 PICO/SenseGlove 采集、重定向、分区 IK 和客户端入口已整理到 [`laptop_teleop`](../laptop_teleop/README.md)，默认机器人地址为 `192.168.10.100`。本机骨架查看沿用 PICO 采集桥；两机真实设备联调仍待完成。旧脚本仍是原来的本机一体运行方式。
+当前 PICO Body/Hand 采集、重定向、分区 IK 和客户端入口见 [`laptop_teleop`](../laptop_teleop/README.md)，默认机器人地址为 `192.168.10.100`。部署与历史联调记录见该项目文档；新环境仍需分别核验依赖、合同、服务加载和实机行为。旧 SenseGlove 及一体式脚本用于旧路径维护。
 负载拆分不能证明此前整机崩溃已解决，操作系统卡死时 Python 看门狗也无法执行。
+
+## 开发者入口
+
+| 模块 | 作用 |
+| --- | --- |
+| [protocol.py](esrobo_link/protocol.py) | JSON/HMAC 封装及消息、单位、范围等校验 |
+| [session.py](esrobo_link/session.py) | 会话、序号、有效期和最新目标管理 |
+| [client.py](esrobo_link/client.py) | `RobotClient`：连接、接收反馈、提交单侧／双侧目标及保持／停止 |
+| [gateway.py](esrobo_link/gateway.py) | 网络收发、执行协调、状态机和诊断 |
+| [backends.py](esrobo_link/backends.py) | mock 与真实设备后端；硬件实现复用平台运动组件 |
+| [monitor.py](esrobo_link/monitor.py) | 只读检查合同和状态，使用同一独占会话机制 |
+| [camera.py](esrobo_link/camera.py) | 独立图像采集／MJPEG 服务 |
+
+新项目先用 mock 网关确认连接与状态，再按 [协议](PROTOCOL.md)对齐关节顺序、弧度／手部单位、配置合同和输入时效。客户端只提交新鲜目标，不重放旧帧；`accepted_seq` 是接纳序号，不是到位证明。接管、保持、恢复等能力以网关合同为准，旧 `examples/` 辅助函数不覆盖现行完整接管状态机；完整接入参考当前应用的 [app.py](../laptop_teleop/src/esrobo_laptop/app.py)。
+
+通信客户端与 mock 网关仅依赖 Python 标准库；真实后端还依赖 `teleoperation` 中的运动组件和机器人 SDK。当前网络关节接口主要面向机械臂／灵巧手，不能因平台存在底盘、腰部驱动就假定这些设备已经具备同样的网络目标接口。
 
 ## 先做无硬件通信检查
 
@@ -201,7 +217,7 @@ client.send_target(arm_urdf_rad=q7.tolist(), hand_unit=hand10.tolist())
 client.close()  # 最佳努力 STOP；丢包时仍由机器人有效期看门狗处理
 ```
 
-上面只展示基础 API；真实单臂 `entry_protocol=1` 还必须携带接管阶段、原始源姿态与到位令牌，使用 `laptop_teleop` 的 `Controller` 完成流程。旧示例不具备新的接管握手，不能用于真实单臂启动。不得在定时线程里无限重复最后一帧人体目标来维持网络有效期。输入丢失、求解异常时停止发目标或调用 `stop()`。
+上面只展示基础 API；当前真实单臂 `entry_protocol=7` 还必须完成固定目标接近、原始源姿态和到位令牌握手，使用 `laptop_teleop` 的 `Controller` 完成流程。旧示例不具备新的接管握手，不能用于真实单臂启动。不得在定时线程里无限重复最后一帧人体目标来维持网络有效期。输入丢失、求解异常时停止发目标或调用 `stop()`。
 
 - 手臂目标是选定侧 J1–J7 的 **URDF 弧度**，不是角度，也不是电机原始角度。电机方向/偏置仅机器人应用一次。
 - 手目标是 **L10 物理十轴顺序的 0–255 整数**，不是现有 `BodyDevice` 的手指弧度数组。笔记本需复用现有映射、标定和手指顺序；不要直接把弧度乘 255。

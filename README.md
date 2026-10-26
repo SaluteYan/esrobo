@@ -1,87 +1,119 @@
-# ESROBO 移动双臂机器人
+<div align="center">
 
-本仓库包含 ESROBO 移动双臂机器人的 ROS 2 工作空间、底层设备驱动，以及 PICO 遥操作程序。机器人主机运行 CAN/ROS 驱动和运动执行网关；本机采集 PICO Body 与 Hand 数据，完成标定、重定向和逆运动学（IK），再将关节目标发送给机器人。主要环境为 Ubuntu 22.04 与 ROS 2 Humble。
+# ESROBO
 
-**当前日常入口**是 [`laptop_teleop`](laptop_teleop/README.md) 的网页控制台；[`robot_link`](robot_link/README.md) 负责两机通信和机器人端执行。[`teleoperation`](teleoperation/README.md) 保留模型、运动控制组件及较早的一体式运行入口。第一次接触真机，请先按[逐部件调试记录](HARDWARE_BRINGUP.md)核对设备，再按[部署文档](laptop_teleop/docs/01_README.md)操作。
+**移动双臂灵巧手机器人开发平台**
 
-## 系统如何工作
+硬件与驱动 · 机器人模型 · 通信协议 · 遥操作与研究项目
+
+[开发文档](document/README.md) · [设备驱动](src/README.md) · [通信接口](robot_link/README.md) · [平台应用](#平台应用)
+
+</div>
+
+---
+
+ESROBO 是一套集成移动底盘、双七轴机械臂和双五指灵巧手的机器人平台。本仓库提供开发该平台所需的设备驱动、硬件文档、模型和机器人主机通信接口，供遥操作、仿真及后续研究项目复用。主要部署环境为 **Ubuntu 22.04 / ROS 2 Humble**。
+
+平台代码与具体应用分层介绍：先了解机器人、接通设备和通信接口，再选择平台上的项目。当前仓库仍保留本机遥操作及共用控制组件；新组织与独立仓库的整理状态见 [组织与仓库布局](organization/README.md)。
+
+## 机器人平台
+
+| 子系统 | 硬件 | 开发内容 |
+| --- | --- | --- |
+| 移动底盘 | Ranger Mini 3 | 底盘 ROS 2 接口、CAN 通信和底层 SDK |
+| 双臂 | 左右 NERO 七轴机械臂 | 关节控制、状态反馈、URDF 与运动约束 |
+| 双手 | LinkerHand L20Lite | 十主动通道控制、反馈及联动关节模型 |
+| 腰部与头部 | 三轴腰部、RS485 头部舵机 | 关节驱动、设备命名和调试接口 |
+| RGB-D 视觉 | Orbbec 头部相机、RealSense 腕部相机 | 图像和深度采集、相机配置 |
+| 测距与力觉 | RoboSense 雷达、双六维力传感器 | 点云、力/力矩及设备状态 |
+
+每个设备的源码和说明见 [驱动索引](src/README.md)。整机连接、CAN/串口分配和逐部件操作见 [硬件调试指南](HARDWARE_BRINGUP.md)，厂家手册见 [文档中心](document/README.md)。设备可用范围由具体应用决定；底盘、腰部、头部驱动存在，并不表示所有遥操作项目都接入了全身控制。
+
+## 平台架构
 
 ```mermaid
-flowchart LR
-    P[PICO Body + Hand] --> L[本机 laptop_teleop<br/>采集、标定、重定向、IK、网页]
-    L <-->|HMAC 认证的 UDP 16000<br/>目标与实测反馈| G[机器人 robot_link 网关<br/>会话、安全检查、轨迹与停止]
-    G --> D[CAN / ROS 驱动]
-    D --> R[NERO 双臂、LinkerHand 双手]
-    C[机器人相机] -->|独立图像服务，经 SSH 转发| L
+flowchart TB
+    A[平台应用：遥操作、仿真及后续研究] --> C[robot_link 客户端与通信协议]
+    C <-->|认证 UDP：关节目标与实测反馈| G[机器人主机：网关与执行状态机]
+    G --> M[共用模型、轨迹约束与运动检查]
+    M --> D[设备适配器 / CAN / ROS 2 驱动]
+    D <--> R[ESROBO 机器人]
+    V[相机图像服务] --> A
 ```
 
-| 层次 | 主要职责 | 入口 |
+应用负责生成目标，机器人主机负责校验与执行。控制和反馈使用 UDP，SSH 用于部署及服务管理，图像走独立通道。机器人端始终保留反馈检查和执行约束；网络接纳目标不等于实体已执行到位。
+
+## 基础开发资源
+
+### 设备驱动与硬件接入
+
+[`src/`](src/README.md) 收录机器人 ROS 2 驱动、第三方 SDK 和集成工具，涵盖机械臂、灵巧手、底盘、腰部、头部、相机、雷达与力传感器。驱动索引说明每项源码的职责、对应设备和阅读入口，也区分当前 ESROBO 主线与其他机器人配置。
+
+[`start_can.sh`](start_can.sh) 与 [`99-fixed-can.rules`](99-fixed-can.rules) 提供机器人主机设备命名参考。首次部署按 [逐部件调试指南](HARDWARE_BRINGUP.md)核验各设备，再组合启动；已有总 launch 不作为首次上电入口。
+
+### 文档与机器人模型
+
+[`document/`](document/README.md) 是平台开发文档入口，集中索引整机及厂家 PDF、硬件调试、通信和应用开发资料。
+
+当前运动学模型位于 [`teleoperation/urdf/`](teleoperation/urdf/)，包含机械臂与灵巧手的连接关系、关节限位和 mimic 联动。关节命名与零位说明见 [整机 URDF 模型](HARDWARE_BRINGUP.md#整机-urdf-模型)。网络机械臂目标使用 URDF 弧度；物理电机方向和偏置在机器人端处理，手部控制单位与模型角度需按标定转换。
+
+### 机器人通信协议
+
+[`robot_link/`](robot_link/README.md) 为平台应用提供 Python 客户端、UDP 协议和机器人端网关。它将上位机计算与机器人执行分离，支持单臂、单臂带同侧手、仅单手，以及双臂双手端点。
+
+| 内容 | 说明 | 入口 |
 | --- | --- | --- |
-| 本机计算与界面 | PICO 身体及五指采集、输入时效检查、标定、IK、目标生成、状态显示 | [`laptop_teleop/README.md`](laptop_teleop/README.md) |
-| 机器人执行 | 认证与配置合同、最新目标缓存、反馈校验、限速轨迹、故障停止、驱动调用 | [`robot_link/README.md`](robot_link/README.md)、[执行流程](robot_link/ROBOT_EXECUTION.md) |
-| 模型与运动组件 | URDF、运动学、机械臂和灵巧手适配器、安全回零等；也保留原一体式遥操作 | [`teleoperation/README.md`](teleoperation/README.md) |
-| ROS 2 设备层 | 底盘、双臂、腰部、灵巧手、相机、雷达、头部舵机和力传感器驱动 | [`src/`](src/) |
+| 协议与数据约定 | HMAC 认证、独占会话、序号、配置合同、有效期、目标与反馈格式 | [PROTOCOL.md](robot_link/PROTOCOL.md) |
+| 客户端 | 接收状态，发送新目标、保持或停止请求 | [client.py](robot_link/esrobo_link/client.py) |
+| 执行网关 | 校验输入、保留最新目标、执行状态机和反馈检查 | [gateway.py](robot_link/esrobo_link/gateway.py) |
+| 执行流程 | 从网络目标到受限命令、CAN/ROS 下发和实测反馈 | [ROBOT_EXECUTION.md](robot_link/ROBOT_EXECUTION.md) |
+| 无硬件接入 | 使用 mock 网关检查协议与客户端连接 | [通信快速开始](robot_link/README.md#先做无硬件通信检查) |
 
-运动目标走 UDP 16000；SSH 用于机器人端程序管理和图像服务转发。网页和人体 IK 在本机运行，CAN 与硬件驱动在机器人主机运行。网络包被接收不等于机器人已执行或到位，实际状态以新鲜反馈为准。协议细节见 [`robot_link/PROTOCOL.md`](robot_link/PROTOCOL.md)。
+默认控制端口为 **UDP 16000**，设计控制周期为 **50 Hz**，不作硬实时保证。HMAC 提供认证和完整性；双侧硬件按顺序发送，不具有原子同步保证。当前双臂自动准备／回零未开放，完整双臂互碰扫掠检查尚未实现。
 
-## 硬件范围
+## 开始开发
 
-| 部件 | 当前使用的设备或驱动 |
+| 你的目标 | 阅读顺序 |
 | --- | --- |
-| 移动底盘 | Ranger Mini 3；`ranger_ros2`、`ugv_sdk` |
-| 双臂 | 两台 NERO 七轴机械臂；`agx_arm_ros2`、`pyAgxArm-master` |
-| 腰部与头部 | 三轴腰部 CAN 关节、RS485 头部舵机 |
-| 双手 | LinkerHand 灵巧手；`linkerhand-ros2` |
-| 视觉与测距 | Orbbec 头部相机、RealSense 腕部相机、RoboSense 雷达 |
-| 力觉 | 双侧 RS422 六维力传感器 |
+| 了解或搭建 ESROBO | [硬件与手册](document/README.md) → [逐部件调试](HARDWARE_BRINGUP.md) → [驱动索引](src/README.md) |
+| 在平台上实现新控制程序 | [通信模块](robot_link/README.md) → [协议](robot_link/PROTOCOL.md) → [执行行为](robot_link/ROBOT_EXECUTION.md) → mock 端点联调 |
+| 使用当前 PICO 遥操作 | [应用 README](laptop_teleop/README.md) → [两机连接](laptop_teleop/docs/02_ROBOT_CONNECTION.md) → [网页操作](laptop_teleop/docs/05_WEB_CONSOLE.md) |
+| 研究重定向、IK 与灵巧手算法 | [代码与计算](laptop_teleop/docs/07_CODE_AND_COMPUTATION.md) → [技术方案](laptop_teleop/docs/09_TECHNICAL_SCHEME.md) |
+| 运行仿真与回放 | [现有仿真项目](https://github.com/SaluteYan/Dual-arm-teleoperation)的环境、资产和复现说明 |
 
-整机操作说明和厂家手册位于 [`document/`](document/)。遥操作当前使用 PICO Body 的肩、肘、腕数据和独立的 PICO Hand 五指追踪；SenseGlove 相关代码与文档用于旧设备维护，当前本机遥操作流程不需要启动手套软件。
+机器人驱动使用 ROS 2 工作空间，通信客户端和本机应用是独立 Python 包。安装方式以各模块 README 为准；只克隆源码不能替代 SDK、模型资产、环境与设备准备。
 
-## 仓库导航
+## 平台应用
+
+每个项目围绕 ESROBO 的具体用途维护自己的安装说明、方法、实验和验证记录。项目独立仓库逐步整理，下面明确区分现有入口与待拆分内容。
+
+| 项目 | 内容 | 当前入口与状态 |
+| --- | --- | --- |
+| **PICO 实机遥操作** | PICO Body/Hand 输入、人体标定、臂手重定向、IK、网页控制台和双机执行 | [`laptop_teleop`](laptop_teleop/README.md)；代码在本仓库，拟独立为 `esrobo-teleop` |
+| **仿真遥操作与回放** | IsaacLab 仿真基线、ESROBO 资产、PICO/SenseGlove 输入与录制回放 | [Dual-arm-teleoperation](https://github.com/SaluteYan/Dual-arm-teleoperation)；现有独立仓库，新组织归属待整理 |
+
+新的平台项目在此追加实际仓库链接、用途、所需平台版本和验证范围。尚未建立的项目不提供虚构仓库链接。
+
+### 当前目录与项目边界
 
 ```text
-.
-├── README.md                      项目总览与文档导航
-├── HARDWARE_BRINGUP.md            逐部件真机调试记录
-├── laptop_teleop/                 本机 PICO 计算、网页与操作文档
-├── robot_link/                    双机通信协议、客户端和机器人网关
-├── teleoperation/                 运动模型、控制组件及原一体式入口
-│   ├── config/teleop_config.yaml  机器人运动与安全配置
-│   └── urdf/                      当前遥操作使用的整机 URDF
-├── src/                           ROS 2 工作空间源码与第三方驱动
-├── document/                      整机及设备 PDF 手册
-├── start_can.sh                   机器人端 CAN 接口初始化
-└── 99-fixed-can.rules             机器人端设备命名规则参考
+esrobo/
+├── README.md                平台总览、开发入口与应用导航
+├── HARDWARE_BRINGUP.md      逐部件硬件接入和调试
+├── src/                     ROS 2 设备驱动与第三方 SDK
+├── document/                文档索引与厂家手册
+├── robot_link/              通信协议、客户端和机器人执行网关
+├── teleoperation/           当前共用模型、IK、驱动与旧一体式入口
+├── laptop_teleop/           新实现的 PICO 本机遥操作项目
+├── organization/            新 GitHub 组织主页及仓库整理说明
+├── start_can.sh             CAN 初始化参考
+└── 99-fixed-can.rules       设备命名参考
 ```
 
-`build/`、`install/`、`log/` 是本机生成的构建或运行目录；外部 SDK 与本机标定文件也可能只存在于已部署机器上。新机器部署时按[环境安装](laptop_teleop/README.md#环境安装与配置)和[两机连接](laptop_teleop/docs/02_ROBOT_CONNECTION.md)准备，不能仅凭克隆源码推断设备已就绪。
+`teleoperation/` 的算法源自仿真项目，但当前目录还承载实机共用组件：`robot_link` 导入其中的 NERO/手部驱动，`laptop_teleop` 导入其中的配置、人体重定向和 IK。该目录的 `--no-robot` 与模拟人体输入用于离线检查，不能等同于完整 IsaacLab 动力学仿真。独立项目拆分需先明确这些公共组件的依赖和版本，详见 [仓库整理方案](organization/README.md)。
 
-清理仓库时，优先删除可再生缓存、已确认的模拟输出及重复备份；不要把 `external/`、虚拟环境、`install/` 或 URDF 网格当作普通缓存清空。历史现场记录可校验后压缩，活动日志、状态、标定和未解决故障证据保留。测试按用途保留，按修改范围运行；目录规则、归档读取及清理清单见[日志与测试目录维护](laptop_teleop/docs/04_TROUBLESHOOTING.md#日志与测试目录维护)。
+## 开发与验证
 
-## 从哪里开始
+修改设备接口、配置或通信行为时，同步更新对应文档并记录验证范围。保持两端协议、关节语义、配置和模型版本一致。历史现场记录、软件测试与本次实机验收分开说明；当前运行限制及问题见 [故障排查](laptop_teleop/docs/04_TROUBLESHOOTING.md)。
 
-1. **首次部署**：阅读[环境安装](laptop_teleop/README.md#环境安装与配置)和[网络、SSH、共享密钥及网关](laptop_teleop/docs/02_ROBOT_CONNECTION.md)。本机与机器人端需使用相匹配的协议、配置和 URDF。
-2. **真机上电或排障**：核对[逐部件调试记录](HARDWARE_BRINGUP.md)及[厂家手册](document/移动仿人形双臂机器人平台操作手册.pdf)，先确认 CAN、反馈、急停和运动空间。整机总 launch 会同时启动多个设备，不作为首次调试入口。
-3. **日常遥操作**：在已安装本机环境后，从仓库根目录运行：
-
-   ```bash
-   ./laptop_teleop/scripts/run_dashboard.sh
-   ```
-
-   打开 `http://127.0.0.1:8080`，按[网页操作文档](laptop_teleop/docs/05_WEB_CONSOLE.md)连接机器人、选模式、检查输入、预览、标定并人工使能。命令行逐终端流程见[日常运行手册](laptop_teleop/docs/03_OPERATION_RUNBOOK.md)。启动网页本身不会使能机器人。
-4. **先做只读或离线检查**：本机环境检查可用 `./laptop_teleop/scripts/run_laptop.sh check`；已启动网关时可用 `./laptop_teleop/scripts/run_laptop.sh inspect` 查看合同与反馈。无硬件通信模拟见 [`robot_link/README.md`](robot_link/README.md)。
-
-模式包括双臂双手、单臂带同侧手、纯单臂和仅单侧灵巧手。各模式所需 PICO 输入和网关参数见 [`laptop_teleop/README.md`](laptop_teleop/README.md#运行模式)。当前双臂模式缺少两臂互碰的完整扫掠检查，网关会拒绝双臂自动回零与自动准备；不可把单臂回零流程直接组合用于双臂。现场运行还需以机器人控制器反馈确认停止、失能和故障状态。
-
-## 文档索引
-
-| 需求 | 文档 |
-| --- | --- |
-| 本机结构、数据流、模式 | [`laptop_teleop/README.md`](laptop_teleop/README.md) |
-| 安装、连接、每日操作、故障排查、网页 | [`laptop_teleop/docs/01_README.md`](laptop_teleop/docs/01_README.md) |
-| PICO Body/Hand 输入和计算细节 | [PICO 输入](laptop_teleop/docs/06_PICO_HAND_INPUT.md)、[代码与计算](laptop_teleop/docs/07_CODE_AND_COMPUTATION.md) |
-| 通信协议与机器人收到目标后的行为 | [协议](robot_link/PROTOCOL.md)、[执行流程](robot_link/ROBOT_EXECUTION.md) |
-| 原一体式遥操作及其运行记录 | [`teleoperation/README.md`](teleoperation/README.md)、[旧运行手册](teleoperation/TELEOPERATION_RUNBOOK.md) |
-| 设备逐项调试和现场命令 | [`HARDWARE_BRINGUP.md`](HARDWARE_BRINGUP.md) |
-
-修改代码或配置后，按现场安全流程停止并重启相关进程；已运行的 Python 进程不会自动加载工作区变更。软件回归入口为 `./laptop_teleop/scripts/test.sh`，它需要先完成本机环境安装；软件测试不代替实机验收。
+第三方驱动、SDK 和模型沿用各目录的来源与许可说明。本机密钥、标定、环境、活动日志及部署备份不作为平台发布内容。
